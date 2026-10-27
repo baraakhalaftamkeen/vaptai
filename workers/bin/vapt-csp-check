@@ -1,0 +1,242 @@
+#!/usr/bin/env python3
+"""Content-Security-Policy posture evaluator.
+
+Fetches ONE in-scope URL, parses `Content-Security-Policy` and
+`Content-Security-Policy-Report-Only` response headers, applies evaluation
+rules against each directive, and emits structured findings.
+
+Rules (modeled on the SnailSploit XSS-skill guidance + 2025 CSP best practice):
+
+  * CRITICAL weaknesses (confirmed=True, severity=high):
+    - `'unsafe-inline'` in script-src / style-src
+    - `'unsafe-eval'` in script-src
+    - `data:` scheme in script-src
+    - Wildcard (`*`) in script-src or default-src (with no fallback restrict)
+    - Missing default-src AND no script-src (unrestricted script loading)
+
+  * MEDIUM weaknesses (confirmed=False, severity=medium):
+    - Missing `'strict-dynamic'` on nonce/hash-based script-src
+    - Missing `require-trusted-types-for 'script'`
+    - `object-src` not `'none'`
+    - `base-uri` not restricted (default/none)
+    - `frame-ancestors` missing (clickjacking vector)
+
+  * INFO (severity=info): report-only mode (policy not enforced).
+
+Emits ONE JSON record to stdout:
+    {"findings": [{"type": "csp_weakness", "severity": "...",
+                   "url": "<url>", "directive": "<...>",
+                   "evidence": "<policy snippet>", "confirmed": true|false}, ...],
+     "trace":    [{"url", "status", "has_csp", "has_report_only"}]}
+
+Safety: GET only, in-scope URL enforced, 10s timeout, 1 MB body cap (we only
+read headers but the body read is bounded as belt-and-braces). Argv-only.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+from urllib.parse import urlparse
+
+try:
+    import requests
+except Exception as e:
+    print(json.dumps({"error": f"requests not available: {e}", "findings": []}))
+    sys.exit(0)
+
+
+_UA = "vapt-csp-check/1.0"
+_TIMEOUT = 10
+
+
+# Directive parsers. CSP directives are space-separated tokens; a source list
+# may contain scheme-src (`https:`), host-src (`cdn.example.com`), keyword-src
+# (`'self'`, `'none'`, `'unsafe-inline'`, …), nonce (`'nonce-abc'`) or hash
+# (`'sha256-...'`).
+def _parse_policy(raw: str) -> dict[str, list[str]]:
+    directives: dict[str, list[str]] = {}
+    if not raw:
+        return directives
+    for chunk in raw.split(";"):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        parts = chunk.split()
+        if not parts:
+            continue
+        name = parts[0].lower()
+        directives[name] = [p.strip() for p in parts[1:] if p.strip()]
+    return directives
+
+
+def _directive_or_fallback(dirs: dict[str, list[str]], name: str) -> list[str] | None:
+    if name in dirs:
+        return dirs[name]
+    # script-src and style-src fall back to default-src per the spec.
+    if name in ("script-src", "style-src", "img-src", "connect-src",
+                "font-src", "frame-src", "media-src", "object-src", "worker-src"):
+        return dirs.get("default-src")
+    return None
+
+
+def _has_nonce_or_hash(sources: list[str]) -> bool:
+    return any(s.startswith("'nonce-") or s.startswith("'sha") for s in sources)
+
+
+def _evaluate(url: str, policy: str, enforced: bool) -> list[dict]:
+    """Return findings for ONE policy string. `enforced` is False for Report-Only."""
+    out: list[dict] = []
+    dirs = _parse_policy(policy)
+
+    def _emit(sev: str, directive: str, evidence: str, confirmed: bool, klass: str) -> None:
+        prefix = "" if enforced else "[report-only] "
+        out.append({
+            "type": klass,
+            "severity": sev,
+            "url": url,
+            "directive": directive,
+            "evidence": (prefix + evidence)[:300],
+            "confirmed": confirmed,
+            "enforced": enforced,
+        })
+
+    # ---------- CRITICAL weaknesses ----------
+    script_src = _directive_or_fallback(dirs, "script-src")
+    if script_src is not None:
+        if "'unsafe-inline'" in script_src and not _has_nonce_or_hash(script_src):
+            _emit("high", "script-src",
+                  f"script-src contains 'unsafe-inline' without nonce/hash: "
+                  f"{' '.join(script_src)}",
+                  True, "csp_weakness_unsafe_inline")
+        if "'unsafe-eval'" in script_src:
+            _emit("high", "script-src",
+                  f"script-src contains 'unsafe-eval': {' '.join(script_src)}",
+                  True, "csp_weakness_unsafe_eval")
+        if any(s == "data:" for s in script_src):
+            _emit("high", "script-src",
+                  f"script-src allows data: scheme (base64 scripts): "
+                  f"{' '.join(script_src)}",
+                  True, "csp_weakness_data_scheme")
+        if "*" in script_src:
+            _emit("high", "script-src",
+                  f"script-src contains wildcard '*': {' '.join(script_src)}",
+                  True, "csp_weakness_wildcard")
+    elif "default-src" not in dirs:
+        _emit("high", "script-src",
+              "no script-src and no default-src — any origin can load scripts",
+              True, "csp_weakness_unrestricted")
+
+    default_src = dirs.get("default-src", [])
+    if "*" in default_src and "script-src" not in dirs:
+        _emit("high", "default-src",
+              f"default-src wildcard '*' with no script-src override: "
+              f"{' '.join(default_src)}",
+              True, "csp_weakness_wildcard")
+
+    # ---------- MEDIUM weaknesses ----------
+    if script_src is not None and _has_nonce_or_hash(script_src) \
+            and "'strict-dynamic'" not in script_src:
+        _emit("medium", "script-src",
+              f"nonce/hash-based script-src without 'strict-dynamic' "
+              f"(allowed-host bypass surface): {' '.join(script_src)}",
+              False, "csp_weakness_no_strict_dynamic")
+
+    if "require-trusted-types-for" not in dirs:
+        _emit("medium", "require-trusted-types-for",
+              "no 'require-trusted-types-for' — DOM-XSS sinks remain string-typed",
+              False, "csp_weakness_no_trusted_types")
+
+    object_src = _directive_or_fallback(dirs, "object-src")
+    if object_src is None or object_src != ["'none'"]:
+        _emit("medium", "object-src",
+              f"object-src is not 'none' (plugin/legacy script surface): "
+              f"{' '.join(object_src) if object_src else '(unset)'}",
+              False, "csp_weakness_object_src")
+
+    base_uri = dirs.get("base-uri")
+    if base_uri is None or base_uri == ["'self'"]:
+        # Missing base-uri OR too permissive — the modern recommendation is 'none'.
+        if base_uri is None:
+            _emit("medium", "base-uri",
+                  "no base-uri directive — <base> injection can redirect script loads",
+                  False, "csp_weakness_base_uri")
+
+    if "frame-ancestors" not in dirs:
+        _emit("medium", "frame-ancestors",
+              "no frame-ancestors directive — clickjacking vector",
+              False, "csp_weakness_frame_ancestors")
+
+    # ---------- INFO ----------
+    if not enforced:
+        _emit("info", "<report-only>",
+              "policy is in Report-Only mode — violations are logged, not blocked",
+              False, "csp_report_only")
+
+    return out
+
+
+def main() -> int:
+    p = argparse.ArgumentParser()
+    p.add_argument("--target", required=True, help="in-scope host (scope-check only)")
+    p.add_argument("--url", required=True, help="full http(s) URL to fetch")
+    args = p.parse_args()
+
+    out: dict = {"findings": [], "trace": []}
+
+    if not args.url.lower().startswith(("http://", "https://")):
+        out["trace"].append({"url": args.url, "note": "not http(s)"})
+        print(json.dumps(out)); return 0
+    if urlparse(args.url).hostname != args.target:
+        out["trace"].append({"url": args.url, "note": "off-scope"})
+        print(json.dumps(out)); return 0
+
+    headers = {"User-Agent": _UA, "Accept": "text/html,*/*"}
+    try:
+        r = requests.get(args.url, headers=headers, timeout=_TIMEOUT,
+                         allow_redirects=True, stream=True)
+        # Drain a small amount of body so the connection releases cleanly, but
+        # we only care about the headers.
+        try:
+            next(r.iter_content(chunk_size=4096), b"")
+        except Exception:
+            pass
+    except Exception as e:
+        out["trace"].append({"url": args.url, "note": f"GET error: {e}"})
+        print(json.dumps(out)); return 0
+
+    enforced_policy = r.headers.get("Content-Security-Policy", "")
+    report_only_policy = r.headers.get("Content-Security-Policy-Report-Only", "")
+
+    out["trace"].append({
+        "url": args.url,
+        "status": r.status_code,
+        "has_csp": bool(enforced_policy),
+        "has_report_only": bool(report_only_policy),
+    })
+
+    if not enforced_policy and not report_only_policy:
+        out["findings"].append({
+            "type": "csp_weakness_absent",
+            "severity": "high",
+            "url": args.url,
+            "directive": "<missing>",
+            "evidence": "no Content-Security-Policy header set on this response",
+            "confirmed": True,
+            "enforced": False,
+        })
+        print(json.dumps(out)); return 0
+
+    if enforced_policy:
+        out["findings"].extend(_evaluate(args.url, enforced_policy, enforced=True))
+    if report_only_policy:
+        out["findings"].extend(_evaluate(args.url, report_only_policy, enforced=False))
+
+    print(json.dumps(out))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

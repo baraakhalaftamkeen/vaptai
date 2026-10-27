@@ -1,0 +1,181 @@
+#!/usr/bin/env python3
+"""vapt-tenable — READ-ONLY Tenable.sc intel for an in-scope host, as JSONL.
+
+It does NOT scan. It queries an existing Tenable.sc deployment's cumulative vulnerability
+data over the REST API and prints one JSON object per line to stdout, in the same intel
+shape the `tenable_scan` normalizer understands (identical to vapt-nessus-import):
+
+  {"ip","port","protocol","plugin","severity","cve","cvss","exploit","frameworks",
+   "synopsis","solution","os","source":"tenable"}
+
+Credentials (never argv, never stored by the platform). Env wins; otherwise it falls back
+to V1's credentials file so an existing setup keeps working without copying secrets:
+  VAPT_TENABLE_URL          Tenable.sc host/IP (e.g. 192.168.1.50)
+  VAPT_TENABLE_ACCESS_KEY   API access key
+  VAPT_TENABLE_SECRET_KEY   API secret key
+  VAPT_TENABLE_CREDS        path to a V1-style creds JSON {host,access_key,secret_key}
+                            (default ~/.vapt_ai/tenable.json)
+
+Usage:
+  vapt-tenable --ip <ip>                 query cumulative vulns for one in-scope IP
+  vapt-tenable --analysis-file <path>    OFFLINE: parse a saved /analysis JSON response
+                                         (same mapping, no network) — used by tests
+
+Exit 0 on success (even with zero findings), 3 when not configured (no creds), 2 on a
+connection/HTTP error — so the platform records an honest coverage gap, never fake data.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import ssl
+import sys
+import urllib.request
+
+# Tenable.sc severity id/name → shared severity band.
+_SEV = {"0": "info", "1": "low", "2": "medium", "3": "high", "4": "critical",
+        "info": "info", "low": "low", "medium": "medium", "high": "high", "critical": "critical"}
+
+_VULN_COLUMNS = [
+    {"name": "ip"}, {"name": "port"}, {"name": "protocol"}, {"name": "pluginName"},
+    {"name": "severity"}, {"name": "cve"}, {"name": "cvssV3BaseScore"},
+    {"name": "exploitAvailable"}, {"name": "exploitFrameworks"}, {"name": "synopsis"},
+    {"name": "solution"}, {"name": "operatingSystem"},
+]
+
+
+def _sev(level) -> str:
+    if isinstance(level, dict):
+        level = level.get("id", level.get("name", "2"))
+    return _SEV.get(str(level).strip().lower(), "medium")
+
+
+def _cvss(v: dict) -> float | None:
+    raw = str(v.get("cvssV3BaseScore", "") or v.get("baseScore", "")).strip()
+    try:
+        return float(raw) if raw else None
+    except ValueError:
+        return None
+
+
+def parse_analysis(response: dict) -> list[dict]:
+    """Map a Tenable.sc /analysis vuln response to the shared intel finding shape.
+    One finding per (result, CVE); results with no CVE emit a single cve="" finding."""
+    out: list[dict] = []
+    results = ((response or {}).get("response", {}) or {}).get("results", []) or []
+    for v in results:
+        if not isinstance(v, dict):
+            continue
+        exploit = str(v.get("exploitAvailable", "")).strip().lower() in ("yes", "true", "1")
+        base = {
+            "ip": str(v.get("ip", "")),
+            "port": str(v.get("port", "")),
+            "protocol": str(v.get("protocol", "")),
+            "plugin": str(v.get("pluginName", "")),
+            "severity": _sev(v.get("severity", "2")),
+            "cvss": _cvss(v),
+            "exploit": exploit,
+            "frameworks": str(v.get("exploitFrameworks", "") or ""),
+            "synopsis": str(v.get("synopsis", ""))[:300],
+            "solution": str(v.get("solution", ""))[:300],
+            "os": str(v.get("operatingSystem", "")),
+            "source": "tenable",
+        }
+        cves = [c.strip().upper() for c in str(v.get("cve", "")).replace(";", ",").split(",")
+                if c.strip()]
+        if cves:
+            for cve in cves:
+                out.append({**base, "cve": cve})
+        else:
+            out.append({**base, "cve": ""})
+    return out
+
+
+def _creds_file_path() -> str:
+    return os.environ.get("VAPT_TENABLE_CREDS",
+                          os.path.expanduser("~/.vapt_ai/tenable.json"))
+
+
+def load_creds() -> tuple[str, str, str]:
+    """(host, access_key, secret_key). Env vars win; otherwise read V1's creds file
+    (~/.vapt_ai/tenable.json: {host, access_key, secret_key}). Raises _NotConfigured if
+    neither source has all three. The host may include a scheme — it's stripped."""
+    host = os.environ.get("VAPT_TENABLE_URL", "").strip()
+    ak = os.environ.get("VAPT_TENABLE_ACCESS_KEY", "").strip()
+    sk = os.environ.get("VAPT_TENABLE_SECRET_KEY", "").strip()
+    if not (host and ak and sk):
+        try:
+            with open(_creds_file_path()) as f:
+                c = json.load(f)
+            host = host or str(c.get("host", "")).strip()
+            ak = ak or str(c.get("access_key", "")).strip()
+            sk = sk or str(c.get("secret_key", "")).strip()
+        except Exception:
+            pass
+    if not (host and ak and sk):
+        raise _NotConfigured("no Tenable.sc credentials (set VAPT_TENABLE_* or ~/.vapt_ai/tenable.json)")
+    host = host.replace("https://", "").replace("http://", "").strip("/")
+    return host, ak, sk
+
+
+def _fetch(ip: str, timeout: int = 30) -> dict:
+    host, ak, sk = load_creds()
+    url = f"https://{host}/rest/analysis"
+    filters = [{"filterName": "ip", "operator": "=", "value": ip}] if ip else []
+    payload = json.dumps({
+        "type": "vuln", "sourceType": "cumulative",
+        "query": {"type": "vuln", "tool": "vulndetails", "filters": filters},
+        "columns": _VULN_COLUMNS, "startOffset": 0, "endOffset": 5000,
+    }).encode()
+    req = urllib.request.Request(url, data=payload, method="POST", headers={
+        "X-ApiKey": f"accesskey={ak}; secretkey={sk}",
+        "Content-Type": "application/json", "Accept": "application/json",
+    })
+    ctx = ssl.create_default_context()        # Tenable.sc is commonly self-signed
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:  # noqa: S310
+        return json.loads(resp.read().decode("utf-8", "replace"))
+
+
+class _NotConfigured(Exception):
+    pass
+
+
+def main(argv: list[str]) -> int:
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument("--ip", default="")
+    ap.add_argument("--analysis-file", default="")
+    args = ap.parse_args(argv[1:])
+
+    try:
+        if args.analysis_file:
+            with open(args.analysis_file) as f:
+                response = json.load(f)
+        else:
+            response = _fetch(args.ip)
+    except _NotConfigured as e:
+        print(json.dumps({"error": str(e), "configured": False}), file=sys.stderr)
+        return 3
+    except Exception as e:  # connection / HTTP / parse — honest coverage gap, no fake data
+        print(json.dumps({"error": f"tenable fetch failed: {e}"}), file=sys.stderr)
+        return 2
+
+    count = 0
+    try:
+        for finding in parse_analysis(response):
+            print(json.dumps(finding))
+            count += 1
+        print(json.dumps({"_summary": {"findings": count}}), file=sys.stderr)
+    except BrokenPipeError:
+        # A downstream reader (e.g. `head`) closed the pipe — not an error. Redirect stdout
+        # to /dev/null so the interpreter's final flush doesn't re-raise on exit.
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stdout.fileno())
+        return 0
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))

@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Env & local DBs
+.env
+*.db
+*.sqlite3
+
+# Node / Next
+node_modules/
+.next/
+out/
+npm-debug.log*
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+
+# Celery / long-lived process state
+celerybeat-schedule
+celerybeat-schedule.*
+
+# feroxbuster / scan tool resume state (private per-run data)
+ferox-*.state
+*.ferox-state
+
+# scratchpad outputs
+*.jsonl.tmp

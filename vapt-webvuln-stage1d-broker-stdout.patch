@@ -1,0 +1,26 @@
+--- a/packages/tools/vapt_tools/broker.py
++++ b/packages/tools/vapt_tools/broker.py
+@@ -17,6 +17,14 @@
+ 
+ from .registry import ToolRegistry, ToolSpec
+ 
++# How much of a tool's stdout to keep for the result normalizer to parse. Tools that emit a
++# machine-readable report (e.g. wapiti `-f json`, nuclei/semgrep JSON) write the WHOLE document
++# to stdout, often tens-to-hundreds of KB, and a report cut mid-document is invalid — the parser
++# then finds no findings at all. So keep enough to hold a full report. This is only the in-memory
++# parse buffer; persisted findings are bounded downstream by the per-tool normalizers.
++_STDOUT_PARSE_CAP = 5_000_000
++_STDERR_CAP = 20_000
++
+ 
+ def action_digest(tool_id: str, profile_id: str, target_ref: str, args: dict) -> str:
+     blob = json.dumps(
+@@ -75,7 +83,7 @@
+                 stdin=subprocess.DEVNULL,
+             )
+             finished = datetime.now(UTC)
+-            observations = [{"stdout": proc.stdout[:10000], "stderr": proc.stderr[:2000]}]
++            observations = [{"stdout": proc.stdout[:_STDOUT_PARSE_CAP], "stderr": proc.stderr[:_STDERR_CAP]}]
+             return ToolResult(
+                 outcome="ok" if proc.returncode in spec.ok_exit_codes else "failed",
+                 exit_code=proc.returncode,

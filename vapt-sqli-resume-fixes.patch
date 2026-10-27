@@ -1,0 +1,239 @@
+--- a/packages/tools/vapt_tools/catalog.py	2026-10-15 10:53:31.496422422 +0000
++++ b/packages/tools/vapt_tools/catalog.py	2026-10-15 10:53:37.166554694 +0000
+@@ -120,7 +120,7 @@
+     ("subzy",       ["subzy"],        ["run", "--target", "{domain}"],              _P1, [_SC, _VA], "network"),
+     ("swaks_relay", ["swaks"],        ["--server", "{target}", "--quit-after", "RCPT", "--to", "test@example.com", "--from", "probe@example.com"], _P1, [_SC, _VA], "network"),
+     ("corsy",       ["corsy", "corsy.py"], ["-u", "{url}"],                         _P1, [_SC, _VA], "network"),
+-    ("wapiti",      ["wapiti"],       ["-u", "{url}", "--flush-session"],            _P2, [_SC, _VA], "network"),  # sends payloads → gated
++    ("wapiti",      ["wapiti"],       ["-u", "{url}", "--flush-session", "-f", "json", "-o", "/dev/stdout"], _P2, [_SC, _VA], "network"),  # sends payloads → gated; emit the JSON report on stdout so findings are parsed (not just logged)
+     ("xsstrike",    ["xsstrike", "XSStrike"], ["-u", "{url}"],                       _P2, [_VA, _AT], "network"),
+     ("xsrfprobe",   ["xsrfprobe"],    ["-u", "{url}"],                               _P2, [_VA, _AT], "network"),
+ 
+--- a/packages/agents/vapt_agents/normalize.py	2026-10-15 10:53:31.508766558 +0000
++++ b/packages/agents/vapt_agents/normalize.py	2026-10-15 10:54:12.726553880 +0000
+@@ -83,6 +83,8 @@
+         return _smbmap(text)
+     if tool_id == "cmseek":
+         return _cmseek(text)
++    if tool_id == "wapiti":
++        return _wapiti(text)
+     # Generic: if the tool produced any stdout, record one info observation.
+     if text.strip():
+         return [Observation(tool_id, f"{tool_id} output", "info", {"excerpt": text[:500]})]
+@@ -688,3 +690,70 @@
+         if len(obs) >= 20:
+             break
+     return obs
++
++
++# wapiti vulnerability category -> severity. wapiti's categories are stable strings; the
++# injection / high-impact classes map up, the config/info classes map down. Anything
++# unrecognised is medium — it is still an ACTIVE-scanner confirmed web vuln, never info.
++_WAPITI_SEV: tuple[tuple[tuple[str, ...], str], ...] = (
++    (("sql injection", "command execution", "command injection", "path traversal",
++      "file handling", "remote file inclusion", "local file inclusion", "xxe",
++      "server side request forgery", "ssrf", "deserialization", "spring4shell",
++      "log4shell", "ldap injection", "xpath injection"), "high"),
++    (("cross site scripting", "xss", "cross-site request forgery", "csrf",
++      "open redirect", "crlf", "sql", "injection"), "medium"),
++    (("secure headers", "http methods", "cookie", "content security policy",
++      "fingerprint", "backup file", "htaccess", "internal server error"), "low"),
++)
++
++
++def _wapiti_sev(category: str) -> str:
++    c = category.lower()
++    for needles, sev in _WAPITI_SEV:
++        if any(n in c for n in needles):
++            return sev
++    return "medium"
++
++
++def _wapiti(text: str) -> list[Observation]:
++    """Parse wapiti's JSON report (`-f json`). Each entry under `vulnerabilities`
++    (e.g. 'SQL Injection', 'Cross Site Scripting') becomes one Observation whose severity
++    is derived from its category — so an active-scanner finding such as SQLi surfaces as a
++    real high/medium finding instead of the single generic 'wapiti output' blob the fallback
++    produced before. Defensive: non-JSON or empty output yields no findings, never raises.
++
++    wapiti prints progress to stderr and the report to stdout, possibly with a banner line
++    around it; _first_json tolerates surrounding text."""
++    data = _first_json(text)
++    if not isinstance(data, dict) or not isinstance(data.get("vulnerabilities"), dict):
++        return []
++    out: list[Observation] = []
++    seen: set[tuple] = set()
++    for category, entries in data["vulnerabilities"].items():
++        if not isinstance(entries, list):
++            continue
++        sev = _wapiti_sev(str(category))
++        for e in entries:
++            if not isinstance(e, dict):
++                continue
++            path = str(e.get("path") or e.get("url") or "/")
++            param = str(e.get("parameter") or e.get("param") or "")
++            method = str(e.get("method") or "GET")
++            key = (str(category), method, path, param)
++            if key in seen:
++                continue
++            seen.add(key)
++            title = f"wapiti: {category} at {path}" + (f" (param: {param})" if param else "")
++            detail = {
++                "category": str(category),
++                "method": method,
++                "path": path,
++                "parameter": param,
++                "info": str(e.get("info", ""))[:400],
++                "level": e.get("level"),
++                "http_request": str(e.get("http_request", ""))[:600],
++            }
++            out.append(Observation("wapiti", title[:300], sev, detail))
++            if len(out) >= 100:            # bound a pathological report
++                return out
++    return out
+--- a/packages/agents/vapt_agents/phases.py	2026-10-15 10:53:31.518345472 +0000
++++ b/packages/agents/vapt_agents/phases.py	2026-10-15 10:54:58.842552826 +0000
+@@ -19,7 +19,7 @@
+ from vapt_domain.enums import AgentRole, FindingStatus
+ from vapt_harness import ActionContext, ActionOutcome, GovernedHarness
+ from vapt_persistence import ledger
+-from vapt_persistence.models import Finding, FindingObservation
++from vapt_persistence.models import Approval, Finding, FindingObservation
+ from vapt_tools import action_digest, idempotency_key
+ 
+ from .normalize import Observation, normalize
+@@ -110,6 +110,36 @@
+     return rec is not None and rec.state == "executed"
+ 
+ 
++def prior_decision(db: Session, scope: RunScope, *, task_id: str, tool_id: str, args: dict) -> str | None:
++    """The human verdict already recorded for this exact action, if any.
++
++    A self-looping gated graph node re-runs from the top every time the run resumes after
++    an approval (LangGraph replays the interrupted node). If it simply re-proposed the
++    action, the harness would mint a FRESH pending approval each replay — because the
++    prior approval is no longer 'pending' — and under polling/auto-approval that becomes a
++    runaway loop (same action approved + executed dozens of times). So before proposing, a
++    node asks here whether this action's approval was already decided and acts on that
++    directly instead.
++
++    Returns the Approval state for the action's digest ('approved' | 'approved_batch' |
++    'rejected' | 'changes_requested' | 'expired'), or None when the action was never
++    proposed or its approval is still pending. The digest is read from the recorded
++    ToolActionRecord, so it matches exactly what the harness stored for the approval."""
++    rec = ledger.get_action_by_key(db, action_key(scope, task_id=task_id, tool_id=tool_id, args=args))
++    if rec is None:
++        return None
++    appr = db.execute(
++        select(Approval)
++        .where(
++            Approval.run_id == scope.run_id,
++            Approval.action_digest == rec.action_digest,
++            Approval.state != "pending",
++        )
++        .order_by(Approval.created_at.desc())
++    ).scalars().first()
++    return appr.state if appr else None
++
++
+ def candidate_ids_for_run(db: Session, run_id: str) -> list[str]:
+     """All finding ids for a run (any status). The DB, not graph state, is the source
+     of truth for what the scan phase produced — a graph interrupt discards in-node
+--- a/services/orchestrator/vapt_orch/graph/engagement.py	2026-10-15 10:53:31.528293965 +0000
++++ b/services/orchestrator/vapt_orch/graph/engagement.py	2026-10-15 10:55:26.598552191 +0000
+@@ -213,6 +213,20 @@
+         if phases.already_executed(db, scope, task_id=task_id, tool_id=tool_id, args=args):
+             return {**base, "log": [f"scan: {tool_id} already done; skipping"]}
+ 
++        # Re-entrant on resume: if a human already decided this action's approval, act on
++        # that recorded decision instead of re-proposing it. Re-proposing would mint a new
++        # pending approval on every replay (the prior one is no longer 'pending'), which
++        # under auto/polling approval turns one action into a re-execution loop. Only the
++        # FIRST visit (no decision yet) proposes + interrupts.
++        prior = phases.prior_decision(db, scope, task_id=task_id, tool_id=tool_id, args=args)
++        if prior in ("approved", "approve_batch", "approved_batch"):
++            phases.execute_scan_after_approval(
++                db, scope, harness, tool_id=tool_id, args=args, task_id=task_id)
++            return {**base, "log": [f"scan: {tool_id} executed (resumed after approval)"]}
++        if prior is not None:
++            return {**base, "coverage_gaps": [f"{tool_id}: approval {prior}"],
++                    "log": [f"scan: {tool_id} not approved ({prior})"]}
++
+         step = phases.scan_action(db, scope, harness, tool_id=tool_id, args=args, task_id=task_id)
+ 
+         if step.outcome.approval_id:
+@@ -554,6 +568,23 @@
+         if phases.already_executed(db, scope, task_id=task_id, tool_id=tool_id, args=poc_args):
+             return {**base, "log": [f"attack: PoC {idx} already executed; skipping"]}
+ 
++        # Re-entrant on resume: act on an already-recorded human decision rather than
++        # re-proposing the PoC (which would mint a fresh approval every replay -> loop).
++        # Only the first visit proposes + interrupts. See phases.prior_decision.
++        prior = phases.prior_decision(db, scope, task_id=task_id, tool_id=tool_id, args=poc_args)
++        if prior in ("approved", "approve_batch", "approved_batch"):
++            ex = phases.execute_attack_after_approval(db, scope, harness, task_id=task_id,
++                                                      tool_id=tool_id, args=poc_args)
++            if ex.executed:
++                phases.record_poc_evidence(db, fid, playbook_id=playbook.id,
++                                           tool_id=tool_id, outcome=ex)
++            ledger.record_event(db, scope.run_id, "poc.executed",
++                                {"playbook": playbook.id, "tool": tool_id, "finding_id": fid})
++            return {**base, "log": [f"attack: {playbook.id} PoC {idx} executed (resumed after approval)"]}
++        if prior is not None:
++            return {**base, "coverage_gaps": [f"attack-{idx}: PoC {prior}"],
++                    "log": [f"attack: {playbook.id} PoC {idx} not approved ({prior})"]}
++
+         outcome = phases.propose_attack(db, scope, harness, task_id=task_id, tool_id=tool_id,
+                                         args=poc_args)
+         if not outcome.approval_id:
+@@ -652,6 +683,18 @@
+         if phases.already_executed(db, scope, task_id=task_id, tool_id=tool_id, args=args):
+             return {**base, "log": [f"webvuln: {tool_id} already done; skipping"]}
+ 
++        # Re-entrant on resume: act on an already-recorded human decision rather than
++        # re-proposing (which would mint a fresh approval every replay -> re-execution
++        # loop). Only the first visit proposes + interrupts. See phases.prior_decision.
++        prior = phases.prior_decision(db, scope, task_id=task_id, tool_id=tool_id, args=args)
++        if prior in ("approved", "approve_batch", "approved_batch"):
++            phases.execute_scan_after_approval(
++                db, scope, harness, tool_id=tool_id, args=args, task_id=task_id)
++            return {**base, "log": [f"webvuln: {tool_id} executed (resumed after approval)"]}
++        if prior is not None:
++            return {**base, "coverage_gaps": [f"{tool_id}: approval {prior}"],
++                    "log": [f"webvuln: {tool_id} not approved ({prior})"]}
++
+         step = phases.scan_action(db, scope, harness, tool_id=tool_id, args=args, task_id=task_id)
+         if step.outcome.approval_id:
+             verdict = interrupt({
+--- a/services/orchestrator/vapt_orch/tasks.py	2026-10-15 10:53:31.542554822 +0000
++++ b/services/orchestrator/vapt_orch/tasks.py	2026-10-15 10:55:39.890551887 +0000
+@@ -19,7 +19,6 @@
+ from vapt_harness import GovernedHarness
+ from vapt_persistence import init_engine, session_scope
+ from vapt_persistence.models import (
+-    Approval,
+     Engagement,
+     Outbox,
+     Run,
+@@ -386,14 +385,13 @@
+         if not has_pending:
+             return {"status": "noop_no_interrupt", "run_id": run_id}
+ 
+-        # Record the human decision on the pending approval(s).
+-        state = {"approve": "approved", "approve_batch": "approved_batch"}.get(decision, "rejected")
+-        for appr in db.query(Approval).filter(Approval.run_id == run.id,
+-                                              Approval.state == "pending").all():
+-            appr.state = state
+-        db.add(RunEvent(run_id=run.id, seq=_next_seq(db, run.id),
+-                        kind="approval.decided", payload={"decision": decision}))
+-
++        # The approval decision is recorded authoritatively by the API decide endpoint:
++        # it sets Approval.state and logs approval.decided (with the approval_id + reviewer)
++        # in the same transaction that enqueues this resume. resume_run must NOT also flip
++        # approvals here — the old bulk "mark every pending approval approved" (a) double-
++        # logged the decision and (b) could approve an unrelated action on a duplicate
++        # resume. The graph nodes read the recorded per-action decision via
++        # phases.prior_decision, so here we only drive the graph forward.
+         run.status = "running"
+         final_state = _drive_graph(graph, Command(resume={"decision": decision}), config, db)
+         return _finalize(db, run, final_state)

@@ -1,0 +1,260 @@
+--- /dev/null
++++ b/packages/persistence/vapt_persistence/web_credentials.py
+@@ -0,0 +1,73 @@
++"""Ephemeral, run-scoped web-login credentials for authenticated scanning (Stage 2).
++
++The runtime "log in?" dialog collects a test-account username/password at scan time. Those
++are a live secret, so they are held ONLY here: in Redis, under a short TTL, keyed by run id.
++They are NEVER written to the SQL database, the LangGraph checkpoint, the transactional
++outbox, a ToolActionRecord, or the ledger — the three durable stops on the approve/resume
++path carry only a decision, never the secret. The API writes the slot; the webvuln node
++reads it at scan time and feeds it to wapiti's `--form-*` login via the process env; the slot
++is cleared when the webvuln phase ends and TTL-expires as a backstop.
++
++Redis is already the Celery transport (VAPT_REDIS_URL), so no new dependency. Reads fail
++SAFE: any Redis problem yields "no credentials" → the scan simply runs unauthenticated,
++never an error. A write failure is raised so the operator learns the credentials were not
++stored (rather than silently scanning logged-out).
++"""
++from __future__ import annotations
++
++import json
++import os
++
++_PREFIX = "vapt:webcreds:"
++# How long a submitted credential may live in Redis. Covers one run's active window; the
++# node also clears it explicitly at phase end. Bounded, never indefinite.
++_DEFAULT_TTL = int(os.environ.get("VAPT_WEB_CREDS_TTL", "3600"))
++_MAX_FIELD = 8192
++
++
++def _client():
++    # Imported lazily so a deployment without the redis lib still imports this module (the
++    # feature then degrades to unauthenticated scanning rather than breaking startup).
++    import redis
++
++    return redis.Redis.from_url(
++        os.environ.get("VAPT_REDIS_URL", "redis://localhost:6379/0"),
++        socket_timeout=3,
++    )
++
++
++def set_web_credentials(run_id: str, username: str, password: str, *, ttl: int | None = None) -> None:
++    """Stash one run's web-login credentials in the TTL slot. Raises on a bad field or a
++    Redis failure so the caller (API) can tell the operator the creds were not stored."""
++    if not run_id:
++        raise ValueError("run_id required")
++    if not username or not password:
++        raise ValueError("username and password required")
++    if len(username) > _MAX_FIELD or len(password) > _MAX_FIELD:
++        raise ValueError("credential field too long")
++    if any(c in username + password for c in ("\r", "\n", "\x00")):
++        raise ValueError("credential contains control characters")
++    payload = json.dumps({"u": username, "p": password})
++    _client().set(_PREFIX + run_id, payload, ex=max(1, ttl if ttl is not None else _DEFAULT_TTL))
++
++
++def get_web_credentials(run_id: str) -> tuple[str, str] | None:
++    """Return (username, password) for this run, or None. Fails SAFE: any error → None, so
++    a Redis hiccup makes the scan run unauthenticated rather than crash the graph."""
++    try:
++        raw = _client().get(_PREFIX + run_id)
++        if not raw:
++            return None
++        d = json.loads(raw)
++        u, p = str(d.get("u", "")), str(d.get("p", ""))
++        return (u, p) if (u and p) else None
++    except Exception:
++        return None
++
++
++def clear_web_credentials(run_id: str) -> None:
++    """Delete the slot (called when the webvuln phase ends). Best-effort; TTL is the backstop."""
++    try:
++        _client().delete(_PREFIX + run_id)
++    except Exception:
++        pass
+--- a/packages/domain/vapt_domain/schemas.py
++++ b/packages/domain/vapt_domain/schemas.py
+@@ -149,6 +149,13 @@
+     summary: str | None = None        # one-line "what will run"
+     detail: str | None = None         # the tool's own description
+     reason: str | None = None         # why approval is required
++    # Authenticated scanning (Stage 2): set when this action is a web scan that found a login
++    # form, so the UI can offer an optional "log in?" credentials dialog alongside approve.
++    # The credentials themselves are NEVER carried on an approval — they go to the ephemeral
++    # slot via the separate web-credentials endpoint; only this hint and the (non-secret)
++    # login URL travel here.
++    needs_web_credentials: bool = False
++    login_url: str | None = None
+ 
+     model_config = {"from_attributes": True}
+ 
+--- a/services/api/vapt_api/routers/approvals.py
++++ b/services/api/vapt_api/routers/approvals.py
+@@ -16,7 +16,7 @@
+ from sqlalchemy.orm import Session
+ from vapt_domain.enums import ApprovalState, PolicyClass, Role, RunStatus
+ from vapt_domain.schemas import ApprovalOut
+-from vapt_persistence import ledger
++from vapt_persistence import ledger, web_credentials
+ from vapt_persistence.models import Approval, Engagement, Outbox, Run, ToolActionRecord
+ 
+ from ..deps import CurrentUser, get_current_user, get_db, require_project_role
+@@ -70,6 +70,12 @@
+         out.reason = ("Intrusive action — requires approval."
+                       if appr.policy_class == PolicyClass.P2_INTRUSIVE.value
+                       else "Action is gated for this engagement — requires approval.")
++    # Authenticated scanning (Stage 2): an active web scan that discovered a login form can
++    # take optional login credentials, so the UI offers a "log in?" dialog. Only the hint and
++    # the non-secret login URL are surfaced; credentials go via the web-credentials endpoint.
++    if rec.tool_id == "wapiti" and args.get("login_url"):
++        out.needs_web_credentials = True
++        out.login_url = str(args["login_url"])
+     return out
+ 
+ 
+@@ -182,3 +188,58 @@
+     db.commit()
+     db.refresh(appr)
+     return _enrich(db, appr)
++
++
++class WebCredentialsRequest(BaseModel):
++    username: str
++    password: str
++
++
++@router.post("/{approval_id}/web-credentials", status_code=status.HTTP_204_NO_CONTENT)
++def submit_web_credentials(
++    approval_id: str,
++    body: WebCredentialsRequest,
++    db: Session = Depends(get_db),
++    user: CurrentUser = Depends(get_current_user),
++) -> None:
++    """Attach web-login credentials to a pending authenticated-scan approval so the run can
++    log in with them. The credentials go ONLY to the ephemeral Redis slot (short TTL, keyed
++    by run) — never to the approval record, the outbox, the checkpoint, or any durable store.
++    Call this (optionally) BEFORE approving the scan; skip it to scan unauthenticated. The
++    webvuln node consumes the slot at scan time and clears it when the phase ends. Only the
++    fact that credentials were provided (not the credentials) is written to the audit ledger."""
++    appr = db.get(Approval, approval_id)
++    if appr is None:
++        raise HTTPException(status.HTTP_404_NOT_FOUND, "approval not found")
++    _, project_id = _run_and_project(db, appr.run_id)
++    require_project_role(project_id, user, Role.LEAD, Role.REVIEWER)
++    if appr.state != ApprovalState.PENDING.value:
++        raise HTTPException(status.HTTP_409_CONFLICT, f"approval already {appr.state}")
++
++    # Confirm this approval really is an authenticated web scan (a login form was detected),
++    # so credentials can't be stashed against an unrelated action.
++    rec = db.execute(
++        select(ToolActionRecord)
++        .where(ToolActionRecord.run_id == appr.run_id,
++               ToolActionRecord.action_digest == appr.action_digest)
++        .order_by(ToolActionRecord.created_at.desc())
++    ).scalars().first()
++    login_url = (rec.args or {}).get("login_url") if rec else None
++    if not (rec and rec.tool_id == "wapiti" and login_url):
++        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
++                            "approval is not an authenticated web scan")
++
++    try:
++        web_credentials.set_web_credentials(appr.run_id, body.username, body.password)
++    except ValueError as e:
++        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(e))
++    except Exception:
++        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE,
++                            "credential store unavailable; credentials not saved")
++
++    # Audit WHO provided credentials for which login — never the credentials themselves.
++    ledger.record_event(
++        db, appr.run_id, "webvuln.credentials_provided",
++        {"approval_id": appr.id, "by": user.id, "login_url": str(login_url)},
++    )
++    db.commit()
+--- a/services/orchestrator/vapt_orch/graph/engagement.py
++++ b/services/orchestrator/vapt_orch/graph/engagement.py
+@@ -33,6 +33,7 @@
+ """
+ from __future__ import annotations
+ 
++import os
+ from collections.abc import Callable
+ 
+ from langgraph.graph import END, START, StateGraph
+@@ -58,7 +59,7 @@
+ from vapt_agents.report import findings_brief
+ from vapt_agents.runscope import RunScope
+ from vapt_harness import GovernedHarness
+-from vapt_persistence import ledger
++from vapt_persistence import ledger, web_credentials
+ 
+ from .state import EngagementState
+ 
+@@ -679,12 +680,45 @@
+         if not plan_items:
+             return {"phase": "attack", "log": ["webvuln: no web endpoint to actively test"]}
+         if idx >= len(plan_items) or iters > SCAN.max_iterations:
++            # Phase done: drop any run-scoped web-login credentials from the slot (TTL is
++            # the backstop) so a secret never outlives the scan that needed it.
++            web_credentials.clear_web_credentials(scope.run_id)
+             return {"phase": "attack", "webvuln_iters": iters,
+                     "log": ["webvuln: active web-vuln pass complete"]}
+ 
+         tool_id, args, task_id = plan_items[idx]
+         base = {"phase": "webvuln", "webvuln_idx": idx + 1, "webvuln_iters": iters}
+ 
++        def _execute() -> None:
++            """Execute the (approved) action. For an authenticated wapiti scan, pull the
++            run's web-login credentials from the ephemeral slot and expose them to the argv
++            builder through the process env for THIS call only, then restore — so the
++            password reaches wapiti's `--form-*` login without ever entering the action args,
++            the digest, the ledger or the checkpoint. No creds in the slot (operator skipped,
++            or none asked) => an unauthenticated scan, unchanged."""
++            login_url = args.get("login_url") if isinstance(args, dict) else None
++            creds = (web_credentials.get_web_credentials(scope.run_id)
++                     if (tool_id == "wapiti" and login_url) else None)
++            if not creds:
++                phases.execute_scan_after_approval(
++                    db, scope, harness, tool_id=tool_id, args=args, task_id=task_id)
++                return
++            user, pw = creds
++            keys = ("VAPT_WEB_LOGIN_URL", "VAPT_WEB_LOGIN_USER", "VAPT_WEB_LOGIN_PASSWORD")
++            saved = {k: os.environ.get(k) for k in keys}
++            try:
++                os.environ["VAPT_WEB_LOGIN_URL"] = str(login_url)
++                os.environ["VAPT_WEB_LOGIN_USER"] = user
++                os.environ["VAPT_WEB_LOGIN_PASSWORD"] = pw
++                phases.execute_scan_after_approval(
++                    db, scope, harness, tool_id=tool_id, args=args, task_id=task_id)
++            finally:
++                for k, v in saved.items():
++                    if v is None:
++                        os.environ.pop(k, None)
++                    else:
++                        os.environ[k] = v
++
+         # Don't force a human approval for a scanner whose binary isn't installed — it would
+         # only ever no-op. Record an honest coverage gap and move on.
+         if not harness.tool_available(tool_id, {**args}):
+@@ -698,8 +732,7 @@
+         # loop). Only the first visit proposes + interrupts. See phases.prior_decision.
+         prior = phases.prior_decision(db, scope, task_id=task_id, tool_id=tool_id, args=args)
+         if prior in ("approved", "approve_batch", "approved_batch"):
+-            phases.execute_scan_after_approval(
+-                db, scope, harness, tool_id=tool_id, args=args, task_id=task_id)
++            _execute()
+             return {**base, "log": [f"webvuln: {tool_id} executed (resumed after approval)"]}
+         if prior is not None:
+             return {**base, "coverage_gaps": [f"{tool_id}: approval {prior}"],
+@@ -717,8 +750,7 @@
+             })
+             decision = (verdict or {}).get("decision", "reject")
+             if decision in ("approve", "approve_batch"):
+-                phases.execute_scan_after_approval(
+-                    db, scope, harness, tool_id=tool_id, args=args, task_id=task_id)
++                _execute()
+                 return {**base, "log": [f"webvuln: {tool_id} approved and executed"]}
+             return {**base, "coverage_gaps": [f"{tool_id}: approval {decision}"],
+                     "log": [f"webvuln: {tool_id} not approved ({decision})"]}

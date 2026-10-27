@@ -1,0 +1,85 @@
+# Internal-beta deployment (plan §3, §12). Only the reverse proxy is meant to be
+# exposed; API, gateway, broker and DB stay on the private network. Replace all
+# default credentials before any non-local use.
+services:
+  mariadb:
+    image: mariadb:11.4
+    environment:
+      MARIADB_DATABASE: vapt_v2
+      MARIADB_USER: vapt
+      MARIADB_PASSWORD: ${VAPT_DB_PASSWORD:-change-me}
+      MARIADB_ROOT_PASSWORD: ${VAPT_DB_ROOT_PASSWORD:-change-me-root}
+    volumes:
+      - mariadb_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks: [backend]
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    networks: [backend]
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${VAPT_MINIO_USER:-vaptminio}
+      MINIO_ROOT_PASSWORD: ${VAPT_MINIO_PASSWORD:-change-me-minio}
+    volumes:
+      - minio_data:/data
+    networks: [backend]
+
+  api:
+    build:
+      context: ..
+      dockerfile: infra/api.Dockerfile
+    environment:
+      VAPT_DATABASE_URL: mysql+pymysql://vapt:${VAPT_DB_PASSWORD:-change-me}@mariadb:3306/vapt_v2
+      VAPT_REDIS_URL: redis://redis:6379/0
+      VAPT_COOKIE_SECURE: "false"
+      VAPT_BOOTSTRAP_ADMIN_PASSWORD: ${VAPT_BOOTSTRAP_ADMIN_PASSWORD:-change-me-on-first-run}
+    depends_on:
+      mariadb:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    networks: [backend]
+    ports:
+      - "8000:8000"  # dev only; behind the proxy in staging/prod
+
+  worker:
+    build:
+      context: ..
+      dockerfile: infra/worker.Dockerfile
+    environment:
+      VAPT_DATABASE_URL: mysql+pymysql://vapt:${VAPT_DB_PASSWORD:-change-me}@mariadb:3306/vapt_v2
+      VAPT_REDIS_URL: redis://redis:6379/0
+    depends_on:
+      mariadb:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    networks: [backend]
+
+  web:
+    build:
+      context: ../apps/web
+      dockerfile: Dockerfile
+    environment:
+      NEXT_PUBLIC_API_BASE: http://localhost:8000
+    depends_on: [api]
+    networks: [backend, frontend]
+    ports:
+      - "3000:3000"
+
+volumes:
+  mariadb_data:
+  minio_data:
+
+networks:
+  backend:
+  frontend:

@@ -1,0 +1,470 @@
+#!/usr/bin/env python3
+"""Deterministic IDOR (Insecure Direct Object Reference) probe — v3.0.
+
+Owner-vs-non-owner model
+------------------------
+Real-world IDOR on object references (orders, invoices, receipts, bookings)
+usually keys the object by an UNGUESSABLE token (a 32-char hex / UUID), not a
+sequential integer. The vuln is: user B can read user C's object simply by
+holding C's token. The tell is NOT that two users see *different* bodies at the
+same URL (the old v2 heuristic) — it is the OPPOSITE: a non-owner sees the SAME
+body the owner sees. v2 inverted this and missed every token-based IDOR
+(DineHub's /order?id=<hex> among them).
+
+v3 strategy:
+  1. Load every available authenticated session (A/B/C cookies from Redis).
+  2. HARVEST: for each user, fetch their object-LISTING pages (e.g. /orders)
+     and extract the object-reference URLs that belong to THEM (hrefs like
+     /order?id=<tok>, /order/track/<tok>, /invoice/<tok>, …). Because each
+     user's listing shows only their own objects, this establishes OWNERSHIP.
+  3. CROSS-ACCESS: for each object URL owned by user X, request it as every
+     OTHER user Y. If Y gets a 200 whose body is substantially similar to what
+     owner X sees (and is real content, not a login/denied/empty page, and not
+     the same thing an unauthenticated client gets) → confirmed IDOR: Y read
+     X's private object.
+
+Legacy numeric enumeration is kept as a secondary mode: for a seeded URL with a
+numeric id, rewrite it to an adjacent id and check whether a second account can
+read the neighbour.
+
+Public per-resource pages (/restaurant/*/menu, /products/*, …) are skipped:
+every user is supposed to see them, so they are never IDOR candidates.
+
+Emits ONE JSON record to stdout:
+    {"findings": [{"type": "idor", "severity": "high", "url", "param",
+                   "evidence", "confirmed": true}, ...],
+     "trace":    [{"url", "status", "note"}, ...]}
+
+Safety: GET only, bounded request budget, in-scope-only URLs, argv-only.
+"""
+from __future__ import annotations
+
+import argparse
+import difflib
+import json
+import os
+import re
+import sys
+from urllib.parse import urljoin, urlparse, parse_qsl, urlencode, urlunparse
+
+try:
+    import requests
+except Exception as e:
+    print(json.dumps({"error": f"requests not available: {e}", "findings": []}))
+    sys.exit(0)
+
+_UA = "vapt-idor-probe/3.0 (authorized assessment)"
+_TIMEOUT = 10
+_BUDGET = 160
+_MIN_BODY = 400          # a real object page is substantial; below this is a stub/denied
+_SIM_HIT = 0.90          # non-owner body this similar to owner's = same object served
+
+# Numeric ID in a path segment: /42, /123/, /42?… etc. (legacy enumeration mode).
+_PATH_ID_RE = re.compile(r"/(\d{1,10})(?=/|\?|$)")
+
+# An object TOKEN: long hex (>=16), a UUID, or a short integer. Used both to
+# recognise object-reference URLs and to decide a path segment is an id.
+_TOKEN_RE = re.compile(
+    r"[0-9a-f]{16,}"                                   # long hex (order tokens)
+    r"|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"  # uuid
+    r"|\d{1,10}",                                      # short integer
+    re.IGNORECASE,
+)
+
+# Query-param names that typically carry an object id/token.
+_ID_PARAM_NAMES = frozenset({
+    "id", "oid", "uid", "pid", "order", "order_id", "orderid",
+    "invoice", "invoice_id", "receipt", "receipt_id", "booking", "booking_id",
+    "ticket", "ticket_id", "user", "user_id", "userid", "account", "account_id",
+    "item", "item_id", "object", "object_id", "ref", "num", "token", "uuid", "guid",
+})
+
+# Path prefixes that denote a per-user object (not public catalog data).
+_OBJECT_PATH_RE = re.compile(
+    r"/(?:order|orders|invoice|invoices|receipt|receipts|booking|bookings|"
+    r"ticket|tickets|reservation|reservations|payment|payments|transaction|"
+    r"transactions|document|documents|report|reports|message|messages)"
+    r"(?:/track)?/(?:[0-9a-f]{8,}|[0-9a-f-]{32,}|\d{1,10})(?:[/?]|$)",
+    re.IGNORECASE,
+)
+
+# Listing pages to visit per user to harvest their own object URLs. Relative to
+# each in-scope base. Bounded, generic across typical apps.
+_LISTING_PATHS = (
+    "/orders", "/order/history", "/account/orders", "/my-orders",
+    "/invoices", "/receipts", "/bookings", "/tickets", "/reservations",
+    "/account", "/dashboard", "/profile", "/history", "/transactions",
+)
+
+# PUBLIC per-resource pages — never IDOR candidates (every user sees the same).
+_PUBLIC_DATA_RE = re.compile(
+    r"/(?:restaurant|restaurants|product|products|category|categories|"
+    r"catalog|menu|item|items|post|posts|article|articles|page|pages|"
+    r"blog|news|review|reviews)s?(?:/\d+)?(?:/[^?]*)?$",
+    re.IGNORECASE,
+)
+
+# Markers that a response is an access-denied / login / not-found page rather
+# than real object content.
+_DENIED_RE = re.compile(
+    r"not\s+authori[sz]ed|unauthori[sz]ed|forbidden|access\s+denied|"
+    r"permission\s+denied|please\s+log\s*in|login\s+required|sign\s+in|"
+    r"not\s+found|does\s+not\s+exist|no\s+such\s+order|invalid\s+order",
+    re.IGNORECASE,
+)
+_LOGIN_FORM_RE = re.compile(r"""<input\b[^>]*\btype\s*=\s*["']password["']""", re.IGNORECASE)
+
+
+def _in_scope(target_host: str, url: str) -> bool:
+    try:
+        return urlparse(url).hostname == target_host
+    except Exception:
+        return False
+
+
+def _is_public_data(url: str) -> bool:
+    try:
+        parsed = urlparse(url)
+        if any(p[0].lower() in _ID_PARAM_NAMES for p in parse_qsl(parsed.query)):
+            return False  # an explicit id param overrides the public-prefix skip
+        return bool(_PUBLIC_DATA_RE.search(parsed.path or ""))
+    except Exception:
+        return False
+
+
+def _looks_like_object_url(url: str) -> bool:
+    """True when the URL references a specific per-user object (by token/id),
+    i.e. a real IDOR candidate — not a public catalog page, not a bare listing."""
+    if _is_public_data(url):
+        return False
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+    # Query-param id/token (e.g. /order?id=<hex>)
+    for name, value in parse_qsl(parsed.query, keep_blank_values=True):
+        if name.lower() in _ID_PARAM_NAMES and value and _TOKEN_RE.fullmatch(value):
+            return True
+    # Object path with a token/id (e.g. /order/track/<hex>, /invoice/42)
+    if _OBJECT_PATH_RE.search(parsed.path or ""):
+        return True
+    return False
+
+
+def _redis_cookies(run_id: str) -> dict[str, str]:
+    """Load every per-account session cookie available (A=admin, B=user1, C=user2)."""
+    if not run_id:
+        return {}
+    try:
+        import redis
+        r = redis.Redis.from_url(
+            os.environ.get("VAPT_REDIS_URL", "redis://localhost:6379/0"),
+            socket_timeout=3,
+        )
+        out: dict[str, str] = {}
+        for slot in ("A", "B", "C"):
+            v = r.get(f"vapt:webcookie:{run_id}:{slot}")
+            if v:
+                out[slot] = v.decode() if isinstance(v, bytes) else str(v)
+        return out
+    except Exception:
+        return {}
+
+
+def _users(cookies: dict[str, str]) -> list[tuple[str, str]]:
+    """Ordered (label, cookie) for every present session. Prefer the two normal
+    users (B, C) first so cross-tenant comparisons avoid admin-only noise, with
+    admin (A) last as an extra actor."""
+    order = [("user1", "B"), ("user2", "C"), ("admin", "A")]
+    return [(label, cookies[slot]) for label, slot in order if cookies.get(slot)]
+
+
+def _session(cookie: str) -> "requests.Session":
+    s = requests.Session()
+    s.headers.update({"User-Agent": _UA, "Accept": "*/*"})
+    if cookie:
+        s.headers["Cookie"] = cookie
+    return s
+
+
+def _get(sess, url, budget_box):
+    if budget_box[0] <= 0:
+        return None
+    budget_box[0] -= 1
+    try:
+        return sess.get(url, timeout=_TIMEOUT, allow_redirects=False)
+    except Exception:
+        return None
+
+
+def _is_real_content(resp) -> bool:
+    """True when the response is substantive object content, not a denial/login/stub."""
+    if resp is None or resp.status_code != 200:
+        return False
+    body = resp.text or ""
+    if len(body) < _MIN_BODY:
+        return False
+    if _LOGIN_FORM_RE.search(body):
+        return False
+    if _DENIED_RE.search(body):
+        return False
+    return True
+
+
+def _similar(a: str, b: str) -> float:
+    return difflib.SequenceMatcher(None, (a or "")[:6000], (b or "")[:6000]).ratio()
+
+
+def _bases_from_urls(target: str, urls: list[str]) -> list[str]:
+    """Distinct scheme://netloc bases (in scope) seen across the seed URLs."""
+    bases: list[str] = []
+    for u in urls:
+        try:
+            p = urlparse(u)
+        except Exception:
+            continue
+        if p.hostname != target:
+            continue
+        base = f"{p.scheme}://{p.netloc}"
+        if base not in bases:
+            bases.append(base)
+    return bases
+
+
+def _extract_object_urls(html: str, base: str, target: str) -> list[str]:
+    """Pull object-reference URLs (href/action) out of a listing page."""
+    out: list[str] = []
+    for m in re.finditer(r"""(?:href|action)\s*=\s*["']([^"']+)["']""", html or "",
+                         re.IGNORECASE):
+        raw = m.group(1).strip()
+        if not raw or raw.startswith(("#", "javascript:", "mailto:")):
+            continue
+        url = raw if raw.lower().startswith(("http://", "https://")) \
+            else urljoin(base + "/", raw.lstrip("/"))
+        if not _in_scope(target, url):
+            continue
+        if _looks_like_object_url(url) and url not in out:
+            out.append(url)
+    return out
+
+
+def _harvest(users, bases, target, budget_box, trace):
+    """Return {object_url: owner_label} by visiting each user's listing pages and
+    attributing every object URL found there to that user (first owner wins)."""
+    owned: dict[str, str] = {}
+    for label, cookie in users:
+        sess = _session(cookie)
+        seen_pages = 0
+        for base in bases:
+            for path in _LISTING_PATHS:
+                if budget_box[0] <= 0 or seen_pages >= 8:
+                    break
+                r = _get(sess, base + path, budget_box)
+                if r is None:
+                    continue
+                seen_pages += 1
+                if r.status_code != 200 or not r.text:
+                    trace.append({"url": base + path, "status": r.status_code,
+                                  "note": f"{label} listing (skip)"})
+                    continue
+                found = _extract_object_urls(r.text, base, target)
+                for u in found:
+                    owned.setdefault(u, label)
+                if found:
+                    trace.append({"url": base + path, "status": 200,
+                                  "note": f"{label} owns {len(found)} object url(s)"})
+    return owned
+
+
+def _cross_access(users, owned, budget_box, trace):
+    """For each owned object URL, check whether a NON-owner can read it."""
+    findings: list[dict] = []
+    # Unauthenticated baseline session (no cookie) to rule out public objects.
+    anon = _session("")
+    for url, owner in owned.items():
+        owner_cookie = dict(users).get(owner)
+        if not owner_cookie:
+            continue
+        owner_resp = _get(_session(owner_cookie), url, budget_box)
+        if not _is_real_content(owner_resp):
+            trace.append({"url": url, "status": getattr(owner_resp, "status_code", None),
+                          "note": f"owner {owner}: no baseline content (skip)"})
+            continue
+        owner_body = owner_resp.text
+        # Public check: an anonymous client getting the same content means it is
+        # not access-controlled at all — report separately, not as cross-tenant.
+        anon_resp = _get(anon, url, budget_box)
+        anon_same = _is_real_content(anon_resp) and _similar(owner_body, anon_resp.text) >= _SIM_HIT
+        for ylabel, ycookie in users:
+            if ylabel == owner:
+                continue
+            yr = _get(_session(ycookie), url, budget_box)
+            if not _is_real_content(yr):
+                trace.append({"url": url, "status": getattr(yr, "status_code", None),
+                              "note": f"{ylabel} denied/empty (good)"})
+                continue
+            sim = _similar(owner_body, yr.text)
+            trace.append({"url": url, "status": yr.status_code,
+                          "note": f"{ylabel} 200 sim={sim:.2f} vs owner {owner}"})
+            if sim >= _SIM_HIT:
+                # A non-owner read the owner's object — that is the IDOR. If the
+                # object is ALSO reachable with no cookie at all, that is an
+                # aggravating factor (missing auth entirely), not a different bug,
+                # so we fold it into the evidence and bump severity to critical.
+                evidence = (f"non-owner '{ylabel}' retrieved object owned by "
+                            f"'{owner}' (HTTP 200, body sim={sim:.2f} to owner's "
+                            f"view) — cross-tenant object access")
+                severity = "high"
+                if anon_same:
+                    evidence += ("; object is ALSO readable with NO authentication "
+                                 "(leaks to anonymous clients) — missing access control")
+                    severity = "critical"
+                findings.append({
+                    "type": "idor", "severity": severity,
+                    "url": url, "param": "object-token",
+                    "evidence": evidence, "confirmed": True,
+                })
+                break  # one confirmation per object URL is enough
+    return findings
+
+
+def _rewrite_path_id(url: str, new_id: str) -> str:
+    return _PATH_ID_RE.sub(f"/{new_id}", url, count=1)
+
+
+def _rewrite_query_id(url: str, param: str, new_id: str) -> str:
+    parsed = urlparse(url)
+    pairs = parse_qsl(parsed.query, keep_blank_values=True)
+    rewritten = [(k, (new_id if k.lower() == param.lower() else v)) for k, v in pairs]
+    return urlunparse(parsed._replace(query=urlencode(rewritten)))
+
+
+def _numeric_targets(url: str) -> list[tuple[str, str, str]]:
+    """(kind, location, current_id) for each NUMERIC id in the URL (enumeration mode)."""
+    out: list[tuple[str, str, str]] = []
+    parsed = urlparse(url)
+    for m in _PATH_ID_RE.finditer(parsed.path or ""):
+        out.append(("path", "path-id", m.group(1)))
+    for name, value in parse_qsl(parsed.query, keep_blank_values=True):
+        if name.lower() in _ID_PARAM_NAMES and re.fullmatch(r"\d{1,10}", value or ""):
+            out.append(("query", name, value))
+    return out
+
+
+def _enumerate(users, seed_urls, budget_box, trace):
+    """Legacy numeric-enumeration mode: for a seeded URL with a numeric id, have
+    the FIRST user fetch it, rewrite the id to a neighbour, and check whether a
+    SECOND user can read that neighbour with substantively different content."""
+    findings: list[dict] = []
+    if len(users) < 2:
+        return findings
+    (_la, ca), (_lb, cb) = users[0], users[1]
+    sa, sb = _session(ca), _session(cb)
+    for url in seed_urls:
+        if budget_box[0] <= 0:
+            break
+        if _is_public_data(url) or not _in_scope(urlparse(url).hostname or "", url):
+            pass
+        targets = _numeric_targets(url)
+        if not targets:
+            continue
+        kind, loc, cur = targets[0]
+        try:
+            neighbour = str(int(cur) + 1)
+        except Exception:
+            continue
+        alt = _rewrite_path_id(url, neighbour) if kind == "path" \
+            else _rewrite_query_id(url, loc, neighbour)
+        r_owner = _get(sa, alt, budget_box)   # does user A see object #(n+1)?
+        if not _is_real_content(r_owner):
+            continue
+        r_other = _get(sb, alt, budget_box)   # can user B see the same object?
+        if not _is_real_content(r_other):
+            continue
+        if _similar(r_owner.text, r_other.text) >= _SIM_HIT:
+            findings.append({
+                "type": "idor", "severity": "high",
+                "url": alt, "param": (f"path-id→{neighbour}" if kind == "path"
+                                      else f"?{loc}={neighbour}"),
+                "evidence": (f"two accounts both read object id {neighbour} with "
+                             f"identical content (enumerable IDOR)"),
+                "confirmed": True,
+            })
+    return findings
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--target", required=True)
+    ap.add_argument("--urls", default="",
+                    help="comma-separated in-scope seed URLs (object + listing hints)")
+    args = ap.parse_args()
+    target = args.target
+    run_id = os.environ.get("VAPT_RUN_ID", "").strip()
+    cookies = _redis_cookies(run_id)
+    users = _users(cookies)
+    if len(users) < 2:
+        print(json.dumps({"error": "need at least two account cookies in redis "
+                                   "(:B and :C, or :A and :B)", "findings": []}))
+        return 0
+
+    seed_urls = [u.strip() for u in args.urls.split(",")
+                 if u.strip().lower().startswith(("http://", "https://"))
+                 and _in_scope(target, u.strip())]
+    bases = _bases_from_urls(target, seed_urls) or []
+    if not bases:
+        # Fall back to deriving a base from the seed list host:port even if none
+        # matched (shouldn't happen) — otherwise nothing to harvest.
+        for u in seed_urls:
+            p = urlparse(u)
+            bases = [f"{p.scheme}://{p.netloc}"]
+            break
+
+    budget_box = [_BUDGET]
+    trace: list[dict] = [{"accounts": ",".join(l for l, _ in users), "note": "sessions"}]
+
+    # 1) Harvest each user's own object URLs from their listing pages (establishes ownership).
+    owned = _harvest(users, bases, target, budget_box, trace)
+    # 2) Also treat any seeded URL that already points at a specific object as a
+    #    candidate — but we only know its owner if harvesting attributed it.
+    for u in seed_urls:
+        if _looks_like_object_url(u):
+            owned.setdefault(u, _harvest_owner(users, u, budget_box, trace))
+
+    owned = {u: o for u, o in owned.items() if o}  # keep only owner-attributed URLs
+
+    findings = _cross_access(users, owned, budget_box, trace)
+
+    # 3) Secondary: numeric enumeration on seeded numeric URLs (non-public).
+    enum_seeds = [u for u in seed_urls if not _is_public_data(u) and _numeric_targets(u)]
+    findings += _enumerate(users, enum_seeds, budget_box, trace)
+
+    # De-dup findings by (type, url).
+    seen = set()
+    uniq = []
+    for f in findings:
+        key = (f["type"], f["url"])
+        if key not in seen:
+            seen.add(key)
+            uniq.append(f)
+        if len(uniq) >= 25:
+            break
+
+    print(json.dumps({"findings": uniq, "trace": trace[:60]}))
+    return 0
+
+
+def _harvest_owner(users, url, budget_box, trace):
+    """Attribute a specific object URL to whichever user can retrieve it as real
+    content — used for seeded object URLs not found via a listing page. Returns a
+    label or ''. Note: a seeded token typically belongs to the crawling session
+    (often admin); harvesting from listings is preferred for clean ownership."""
+    for label, cookie in users:
+        r = _get(_session(cookie), url, budget_box)
+        if _is_real_content(r):
+            return label
+    return ""
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

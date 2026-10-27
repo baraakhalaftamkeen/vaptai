@@ -1,0 +1,21 @@
+# Direct backend dependencies (top-level). Pinned versions frozen during the
+# Week 1 compatibility spike — see backend.lock.txt for the full transitive set.
+fastapi==0.142.4
+uvicorn[standard]==0.54.0
+sqlalchemy==2.1.4
+alembic==1.20.0
+pymysql==1.2.3
+cryptography==50.0.2
+pydantic==2.13.5
+pydantic-settings==2.15.0
+argon2-cffi==25.1.0
+celery==5.6.3
+redis==8.1.0
+langgraph==1.2.14
+langgraph-checkpoint==4.2.0
+langchain-core==1.6.7
+langchain-ollama==1.1.0
+langchain-openai==1.6.7
+httpx==0.28.1
+email-validator==2.3.0
+python-multipart==0.0.32

@@ -1,0 +1,58 @@
+--- a/packages/agents/vapt_agents/phases.py
++++ b/packages/agents/vapt_agents/phases.py
+@@ -227,30 +227,35 @@
+     return out
+ 
+ 
+-def webvuln_seed_urls(db: Session, scope: RunScope, *, base_url: str, cap: int = 50) -> list[str]:
++def webvuln_seed_urls(db: Session, scope: RunScope, *, base_url: str, cap: int = 80) -> list[str]:
+     """Extra entry-point URLs to seed an active web scan for one base (scheme://host[:port]).
+ 
+     The bare-root scan only reaches pages linked from '/', so unlinked routes (most of an
+     app's real attack surface) are never tested. This gathers seeds from two sources and
+     resolves each against `base_url`, restricted to the base host so the scan stays in scope:
+-      1. endpoints the crawl already discovered (katana finding's `sample`), and
+-      2. an operator-provided path/URL list via the VAPT_WEBVULN_SEED_PATHS env var
+-         (comma / whitespace / newline separated) — a zero-config hook until the engagement
+-         gains a proper 'seed endpoints' field (Stage 2).
++      1. every endpoint the recon/probe discovery tools already found. Both the link crawler
++         (katana) and the content-discovery brute-forcer (feroxbuster) store their hits in a
++         finding's `detail.sample`; we harvest any observation that carries such a list, so
++         unlinked routes a brute-force found (e.g. /login, /admin) get scanned too — not just
++         what the crawler could reach from '/'. This is what makes seeding automatic.
++      2. an optional operator path/URL list via the VAPT_WEBVULN_SEED_PATHS env var
++         (comma / whitespace / newline separated) — an override, no longer required.
+     De-duped and bounded to `cap`."""
+     from urllib.parse import urljoin, urlparse
+ 
+     base = base_url.rstrip("/") + "/"
+     base_host = urlparse(base_url).hostname
+     raw: list[str] = []
+-    # (1) crawl-discovered endpoints (katana sample)
++    # (1) endpoints any discovery tool already found (katana crawl + feroxbuster content
++    # discovery, and any future tool that records a `sample` URL list).
+     for fid in db.execute(select(Finding.id).where(Finding.run_id == scope.run_id)).scalars().all():
+         for o in db.execute(
+             select(FindingObservation).where(FindingObservation.finding_id == fid)
+         ).scalars().all():
+-            if o.source_tool == "katana":
+-                raw += [str(u) for u in (o.detail or {}).get("sample", [])]
+-    # (2) operator-provided paths/URLs
++            sample = (o.detail or {}).get("sample")
++            if isinstance(sample, list):
++                raw += [str(u) for u in sample]
++    # (2) optional operator-provided paths/URLs (override)
+     raw += [p for p in re.split(r"[\s,]+", os.environ.get("VAPT_WEBVULN_SEED_PATHS", "")) if p]
+ 
+     seeds: list[str] = []
+--- a/packages/tools/vapt_tools/catalog.py
++++ b/packages/tools/vapt_tools/catalog.py
+@@ -86,7 +86,7 @@
+     ("dnsrecon",    ["dnsrecon"],     ["-d", "{domain}"],                            _P1, [_RE, _SC], "network"),
+     ("waybackurls", ["waybackurls"],  ["{domain}"],                                  _P0, [_RE, _SC], "network"),
+     ("gau",         ["gau"],          ["--subs", "{domain}"],                        _P0, [_RE, _SC], "network"),
+-    ("katana",      ["katana"],       ["-silent", "-u", "{url}"],                    _P1, [_RE, _SC], "network"),
++    ("katana",      ["katana"],       ["-silent", "-u", "{url}", "-d", "5", "-kf", "all"], _P1, [_RE, _SC], "network"),  # -d 5: crawl deeper than the default 3; -kf all: also pull robots.txt + sitemap.xml so unlinked routes are discovered
+     ("whatweb",     ["whatweb"],      ["--quiet", "--no-errors", "{url}"],           _P1, [_RE, _SC], "network"),
+     ("wafw00f",     ["wafw00f"],      ["{url}"],                                     _P1, [_RE, _SC], "network"),
+ 

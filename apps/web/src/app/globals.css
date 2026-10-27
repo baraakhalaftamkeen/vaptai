@@ -1,0 +1,116 @@
+@import url("https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap");
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+  VAPT-AI V2 — instrument-panel theme.
+  Organizing rule: COOL = system state (live, interactive, needs you).
+                   WARM = risk (the severity ramp, and nothing else).
+  Severity colors are a validated single-direction chroma ramp (0.03 -> 0.21) and are
+  never shown without their label — color never carries severity on its own.
+*/
+:root {
+  color-scheme: dark;
+
+  /* surfaces */
+  --bg: #0b1016;
+  --surface: #151d26;
+  --surface-2: #1c2733;
+  --line: #263341;
+  --line-strong: #35475a;
+
+  /* ink */
+  --ink: #e4ebf2;
+  --ink-2: #9fb0c2;
+  --ink-3: #6b7c8f;
+
+  /* system state (cool) */
+  --accent: #5ad2f4;
+  --accent-deep: #2b9fc4;
+  --ok: #4cc38a;
+
+  /* risk ramp (warm) — info -> critical */
+  --sev-info: #798898;
+  --sev-low: #b69065;
+  --sev-medium: #e39849;
+  --sev-high: #f17547;
+  --sev-critical: #f54651;
+}
+
+html,
+body {
+  background: var(--bg);
+  color: var(--ink);
+}
+
+body {
+  font-family: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Data is data: tabular figures wherever numbers are compared. */
+.tnum {
+  font-variant-numeric: tabular-nums;
+}
+
+.mono {
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-variant-ligatures: none;
+}
+
+/* Visible keyboard focus everywhere. */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+/* The one motion moment: something is waiting on a human. */
+@keyframes signal-pulse {
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.45;
+    transform: scale(0.82);
+  }
+}
+.signal-dot {
+  animation: signal-pulse 2.4s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .signal-dot {
+    animation: none;
+  }
+}
+
+/* Thin, recessive scrollbars — this is a dense operational UI. */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--line-strong);
+  border-radius: 99px;
+  border: 3px solid var(--bg);
+}
+
+/* Loading / notification animations (run progress banner, approval dock) */
+@keyframes indeterminate {
+  0%   { transform: translateX(-100%); }
+  100% { transform: translateX(400%); }
+}
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}

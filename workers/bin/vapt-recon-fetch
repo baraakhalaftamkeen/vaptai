@@ -1,0 +1,231 @@
+#!/usr/bin/env python3
+"""Authenticated recon fetch — a single LLM-callable primitive.
+
+GET (or POST) one in-scope URL with the authenticated session cookie, then emit
+ONE structured JSON record the LLM can reason about directly:
+
+    {"status": 200,
+     "content_type": "text/html; charset=utf-8",
+     "allow": "OPTIONS, GET, POST",     // when OPTIONS was reachable
+     "size": 5432,
+     "body": "<first 8 KB, HTML-safe truncation>",
+     "forms": [
+       {"action": "http://host:5000/admin/offer", "method": "post",
+        "enctype": "application/x-www-form-urlencoded",
+        "fields": [{"name": "offer", "type": "textarea", "value": ""},
+                   {"name": "csrf_token", "type": "hidden", "value": "…"}]}
+     ],
+     "hrefs": ["/admin", "/admin/offer", "/logout", …]}
+
+This is what the LLM-driven recon loop (Stage 3) uses to explore the target the
+way an operator would — fetch a page, read the form fields, decide the next
+probe based on what's actually there (not a hardcoded wordlist).
+
+Safety: GET/POST only, 10 s per request, 1 MB cap, in-scope-only, argv-only
+(shell=False), session cookie injected via env (VAPT_WEB_LOGIN_COOKIE) or Redis
+slot. No destructive methods; no file writes; body is truncated to 8 KB in the
+output so a chatty page can't blow the LLM's context budget.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+from urllib.parse import urljoin, urlparse
+
+try:
+    import requests
+except Exception as e:
+    print(json.dumps({"error": f"requests not available: {e}"}))
+    sys.exit(0)
+
+_UA = "vapt-recon-fetch/1.0 (authorized assessment)"
+_TIMEOUT = 10
+_BODY_CAP = 8 * 1024
+_MAX_HREFS = 60
+
+# Form-field regexes — kept inline (not imported from the vapt_agents package)
+# so this worker binary stays runnable without the full orchestrator PYTHONPATH.
+# Must match packages/agents/vapt_agents/form_map.py — any schema drift there
+# needs the same change here. Covered by test_recon_fetch below (added separately
+# via the shim parse_output).
+_INPUT_RE = re.compile(
+    r"""<input\b([^>]*?)\bname\s*=\s*["']([^"']+)["']([^>]*)>""", re.IGNORECASE)
+_TYPE_IN_TAG_RE = re.compile(r"""\btype\s*=\s*["']([^"']+)["']""", re.IGNORECASE)
+_TEXTAREA_RE = re.compile(
+    r"""<textarea\b[^>]*?\bname\s*=\s*["']([^"']+)["']""", re.IGNORECASE)
+_SELECT_RE = re.compile(
+    r"""<select\b[^>]*?\bname\s*=\s*["']([^"']+)["']""", re.IGNORECASE)
+_FORM_RE = re.compile(
+    r"""<form\b([^>]*)>(.*?)</form>""", re.IGNORECASE | re.DOTALL)
+_ATTR_RE = re.compile(r"""(\w[\w-]*)\s*=\s*["']([^"']*)["']""", re.IGNORECASE)
+_HREF_RE = re.compile(r"""<a\b[^>]*?\bhref\s*=\s*["']([^"']+)["']""", re.IGNORECASE)
+
+
+def _in_scope(target: str, url: str) -> bool:
+    try:
+        return urlparse(url).hostname == target
+    except Exception:
+        return False
+
+
+def _load_cookie() -> str:
+    """Env first (passed by the shim); fall back to Redis slot keyed by run id."""
+    env = (os.environ.get("VAPT_WEB_LOGIN_COOKIE") or "").strip()
+    if env:
+        return env
+    run_id = (os.environ.get("VAPT_RUN_ID") or "").strip()
+    if not run_id:
+        return ""
+    try:
+        import redis
+        r = redis.Redis.from_url(
+            os.environ.get("VAPT_REDIS_URL", "redis://localhost:6379/0"),
+            socket_timeout=3,
+        )
+        v = r.get(f"vapt:webcookie:{run_id}")
+        return v.decode() if v else ""
+    except Exception:
+        return ""
+
+
+def _parse_forms(html: str, page_url: str) -> list[dict]:
+    out: list[dict] = []
+    if not html:
+        return out
+    for m in _FORM_RE.finditer(html):
+        attrs_raw, body = m.group(1) or "", m.group(2) or ""
+        attrs = {k.lower(): v for k, v in _ATTR_RE.findall(attrs_raw)}
+        action = (attrs.get("action") or "").strip()
+        if action:
+            action = urljoin(page_url, action)
+        method = (attrs.get("method") or "get").strip().lower()
+        if method not in ("get", "post", "put", "patch", "delete"):
+            method = "get"
+        enctype = (attrs.get("enctype") or "application/x-www-form-urlencoded").strip().lower()
+        fields: list[dict] = []
+        seen: set[str] = set()
+        for im in _INPUT_RE.finditer(body):
+            tag_attrs = (im.group(1) or "") + (im.group(3) or "")
+            name = (im.group(2) or "").strip()
+            if not name or name in seen:
+                continue
+            tm = _TYPE_IN_TAG_RE.search(tag_attrs)
+            itype = (tm.group(1) if tm else "text").strip().lower()
+            vm = re.search(
+                rf"""<input\b[^>]*?\bname\s*=\s*["']{re.escape(name)}["'][^>]*?\bvalue\s*=\s*["']([^"']*)["']""",
+                body, re.IGNORECASE)
+            value = (vm.group(1) if vm else "").strip()
+            seen.add(name)
+            fields.append({"name": name, "type": itype, "value": value})
+        for tm in _TEXTAREA_RE.finditer(body):
+            name = (tm.group(1) or "").strip()
+            if name and name not in seen:
+                seen.add(name)
+                fields.append({"name": name, "type": "textarea", "value": ""})
+        for sm in _SELECT_RE.finditer(body):
+            name = (sm.group(1) or "").strip()
+            if name and name not in seen:
+                seen.add(name)
+                fields.append({"name": name, "type": "select", "value": ""})
+        if fields or action:
+            out.append({"action": action, "method": method,
+                        "enctype": enctype, "fields": fields})
+    return out
+
+
+def _parse_hrefs(html: str, page_url: str, target: str) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for m in _HREF_RE.finditer(html or ""):
+        href = (m.group(1) or "").strip()
+        if not href or href.startswith(("#", "javascript:", "mailto:")):
+            continue
+        full = href if href.lower().startswith(("http://", "https://")) \
+            else urljoin(page_url, href.lstrip("/"))
+        if not _in_scope(target, full):
+            continue
+        if full in seen:
+            continue
+        seen.add(full)
+        out.append(full)
+        if len(out) >= _MAX_HREFS:
+            break
+    return out
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--target", required=True)
+    ap.add_argument("--url", required=True)
+    ap.add_argument("--method", default="get", choices=("get", "post"))
+    ap.add_argument("--data", default="",
+                    help="k=v[&k=v...] POST body (same shape as http_fetch)")
+    args = ap.parse_args()
+    target = args.target
+    url = (args.url or "").strip()
+    if not url.lower().startswith(("http://", "https://")):
+        print(json.dumps({"error": f"url must be http(s): {url!r}"}))
+        return 0
+    if not _in_scope(target, url):
+        print(json.dumps({"error": f"url off-scope: {url!r}"}))
+        return 0
+
+    cookie = _load_cookie()
+    sess = requests.Session()
+    sess.headers.update({"User-Agent": _UA, "Accept": "*/*"})
+    if cookie:
+        sess.headers["Cookie"] = cookie
+    try:
+        if args.method == "post":
+            # Reuse the http_fetch body-shape validator for safety.
+            if args.data and not re.fullmatch(
+                    r"[A-Za-z0-9_.\-\[\]]+=[^&\s]+(?:&[A-Za-z0-9_.\-\[\]]+=[^&\s]+)*",
+                    args.data):
+                print(json.dumps({"error": "invalid data shape "
+                                          "(expected k=v[&k=v...])"}))
+                return 0
+            r = sess.post(url, data=args.data, timeout=_TIMEOUT,
+                          allow_redirects=True, stream=True)
+        else:
+            r = sess.get(url, timeout=_TIMEOUT, allow_redirects=True, stream=True)
+        # 1 MB raw cap, truncate to 8 KB in the LLM-facing body.
+        body_bytes = r.raw.read(1_048_576, decode_content=True) if hasattr(r, "raw") else b""
+        if not body_bytes:
+            body_bytes = (r.text or "").encode("utf-8", errors="replace")
+        try:
+            body = body_bytes.decode("utf-8", errors="replace")
+        except Exception:
+            body = ""
+        content_type = (r.headers.get("Content-Type") or "").strip()
+    except Exception as e:
+        print(json.dumps({"error": f"fetch error: {type(e).__name__}: {str(e)[:80]}"}))
+        return 0
+
+    out = {
+        "status": r.status_code,
+        "content_type": content_type,
+        "size": len(body),
+        "body": body[:_BODY_CAP],
+        "forms": _parse_forms(body, url) if "text/html" in content_type.lower() else [],
+        "hrefs": _parse_hrefs(body, url, target) if "text/html" in content_type.lower() else [],
+    }
+    # OPTIONS is cheap; only fetch when a form/post signal would benefit from
+    # knowing the allowed methods (avoids wasted OPTIONS on static assets).
+    if r.status_code in (200, 403, 405) and ("text/html" in content_type.lower()
+                                              or r.status_code == 405):
+        try:
+            r2 = sess.options(url, timeout=_TIMEOUT)
+            allow = (r2.headers.get("Allow") or "").strip()
+            if allow:
+                out["allow"] = allow
+        except Exception:
+            pass
+    print(json.dumps(out))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

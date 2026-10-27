@@ -1,0 +1,95 @@
+--- a/packages/agents/vapt_agents/toolrouter.py
++++ b/packages/agents/vapt_agents/toolrouter.py
+@@ -54,22 +54,40 @@
+     return out
+ 
+ 
+-def _web_target(services: list[tuple[str, str]]) -> dict | None:
+-    """Pick the primary web endpoint args (scheme + optional non-standard port)."""
++def _web_targets(services: list[tuple[str, str]], *, cap: int = 6) -> list[dict]:
++    """Every distinct web endpoint (scheme + optional non-standard port), so recon runs against
++    each web service — not just the first. A host commonly serves several (e.g. an IIS default
++    site on :80 AND the real app on :5000); scanning only one silently misses the others. App
++    ports (anything but 80/443) are returned first so a default site on :80 can't crowd the real
++    app out of the action budget. De-duped by (scheme, port) and bounded to `cap`."""
+     web = [(p, s) for p, s in services
+            if p in _WEB_PORTS or "http" in s or "wsman" in s]
+     if not web:
+-        return None
+-    ports = {p for p, _ in web}
+-    if "80" in ports:
+-        return {"scheme": "http"}
+-    if "443" in ports:
+-        return {"scheme": "https"}
+-    p, _ = web[0]
+-    return {"scheme": ("https" if p in _TLS_PORTS else "http"), "port": p}
++        return []
+ 
++    def _rank(ps: tuple[str, str]) -> tuple[int, str]:
++        p = ps[0]
++        return (1 if p in ("80", "443") else 0, p)   # app ports first, then 80/443
++
++    eps: list[dict] = []
++    seen: set[tuple] = set()
++    for p, _s in sorted(web, key=_rank):
++        if p == "80":
++            ep = {"scheme": "http"}
++        elif p == "443":
++            ep = {"scheme": "https"}
++        else:
++            ep = {"scheme": ("https" if p in _TLS_PORTS else "http"), "port": p}
++        key = (ep.get("scheme"), ep.get("port"))
++        if key not in seen:
++            seen.add(key)
++            eps.append(ep)
++        if len(eps) >= cap:
++            break
++    return eps
+ 
+-def route_actions(db: Session, scope: RunScope, harness, *, limit: int = 16
++
++def route_actions(db: Session, scope: RunScope, harness, *, limit: int = 32
+                   ) -> list[tuple[str, dict, str]]:
+     """Choose follow-up tools for the discovered services. Returns [(tool_id, args, task_id)]
+     for installed, non-destructive (P0/P1) tools only."""
+@@ -79,23 +97,25 @@
+     actions: list[tuple[str, dict, str]] = []
+     seen: set[str] = set()
+ 
+-    def add(tool_id: str, args: dict) -> None:
+-        if len(actions) >= limit or tool_id in seen:
++    def add(tool_id: str, args: dict, *, tag: str = "") -> None:
++        key = f"{tool_id}:{tag}" if tag else tool_id
++        if len(actions) >= limit or key in seen:
+             return
+         if harness.tool_available(tool_id, {**args, "target": scope.target}):
+-            seen.add(tool_id)
+-            actions.append((tool_id, args, f"route-{tool_id}"))
+-
+-    # --- Web surface -----------------------------------------------------------------
+-    web = _web_target(services)
+-    if web is not None:
+-        add("whatweb", dict(web))        # tech fingerprint
+-        add("katana", dict(web))         # crawl / endpoint discovery
+-        add("nikto", dict(web))          # server misconfig
+-        add("shcheck", dict(web))        # security headers
+-        add("cmseek", dict(web))         # CMS detect (self-identifies WP/Joomla/Drupal)
+-        add("wafw00f", dict(web))        # WAF detection
+-        add("feroxbuster", dict(web))    # content discovery
++            seen.add(key)
++            task_id = f"route-{tool_id}-{tag}" if tag else f"route-{tool_id}"
++            actions.append((tool_id, args, task_id))
++
++    # --- Web surface (run against EVERY web endpoint, app ports first) ----------------
++    for web in _web_targets(services):
++        tag = str(web.get("port") or web["scheme"])
++        add("whatweb", dict(web), tag=tag)      # tech fingerprint
++        add("katana", dict(web), tag=tag)       # crawl / endpoint discovery
++        add("nikto", dict(web), tag=tag)        # server misconfig
++        add("shcheck", dict(web), tag=tag)      # security headers
++        add("cmseek", dict(web), tag=tag)       # CMS detect (self-identifies WP/Joomla/Drupal)
++        add("wafw00f", dict(web), tag=tag)      # WAF detection
++        add("feroxbuster", dict(web), tag=tag)  # content discovery
+ 
+     # --- TLS -------------------------------------------------------------------------
+     if any(p in _TLS_PORTS for p in ports) or phases.has_tls_port(db, scope.run_id) is True:

@@ -1,0 +1,142 @@
+#!/usr/bin/env python3
+"""vapt-nessus-import — parse a Nessus / Tenable.sc .nessus XML export into JSONL findings.
+
+OFFLINE and read-only: it reads an already-exported .nessus file from the run workspace
+(no scanning, no network, no Tenable.sc connection) and prints one JSON object per line to
+stdout, in the shared intel shape the `nessus_import` normalizer understands:
+
+  {"ip","port","protocol","plugin","severity","cve","cvss","exploit","frameworks",
+   "synopsis","solution","os","source":"nessus"}
+
+One line per (host, ReportItem, CVE) — a ReportItem with several CVEs emits several lines;
+one with none emits a single line with cve="". Severity maps Nessus 0..4 → info..critical.
+Exit 0 on a parsed file (even with zero findings), 2 on a missing/invalid file.
+"""
+from __future__ import annotations
+
+import json
+import sys
+import xml.etree.ElementTree as ET
+
+_SEV = {"0": "info", "1": "low", "2": "medium", "3": "high", "4": "critical"}
+# Nessus exploit-framework tags → a readable framework name.
+_FRAMEWORKS = {
+    "exploit_framework_metasploit": "Metasploit",
+    "exploit_framework_canvas": "CANVAS",
+    "exploit_framework_core": "Core Impact",
+    "exploit_framework_d2_elliot": "D2 Elliot",
+}
+
+
+def _text(item: ET.Element, tag: str) -> str:
+    el = item.find(tag)
+    return (el.text or "").strip() if el is not None and el.text else ""
+
+
+def _host_os(host: ET.Element) -> str:
+    for tag in host.iter("tag"):
+        if tag.get("name") == "operating-system":
+            return (tag.text or "").strip()
+    return ""
+
+
+def _host_ip(host: ET.Element) -> str:
+    for tag in host.iter("tag"):
+        if tag.get("name") == "host-ip":
+            return (tag.text or "").strip()
+    return host.get("name", "").strip()
+
+
+def _frameworks(item: ET.Element) -> str:
+    names = [name for tag, name in _FRAMEWORKS.items()
+             if _text(item, tag).lower() in ("true", "1", "yes")]
+    return ", ".join(names)
+
+
+def _exploit(item: ET.Element) -> bool:
+    if _text(item, "exploit_available").lower() in ("true", "1", "yes"):
+        return True
+    return bool(_frameworks(item))
+
+
+def _cvss(item: ET.Element) -> float | None:
+    for tag in ("cvss3_base_score", "cvssV3BaseScore", "cvss_base_score"):
+        v = _text(item, tag)
+        if v:
+            try:
+                return float(v)
+            except ValueError:
+                pass
+    return None
+
+
+def _cves(item: ET.Element) -> list[str]:
+    out = []
+    for el in item.findall("cve"):
+        c = (el.text or "").strip().upper()
+        if c:
+            out.append(c)
+    return out
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) < 2:
+        print(json.dumps({"error": "usage: vapt-nessus-import <file.nessus>"}), file=sys.stderr)
+        return 2
+    path = argv[1]
+    try:
+        tree = ET.parse(path)  # noqa: S314 — user's own authorized export
+    except FileNotFoundError:
+        print(json.dumps({"error": f"file not found: {path}"}), file=sys.stderr)
+        return 2
+    except ET.ParseError as e:
+        print(json.dumps({"error": f"invalid .nessus XML: {e}"}), file=sys.stderr)
+        return 2
+
+    root = tree.getroot()
+    count = 0
+    try:
+        count = _emit(root)
+        print(json.dumps({"_summary": {"findings": count}}), file=sys.stderr)
+    except BrokenPipeError:
+        devnull = os.open(os.devnull, os.O_WRONLY)   # downstream closed the pipe — fine
+        os.dup2(devnull, sys.stdout.fileno())
+    return 0
+
+
+def _emit(root) -> int:
+    count = 0
+    for host in root.iter("ReportHost"):
+        ip = _host_ip(host)
+        os_name = _host_os(host)
+        for item in host.iter("ReportItem"):
+            # Nessus emits an informational ReportItem per open port (severity 0, no CVE);
+            # keep those too — they corroborate the active scan's open-port findings.
+            sev = _SEV.get(str(item.get("severity", "0")), "info")
+            base = {
+                "ip": ip,
+                "port": str(item.get("port", "")),
+                "protocol": str(item.get("protocol", "")),
+                "plugin": str(item.get("pluginName", "")),
+                "severity": sev,
+                "cvss": _cvss(item),
+                "exploit": _exploit(item),
+                "frameworks": _frameworks(item),
+                "synopsis": _text(item, "synopsis")[:300],
+                "solution": _text(item, "solution")[:300],
+                "os": os_name,
+                "source": "nessus",
+            }
+            cves = _cves(item)
+            if cves:
+                for cve in cves:
+                    print(json.dumps({**base, "cve": cve}))
+                    count += 1
+            else:
+                print(json.dumps({**base, "cve": ""}))
+                count += 1
+    return count
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))

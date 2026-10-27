@@ -1,0 +1,207 @@
+--- a/packages/agents/vapt_agents/phases.py
++++ b/packages/agents/vapt_agents/phases.py
+@@ -30,8 +30,8 @@
+ # own "Allowed ports" field overrides this (including a full-range sweep like 1-65535).
+ DEFAULT_PORTS = (
+     "21,22,23,25,53,80,110,135,139,143,389,443,445,465,587,636,993,995,"
+-    "1433,1521,2049,3000,3306,3389,5432,5900,5985,5986,6379,8000,8008,8080,"
+-    "8081,8443,8888,9000,9200,27017"
++    "1433,1521,2049,3000,3001,3306,3389,4200,5000,5001,5432,5601,5900,5985,5986,6379,"
++    "7001,7070,8000,8001,8002,8008,8080,8081,8088,8090,8443,8888,9000,9001,9200,27017"
+ )
+ 
+ # Default bounded black/gray-box web+network adapter set, used when no plan is given.
+@@ -124,8 +124,9 @@
+ # Ports (beyond the 80/443 the base http_probe already covers) that commonly front an
+ # HTTP service worth a follow-up probe. Service names containing "http"/"wsman" also qualify.
+ _WEB_PORTS = {
+-    591, 2082, 2083, 2086, 2087, 2095, 2096, 3000, 5985, 5986, 7001, 7002, 8000, 8008,
+-    8080, 8081, 8088, 8443, 8834, 8888, 9000, 9001, 9043, 9080, 9090, 9200, 9443, 10000,
++    591, 2082, 2083, 2086, 2087, 2095, 2096, 3000, 3001, 4200, 5000, 5001, 5601, 5985,
++    5986, 7001, 7002, 8000, 8001, 8002, 8008, 8080, 8081, 8088, 8090, 8443, 8834, 8888,
++    9000, 9001, 9043, 9080, 9090, 9200, 9443, 10000,
+ }
+ 
+ 
+--- a/packages/agents/vapt_agents/toolrouter.py
++++ b/packages/agents/vapt_agents/toolrouter.py
+@@ -23,7 +23,9 @@
+ from .runscope import RunScope
+ 
+ # Common web, TLS and service ports we key selection on (service name is also checked).
+-_WEB_PORTS = {"80", "443", "8080", "8443", "8000", "8008", "8081", "8888", "9443", "5985", "5986"}
++_WEB_PORTS = {"80", "443", "3000", "3001", "4200", "5000", "5001", "5601", "8000", "8001",
++              "8002", "8008", "8080", "8081", "8088", "8090", "8443", "8888", "9000", "9001",
++              "9443", "5985", "5986"}
+ _TLS_PORTS = {"443", "8443", "9443", "993", "995", "465", "636", "990"}
+ 
+ 
+--- a/packages/tools/vapt_tools/registry.py
++++ b/packages/tools/vapt_tools/registry.py
+@@ -162,7 +162,18 @@
+     sev = str(args.get("severity", "info,low,medium"))
+     if not re.fullmatch(r"(info|low|medium|high|critical)(?:,(info|low|medium|high|critical))*", sev):
+         raise ValueError(f"invalid severity set: {sev!r}")
+-    return ["nuclei", "-silent", "-severity", sev, "-u", f"https://{target}"]
++    # Optional scheme/port so an active (P2) scan can target a web app on a non-standard
++    # port (e.g. http://host:5000) instead of a hardcoded https/443. Backward compatible:
++    # with neither supplied it stays https://<target>, exactly as before.
++    scheme = "http" if str(args.get("scheme", "")).lower() == "http" else "https"
++    url = f"{scheme}://{target}"
++    port = args.get("port")
++    if port is not None and str(port) != "":
++        p = str(port)
++        if not re.fullmatch(r"\d{1,5}", p) or not 0 < int(p) < 65536:
++            raise ValueError(f"invalid port: {port!r}")
++        url = f"{scheme}://{target}:{p}"
++    return ["nuclei", "-silent", "-severity", sev, "-u", url]
+ 
+ 
+ def _build_zap_baseline(args: dict) -> list[str]:
+--- a/services/orchestrator/vapt_orch/graph/state.py
++++ b/services/orchestrator/vapt_orch/graph/state.py
+@@ -47,6 +47,9 @@
+     # Attack is also a self-looping node (one gated PoC per visit).
+     attack_idx: int
+     attack_iters: int
++    # Webvuln is a self-looping node (one gated active web-vuln scan per visit).
++    webvuln_idx: int
++    webvuln_iters: int
+     task_refs: Annotated[list[str], _merge_unique]
+     proposed_asset_refs: Annotated[list[str], _merge_unique]
+     approved_asset_refs: Annotated[list[str], _merge_unique]
+--- a/services/orchestrator/vapt_orch/graph/engagement.py
++++ b/services/orchestrator/vapt_orch/graph/engagement.py
+@@ -490,7 +490,7 @@
+                        f"{tiers['exploit_available']} exploit-available, "
+                        f"{tiers['inconclusive']} version-only")
+         return {
+-            "phase": "attack",
++            "phase": "webvuln",
+             "validated_finding_refs": all_confirmed,
+             "log": log,
+         }
+@@ -586,6 +586,103 @@
+     def _attack_router(state: EngagementState) -> str:
+         return "remediate" if state.get("phase") == "remediate" else "attack"
+ 
++    # -- webvuln (opt-in ACTIVE web-vuln scan, self-looping, ALWAYS human-gated) ----------
++    # Actively tests DISCOVERED web endpoints for injection/other web vulns (SQLi etc. via
++    # wapiti; high/critical nuclei templates). These send payloads, so every action is P2
++    # and forced through human approval. Runs ONLY when the engagement authorized P2
++    # intrusive; otherwise an immediate pass-through. One action per visit -> at most one
++    # interrupt() per visit, so resume values never drift (same shape as the scan node).
++    def _webvuln_plan() -> list[tuple[str, dict, str]]:
++        open_ports = set(phases.open_ports_from_findings(db, scope.run_id))
++        endpoints: list[dict] = []
++        if "80" in open_ports:
++            endpoints.append({"scheme": "http"})
++        if "443" in open_ports:
++            endpoints.append({"scheme": "https"})
++        for port, _svc in phases.web_ports_from_findings(db, scope.run_id):
++            scheme = "https" if (port.isdigit() and int(port) in phases._TLS_PORTS) else "http"
++            endpoints.append({"scheme": scheme, "port": port})
++        seen: set[tuple] = set()
++        plan: list[tuple[str, dict, str]] = []
++        n = 0
++        for ep in endpoints:
++            key = (ep.get("scheme"), ep.get("port"))
++            if key in seen:
++                continue
++            seen.add(key)
++            if n >= 4:                     # bound how many endpoints are actively tested
++                break
++            tag = ep.get("port") or ep.get("scheme")
++            plan.append(("wapiti", {"target": scope.target, **ep}, f"webvuln-wapiti-{tag}"))
++            plan.append(("nuclei_intrusive",
++                         {"target": scope.target, "severity": "high,critical", **ep},
++                         f"webvuln-nuclei-{tag}"))
++            n += 1
++        return plan
++
++    def webvuln(state: EngagementState) -> dict:
++        if state.get("cancellation_requested"):
++            return {"phase": "attack", "log": ["webvuln: cancellation observed"]}
++        # Gated feature, OFF by default: only active when the engagement authorized P2.
++        if PolicyClass.P2_INTRUSIVE not in scope.allowed_action_classes:
++            ledger.record_event(db, scope.run_id, "phase.webvuln",
++                                {"skipped": "engagement did not enable P2 intrusive"})
++            return {"phase": "attack",
++                    "log": ["webvuln: skipped (P2 intrusive not enabled for this engagement)"]}
++
++        plan_items = _webvuln_plan()
++        idx = int(state.get("webvuln_idx", 0))
++        iters = int(state.get("webvuln_iters", 0)) + 1
++        if idx == 0 and iters == 1:
++            ledger.record_event(db, scope.run_id, "phase.webvuln", {"targets": len(plan_items)})
++        if not plan_items:
++            return {"phase": "attack", "log": ["webvuln: no web endpoint to actively test"]}
++        if idx >= len(plan_items) or iters > SCAN.max_iterations:
++            return {"phase": "attack", "webvuln_iters": iters,
++                    "log": ["webvuln: active web-vuln pass complete"]}
++
++        tool_id, args, task_id = plan_items[idx]
++        base = {"phase": "webvuln", "webvuln_idx": idx + 1, "webvuln_iters": iters}
++
++        # Don't force a human approval for a scanner whose binary isn't installed — it would
++        # only ever no-op. Record an honest coverage gap and move on.
++        if not harness.tool_available(tool_id, {**args}):
++            return {**base, "coverage_gaps": [f"webvuln: {tool_id} not installed"],
++                    "log": [f"webvuln: {tool_id} unavailable; skipped"]}
++        if phases.already_executed(db, scope, task_id=task_id, tool_id=tool_id, args=args):
++            return {**base, "log": [f"webvuln: {tool_id} already done; skipping"]}
++
++        step = phases.scan_action(db, scope, harness, tool_id=tool_id, args=args, task_id=task_id)
++        if step.outcome.approval_id:
++            verdict = interrupt({
++                "kind": "approval_required",
++                "tool": tool_id,
++                "target": scope.target,
++                "approval_id": step.outcome.approval_id,
++                "action_digest": step.outcome.action_digest,
++                "reason": step.outcome.reason,
++            })
++            decision = (verdict or {}).get("decision", "reject")
++            if decision in ("approve", "approve_batch"):
++                phases.execute_scan_after_approval(
++                    db, scope, harness, tool_id=tool_id, args=args, task_id=task_id)
++                return {**base, "log": [f"webvuln: {tool_id} approved and executed"]}
++            return {**base, "coverage_gaps": [f"{tool_id}: approval {decision}"],
++                    "log": [f"webvuln: {tool_id} not approved ({decision})"]}
++
++        if not step.outcome.executed:
++            return {**base, "coverage_gaps": [f"{tool_id}: {step.outcome.reason}"],
++                    "log": [f"webvuln: {tool_id} not executed ({step.outcome.reason})"]}
++        res = step.outcome.result
++        if res is not None and res.outcome != "ok":
++            return {**base, "coverage_gaps": [f"{tool_id}: tool {res.outcome}"],
++                    "log": [f"webvuln: {tool_id} ran but produced no results"]}
++        return {**base,
++                "log": [f"webvuln: {tool_id} executed ({len(step.candidate_ids)} candidate(s))"]}
++
++    def _webvuln_router(state: EngagementState) -> str:
++        return "webvuln" if state.get("phase") == "webvuln" else "attack"
++
+     # -- remediate (REMEDIATION agent; no tools) -----------------------------
+     def remediate(state: EngagementState) -> dict:
+         guard = ManifestGuard(REMEDIATION)
+@@ -661,6 +758,7 @@
+     graph.add_node("probe_services", probe_services)
+     graph.add_node("validate", validate)
+     graph.add_node("attack", attack)
++    graph.add_node("webvuln", webvuln)
+     graph.add_node("remediate", remediate)
+     graph.add_node("report", report)
+ 
+@@ -673,7 +771,10 @@
+     graph.add_conditional_edges("scan", _scan_router,
+                                 {"scan": "scan", "probe_services": "probe_services"})
+     graph.add_edge("probe_services", "validate")
+-    graph.add_edge("validate", "attack")
++    graph.add_edge("validate", "webvuln")
++    # Webvuln loops back to itself (one gated active web-vuln scan per visit); when the pass
++    # is complete (or P2 intrusive is not enabled) it routes to attack.
++    graph.add_conditional_edges("webvuln", _webvuln_router, {"webvuln": "webvuln", "attack": "attack"})
+     # Attack loops back to itself (one gated PoC per visit) until confirmed findings exhausted.
+     graph.add_conditional_edges("attack", _attack_router, {"attack": "attack", "remediate": "remediate"})
+     graph.add_edge("remediate", "report")

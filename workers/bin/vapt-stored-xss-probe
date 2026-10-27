@@ -1,0 +1,270 @@
+#!/usr/bin/env python3
+"""Deterministic stored + blind XSS probe.
+
+Dalfox POSTs a payload and inspects ONLY the POST response — it never fetches the
+view page that would render the persisted content. That blind spot is exactly where
+stored XSS lives (review/comment/profile endpoints that store user text and render
+it later on a different page). This probe fills the gap AND covers blind XSS via
+the per-run interactsh OAST session (`vapt_persistence.oast`).
+
+Flow:
+  1. Mint TWO canaries per invocation:
+     * `visible_canary` — a UUID string the probe matches directly in the view body
+       (synchronous proof: the server emitted our raw text on the next page load).
+     * `oast_canary` — a URL on the per-run interactsh session, injected as an
+       `<img src="{oast}">` tag. When ANY backend browser session (admin viewer,
+       log processor, email digest renderer) renders the stored content, their
+       browser fetches our OAST canary and interactsh records the hit.
+  2. POST the combined payload to the submit endpoint.
+  3. GET the view URL and look for the visible canary → classifies as `stored_xss`.
+  4. Poll interactsh for ~8 seconds for the OAST canary token → classifies as
+     `blind_xss` with `confirmed=True`. Blind-only hits (visible canary didn't
+     match but OAST did) indicate a different render surface the GET pass missed.
+
+Both detectors emit `confirmed=True` so the validator promotes the finding via
+`_PROOF_SOURCE_TOOLS`. The two findings are distinguished by their `type` field.
+
+Emits ONE JSON record to stdout:
+    {"findings": [{"type": "stored_xss"|"blind_xss", "severity": "high"|"info",
+                   "url": "<view_url>", "param": "<name>", "evidence": "<...>",
+                   "confirmed": true|false, "post_url": "<...>"}, ...],
+     "trace": [{"url", "status", "note"}, ...]}
+
+Safety:
+  * Only in-scope URL(s) accepted (both POST and VIEW urls must match --target host)
+  * No destructive methods beyond the single bounded POST + GET + OAST poll
+  * 1 MB body cap on each response (via requests `stream=True` + manual read)
+  * OAST poll is bounded (8 seconds, polling at 1-second intervals) so a quiet
+    OAST session never blocks the probe past its subprocess timeout
+  * Argv-only, no shell
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import uuid
+from urllib.parse import urlparse
+
+try:
+    import requests
+except Exception as e:
+    print(json.dumps({"error": f"requests not available: {e}", "findings": []}))
+    sys.exit(0)
+
+
+_UA = "vapt-stored-xss-probe/1.0"
+_MAX_BODY_BYTES = 1_048_576  # 1 MB
+_TIMEOUT = 10
+
+
+def _read_bounded(r: requests.Response) -> str:
+    chunks: list[bytes] = []
+    total = 0
+    for chunk in r.iter_content(chunk_size=16_384):
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+        if total >= _MAX_BODY_BYTES:
+            break
+    try:
+        return b"".join(chunks).decode("utf-8", errors="replace")
+    except Exception:
+        return ""
+
+
+def _cookie_from_redis(run_id: str) -> str:
+    try:
+        import redis
+        r = redis.Redis.from_url(
+            os.environ.get("VAPT_REDIS_URL", "redis://localhost:6379/0"),
+            socket_timeout=3,
+        )
+        val = r.get(f"vapt:webcookie:{run_id}")
+        if val:
+            return (val.decode() if isinstance(val, bytes) else str(val)).strip()
+    except Exception:
+        pass
+    return ""
+
+
+def main() -> int:
+    p = argparse.ArgumentParser()
+    p.add_argument("--target", required=True, help="in-scope host (scope-check only)")
+    p.add_argument("--post-url", required=True, help="full http(s) URL that stores the content")
+    p.add_argument("--view-url", required=True, help="full http(s) URL that renders stored content")
+    p.add_argument("--param", required=True, help="form parameter name that carries the user text")
+    p.add_argument("--data", default="", help="extra k=v[&k=v] body fields beyond `param`")
+    args = p.parse_args()
+
+    out: dict = {"findings": [], "trace": []}
+
+    # Scope check both URLs — the orchestrator already does this, but the shim is
+    # the last line of defense; refuse off-host URLs rather than hit them.
+    for u in (args.post_url, args.view_url):
+        host = urlparse(u).hostname
+        if host != args.target:
+            out["trace"].append({"url": u, "note": f"off-scope (host={host})"})
+            print(json.dumps(out)); return 0
+        if not u.lower().startswith(("http://", "https://")):
+            out["trace"].append({"url": u, "note": "not http(s)"})
+            print(json.dumps(out)); return 0
+
+    visible_canary = f"vapt-xss-{uuid.uuid4().hex[:16]}"
+    oast_label = f"xss{uuid.uuid4().hex[:12]}"
+
+    # Mint the OAST canary URL. If interactsh isn't configured (no run_id env, no
+    # OAST session), oast_url is None and we silently degrade to visible-only.
+    oast_url: str | None = None
+    oast_handle: dict | None = None
+    oast_t0: float = 0.0
+    run_id = os.environ.get("VAPT_RUN_ID", "").strip()
+    if run_id:
+        try:
+            # Add the orchestrator's package path so this shim can import the OAST
+            # coordinator the same way the orchestrator does. Fail-safe — any import
+            # error degrades to visible-only.
+            import sys as _sys
+            _repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            for _p in ("packages/persistence",):
+                _full = os.path.join(_repo, _p)
+                if _full not in _sys.path:
+                    _sys.path.insert(0, _full)
+            from vapt_persistence import oast as _oast
+            oast_handle = _oast.obtain_oast_handle(run_id)
+            if oast_handle:
+                oast_url = _oast.canary_url(run_id, oast_label)
+                oast_t0 = __import__("time").time()
+        except Exception as _e:
+            oast_url = None
+
+    # Combined payload: visible string (for synchronous GET-view match) PLUS an
+    # <img src="{oast}"> tag that any backend browser render will fetch, triggering
+    # the OAST callback. Both inject in one POST so one request body covers both
+    # surfaces. If OAST isn't configured, only the visible payload is emitted.
+    payload_parts = [f'"><img src=x onerror="/*{visible_canary}*/">']
+    if oast_url:
+        payload_parts.append(f'<img src="{oast_url}">')
+    payload = "".join(payload_parts)
+
+    # Build the POST body: `param=<payload>` plus any extra fields the operator
+    # supplied (CSRF tokens, user-id hidden fields, etc).
+    body_fields: dict[str, str] = {args.param: payload}
+    for pair in args.data.split("&"):
+        if "=" in pair:
+            k, _, v = pair.partition("=")
+            k = k.strip(); v = v.strip()
+            if k and k != args.param:
+                body_fields[k] = v
+
+    headers = {"User-Agent": _UA, "Accept": "text/html,*/*"}
+    run_id = os.environ.get("VAPT_RUN_ID", "").strip()
+    cookie = os.environ.get("VAPT_WEB_LOGIN_COOKIE", "").strip() \
+        or (_cookie_from_redis(run_id) if run_id else "")
+    if cookie:
+        headers["Cookie"] = cookie
+
+    sess = requests.Session()
+    try:
+        r_post = sess.post(args.post_url, data=body_fields, headers=headers,
+                           timeout=_TIMEOUT, allow_redirects=True, stream=True)
+        _read_bounded(r_post)  # drain + bound, we don't inspect the POST body
+        out["trace"].append({"url": args.post_url, "status": r_post.status_code,
+                             "note": "POST canary"})
+    except Exception as e:
+        out["trace"].append({"url": args.post_url, "note": f"POST error: {e}"})
+        print(json.dumps(out)); return 0
+
+    try:
+        r_view = sess.get(args.view_url, headers=headers,
+                          timeout=_TIMEOUT, allow_redirects=True, stream=True)
+        body = _read_bounded(r_view)
+        out["trace"].append({"url": args.view_url, "status": r_view.status_code,
+                             "note": f"GET view (len={len(body)})"})
+    except Exception as e:
+        out["trace"].append({"url": args.view_url, "note": f"GET error: {e}"})
+        print(json.dumps(out)); return 0
+
+    # --- Stored XSS (synchronous): visible canary in view body ---
+    if visible_canary in body:
+        out["findings"].append({
+            "type": "stored_xss",
+            "severity": "high",
+            "url": args.view_url,
+            "param": args.param,
+            "evidence": f"canary {visible_canary} appears in view body (status={r_view.status_code})",
+            "confirmed": True,
+            "post_url": args.post_url,
+        })
+    else:
+        out["findings"].append({
+            "type": "stored_xss",
+            "severity": "info",
+            "url": args.view_url,
+            "param": args.param,
+            "evidence": f"canary {visible_canary} NOT found in view body (status={r_view.status_code})",
+            "confirmed": False,
+            "post_url": args.post_url,
+        })
+
+    # --- Blind XSS: poll OAST for the canary token ---
+    # Blind XSS fires when a backend browser (admin viewer, email digest renderer,
+    # log-aggregator with HTML preview) renders the stored content and their browser
+    # fetches our OAST canary. We give it ~8 seconds — a GET-view path that already
+    # rendered the payload will have triggered the img fetch synchronously; async
+    # render paths (email digests, cron'd log viewers) take longer and are out of
+    # scope for a single-probe run.
+    if oast_url and oast_handle:
+        import time as _time
+        try:
+            from vapt_persistence import oast as _oast
+            matched = False
+            matched_entry: dict | None = None
+            for _ in range(8):
+                _time.sleep(1.0)
+                hits = _oast.collect_callbacks(run_id, since_ts=oast_t0)
+                for entry in hits:
+                    # interactsh records the subdomain-labeled hit under `full-id`
+                    # or `unique-id`. We match on our label substring.
+                    label_in_hit = False
+                    for key in ("full-id", "unique-id", "q-type", "raw-request"):
+                        v = entry.get(key)
+                        if isinstance(v, str) and oast_label in v.lower():
+                            label_in_hit = True
+                            break
+                    if label_in_hit:
+                        matched = True
+                        matched_entry = entry
+                        break
+                if matched:
+                    break
+            if matched:
+                proto = (matched_entry or {}).get("protocol", "http")
+                remote = (matched_entry or {}).get("remote-address", "")
+                out["findings"].append({
+                    "type": "blind_xss",
+                    "severity": "high",
+                    "url": args.view_url,
+                    "param": args.param,
+                    "evidence": (f"OAST callback: label={oast_label} proto={proto} "
+                                 f"from={remote} (payload fired in a backend render)"),
+                    "confirmed": True,
+                    "post_url": args.post_url,
+                    "oast_label": oast_label,
+                })
+            else:
+                out["trace"].append({
+                    "url": oast_url,
+                    "note": f"no OAST callback for {oast_label} within 8s",
+                })
+        except Exception as _e:
+            out["trace"].append({"url": oast_url, "note": f"OAST poll error: {_e}"})
+
+    print(json.dumps(out))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

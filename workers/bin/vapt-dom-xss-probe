@@ -1,0 +1,280 @@
+#!/usr/bin/env python3
+"""Deterministic DOM-based XSS probe via static JS taint analysis.
+
+DOM XSS where the SOURCE is the URL fragment (``location.hash``) is invisible to
+every server-side scanner and even to payload fuzzers like dalfox: the fragment
+is never sent to the server, and dalfox's DOM mining injects query parameters,
+not the hash. The only reliable, non-flaky way to detect it is to read the page's
+JavaScript and look for a tainted data-flow from a client-controlled SOURCE into
+a dangerous SINK — exactly what a human auditor does.
+
+This probe fetches each target URL (with the authenticated session cookie when
+present) plus its same-origin inline and external scripts, then flags a source→
+sink flow such as::
+
+    var hash = location.hash.substring(1);
+    document.getElementById('preview').innerHTML = decodeURIComponent(hash);
+
+SOURCES (client-controlled): location.hash / .search / .href, document.URL /
+documentURI / referrer / cookie, window.name, URLSearchParams(location.*).
+SINKS (HTML/script execution): innerHTML, outerHTML, document.write[ln],
+insertAdjacentHTML, eval, new Function, jQuery .html(), setTimeout/setInterval
+with a string first arg.
+
+A finding is `confirmed=True` only when a sink's injected expression contains a
+source directly OR a variable previously assigned from a source (a real taint
+flow) — not merely when a source and a sink both appear somewhere on the page.
+
+Emits ONE JSON record to stdout:
+    {"findings": [{"type": "dom_xss", "severity": "high", "url", "param":"<source>",
+                   "evidence": "<code snippet>", "confirmed": true}, ...],
+     "trace":    [{"url", "status", "note"}, ...]}
+
+Safety: GET only, bounded (URL + script budget), in-scope-only, argv-only.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+from urllib.parse import urljoin, urlparse
+
+try:
+    import requests
+except Exception as e:
+    print(json.dumps({"error": f"requests not available: {e}", "findings": []}))
+    sys.exit(0)
+
+_UA = "vapt-dom-xss-probe/1.0 (authorized assessment)"
+_TIMEOUT = 10
+_MAX_URLS = 30
+_MAX_SCRIPTS_PER_PAGE = 8
+_MAX_JS_BYTES = 512 * 1024
+
+# Client-controlled SOURCES. Each entry: (compiled regex, human label).
+_SOURCES = [
+    (re.compile(r"location\s*\.\s*hash"), "location.hash"),
+    (re.compile(r"location\s*\.\s*search"), "location.search"),
+    (re.compile(r"location\s*\.\s*href"), "location.href"),
+    (re.compile(r"document\s*\.\s*URL\b"), "document.URL"),
+    (re.compile(r"document\s*\.\s*documentURI"), "document.documentURI"),
+    (re.compile(r"document\s*\.\s*referrer"), "document.referrer"),
+    (re.compile(r"document\s*\.\s*cookie"), "document.cookie"),
+    (re.compile(r"window\s*\.\s*name\b"), "window.name"),
+    (re.compile(r"\bURLSearchParams\s*\("), "URLSearchParams"),
+    # document.location / window.location READ (not .assign/.replace/.reload writes)
+    (re.compile(r"(?:document|window)\s*\.\s*location\b(?!\s*\.\s*(?:replace|assign|reload)\b)"
+                r"(?!\s*=)"), "document.location"),
+]
+
+# Dangerous SINKS. Each: (compiled regex that matches the sink opener, label,
+# kind) where kind is "assign" ( ... = RHS ) or "call" ( ... ( ARGS ) ).
+_SINKS = [
+    (re.compile(r"\.\s*innerHTML\s*="), "innerHTML", "assign"),
+    (re.compile(r"\.\s*outerHTML\s*="), "outerHTML", "assign"),
+    (re.compile(r"document\s*\.\s*write(?:ln)?\s*\("), "document.write", "call"),
+    (re.compile(r"\.\s*insertAdjacentHTML\s*\("), "insertAdjacentHTML", "call"),
+    (re.compile(r"\beval\s*\("), "eval", "call"),
+    (re.compile(r"\bnew\s+Function\s*\("), "Function", "call"),
+    (re.compile(r"\.\s*html\s*\("), "jQuery.html", "call"),
+    (re.compile(r"\bset(?:Timeout|Interval)\s*\(\s*['\"]"), "setTimeout(string)", "call"),
+]
+
+_VAR_ASSIGN_RE = re.compile(r"(?:var|let|const)?\s*([A-Za-z_$][\w$]*)\s*=\s*([^;\n]+)")
+
+
+def _in_scope(target_host: str, url: str) -> bool:
+    try:
+        return urlparse(url).hostname == target_host
+    except Exception:
+        return False
+
+
+def _session(cookie: str):
+    s = requests.Session()
+    s.headers.update({"User-Agent": _UA, "Accept": "*/*"})
+    if cookie:
+        s.headers["Cookie"] = cookie
+    return s
+
+
+def _web_cookie() -> str:
+    """Authenticated session cookie from env or Redis (fail-safe → empty)."""
+    env = os.environ.get("VAPT_WEB_LOGIN_COOKIE", "").strip()
+    if env:
+        return env
+    run_id = os.environ.get("VAPT_RUN_ID", "").strip()
+    if not run_id:
+        return ""
+    try:
+        import redis
+        r = redis.Redis.from_url(
+            os.environ.get("VAPT_REDIS_URL", "redis://localhost:6379/0"), socket_timeout=3)
+        v = r.get(f"vapt:webcookie:{run_id}")
+        return v.decode() if v else ""
+    except Exception:
+        return ""
+
+
+def _scripts_for(sess, url, target, trace) -> list[str]:
+    """Return the JS bodies to analyse for a page: inline <script> blocks plus
+    same-origin external scripts (bounded)."""
+    bodies: list[str] = []
+    try:
+        r = sess.get(url, timeout=_TIMEOUT, allow_redirects=True)
+    except Exception as e:
+        trace.append({"url": url, "status": None, "note": f"err:{type(e).__name__}"})
+        return bodies
+    trace.append({"url": url, "status": r.status_code, "note": "page"})
+    if r.status_code != 200 or not r.text:
+        return bodies
+    html = r.text
+    # Inline scripts
+    for m in re.finditer(r"<script\b([^>]*)>(.*?)</script>", html, re.S | re.I):
+        attrs, body = m.group(1), m.group(2)
+        if "src=" in attrs.lower():
+            continue  # external, handled below
+        if body.strip():
+            bodies.append(body)
+        if len(bodies) >= _MAX_SCRIPTS_PER_PAGE:
+            return bodies
+    # Same-origin external scripts
+    for m in re.finditer(r"""<script\b[^>]*\bsrc\s*=\s*["']([^"']+)["']""", html, re.I):
+        if len(bodies) >= _MAX_SCRIPTS_PER_PAGE:
+            break
+        src = urljoin(url, m.group(1))
+        if not _in_scope(target, src):
+            continue
+        try:
+            jr = sess.get(src, timeout=_TIMEOUT, allow_redirects=True)
+            if jr.status_code == 200 and jr.text:
+                bodies.append(jr.text[:_MAX_JS_BYTES])
+                trace.append({"url": src, "status": 200, "note": "ext script"})
+        except Exception:
+            continue
+    return bodies
+
+
+def _tainted_vars(js: str) -> set[str]:
+    """Variables assigned (transitively) from a source expression."""
+    tainted: set[str] = set()
+    source_names = [lbl for _, lbl in _SOURCES]
+    for _pass in range(3):  # cheap fixpoint for chained assignments
+        changed = False
+        for m in _VAR_ASSIGN_RE.finditer(js):
+            name, rhs = m.group(1), m.group(2)
+            if name in tainted:
+                continue
+            rhs_tainted = any(rx.search(rhs) for rx, _ in _SOURCES) or \
+                any(re.search(r"\b" + re.escape(t) + r"\b", rhs) for t in tainted)
+            if rhs_tainted:
+                tainted.add(name)
+                changed = True
+        if not changed:
+            break
+    return tainted, source_names
+
+
+def _expr_after(js: str, pos: int, kind: str) -> str:
+    """Grab the injected expression for a sink match: the RHS up to ';'/newline for
+    an assignment, or the balanced parenthesised args for a call."""
+    tail = js[pos: pos + 400]
+    if kind == "assign":
+        # after the '=' ; _SINKS assign regex ends at '='
+        return tail.split(";", 1)[0].split("\n", 1)[0]
+    # call: capture until the matching close paren (bounded, best-effort)
+    depth = 0
+    out = []
+    started = False
+    for ch in tail:
+        if ch == "(":
+            depth += 1
+            started = True
+            if depth == 1:
+                continue
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                break
+        if started:
+            out.append(ch)
+    return "".join(out)
+
+
+def _analyze(js: str) -> list[tuple[str, str, str]]:
+    """Return (sink_label, source_label, snippet) for each confirmed taint flow."""
+    hits: list[tuple[str, str, str]] = []
+    tainted, source_names = _tainted_vars(js)
+    for rx, sink_label, kind in _SINKS:
+        for m in rx.finditer(js):
+            expr = _expr_after(js, m.end() if kind == "assign" else m.start(), kind)
+            if not expr:
+                continue
+            # Which source taints this sink? Direct source in the expr, or a
+            # tainted variable used in it.
+            src_hit = None
+            for srx, slbl in _SOURCES:
+                if srx.search(expr):
+                    src_hit = slbl
+                    break
+            if not src_hit:
+                for t in tainted:
+                    if re.search(r"\b" + re.escape(t) + r"\b", expr):
+                        # label with the ultimate source if we can find it near the var
+                        src_hit = next((slbl for srx, slbl in _SOURCES
+                                        if srx.search(js)), "user-controlled")
+                        break
+            if src_hit:
+                start = max(0, m.start() - 60)
+                snippet = js[start: m.start() + len(expr) + 20].strip()
+                snippet = re.sub(r"\s+", " ", snippet)[:240]
+                hits.append((sink_label, src_hit, snippet))
+    return hits
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--target", required=True)
+    ap.add_argument("--urls", required=True,
+                    help="comma-separated in-scope page URLs to analyse for DOM sinks")
+    args = ap.parse_args()
+    target = args.target
+    cookie = _web_cookie()
+    sess = _session(cookie)
+    url_list, seen = [], set()
+    for u in args.urls.split(","):
+        u = u.strip()
+        if (u.lower().startswith(("http://", "https://")) and _in_scope(target, u)
+                and u not in seen):
+            seen.add(u)
+            url_list.append(u)
+        if len(url_list) >= _MAX_URLS:
+            break
+
+    findings: list[dict] = []
+    trace: list[dict] = []
+    reported: set[tuple[str, str, str]] = set()
+    for url in url_list:
+        for js in _scripts_for(sess, url, target, trace):
+            for sink_label, src_label, snippet in _analyze(js):
+                key = (url, sink_label, src_label)
+                if key in reported:
+                    continue
+                reported.add(key)
+                findings.append({
+                    "type": "dom_xss", "severity": "high",
+                    "url": url, "param": src_label,
+                    "evidence": (f"DOM XSS: client-controlled {src_label} flows into "
+                                 f"{sink_label} without sanitisation — {snippet}"),
+                    "confirmed": True,
+                })
+        if len(findings) >= 25:
+            break
+    print(json.dumps({"findings": findings, "trace": trace[:50]}))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

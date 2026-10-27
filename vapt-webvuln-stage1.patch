@@ -1,0 +1,152 @@
+--- a/packages/tools/vapt_tools/registry.py
++++ b/packages/tools/vapt_tools/registry.py
+@@ -11,6 +11,7 @@
+ import re
+ from collections.abc import Callable
+ from dataclasses import dataclass
++from urllib.parse import urlparse
+ 
+ from vapt_domain.enums import AgentRole, PolicyClass
+ 
+@@ -176,6 +177,48 @@
+     return ["nuclei", "-silent", "-severity", sev, "-u", url]
+ 
+ 
++def _build_wapiti(args: dict) -> list[str]:
++    """Active web-app scan. Built-in (not a plain catalog template) so webvuln can hand it
++    the endpoints the bare-root crawl would never reach: `seeds` (extra --start entry-point
++    URLs, e.g. unlinked routes discovered by the crawl or supplied by the operator) plus an
++    optional crawl `depth` and `modules` set. Scheme/port aware; JSON report on stdout so the
++    findings are parsed. argv-only + validated, same contract as every other builder."""
++    target = _valid_host(str(args["target"]))
++    scheme = "http" if str(args.get("scheme", "")).lower() == "http" else "https"
++    url = f"{scheme}://{target}"
++    port = args.get("port")
++    if port is not None and str(port) != "":
++        p = str(port)
++        if not re.fullmatch(r"\d{1,5}", p) or not 0 < int(p) < 65536:
++            raise ValueError(f"invalid port: {port!r}")
++        url = f"{scheme}://{target}:{p}"
++    argv = ["wapiti", "-u", url, "--flush-session", "-f", "json", "-o", "/dev/stdout"]
++    # Optional explicit module set (default = wapiti's own broad module set). Lowercase
++    # module names only, comma-separated.
++    modules = str(args.get("modules", "")).strip()
++    if modules:
++        if not re.fullmatch(r"[a-z0-9_]+(?:,[a-z0-9_]+)*", modules):
++            raise ValueError(f"invalid wapiti modules: {modules!r}")
++        argv += ["-m", modules]
++    # Optional crawl depth (1-2 digits).
++    depth = args.get("depth")
++    if depth is not None and str(depth) != "":
++        if not re.fullmatch(r"\d{1,2}", str(depth)):
++            raise ValueError(f"invalid depth: {depth!r}")
++        argv += ["-d", str(depth)]
++    # Seed extra entry-point URLs. Each must be an in-scope http(s) URL for THIS base host;
++    # anything option-like or off-host is rejected (the caller also pre-filters by host).
++    for s in (args.get("seeds") or []):
++        s = str(s).strip()
++        if not s.lower().startswith(("http://", "https://")):
++            continue
++        _reject_option_like(s)
++        if urlparse(s).hostname != target:
++            continue
++        argv += ["--start", s]
++    return argv
++
++
+ def _build_zap_baseline(args: dict) -> list[str]:
+     # Passive baseline scan only. The active scan is a separate P2 spec.
+     # Overridable: a ZAP install (or a docker wrapper) exposing zap-baseline.py.
+@@ -465,6 +508,22 @@
+         description="Intrusive Nuclei templates (high/critical) — requires approval.",
+     )
+ )
++# wapiti is also listed in the catalog (keeps it in the SCAN/VALIDATE agent manifests), but we
++# register a built-in here so webvuln can seed unlinked endpoints + tune the crawl; catalog
++# `_load()` skips any id already built-in, so this spec is the one that's used.
++REGISTRY.register(
++    ToolSpec(
++        id="wapiti",
++        version="1.0",
++        policy_class=PolicyClass.P2_INTRUSIVE,
++        allowed_agents=[AgentRole.SCAN, AgentRole.VALIDATE],
++        supported_modes=["black_box", "gray_box", "white_box"],
++        build_argv=_build_wapiti,
++        timeout_s=600,
++        description="Active web vulnerability scanner — sends payloads (gated). Seeds discovered/"
++                    "provided endpoints so unlinked routes are tested too.",
++    )
++)
+ REGISTRY.register(
+     ToolSpec(
+         id="zap_baseline",
+--- a/packages/agents/vapt_agents/phases.py
++++ b/packages/agents/vapt_agents/phases.py
+@@ -227,6 +227,50 @@
+     return out
+ 
+ 
++def webvuln_seed_urls(db: Session, scope: RunScope, *, base_url: str, cap: int = 50) -> list[str]:
++    """Extra entry-point URLs to seed an active web scan for one base (scheme://host[:port]).
++
++    The bare-root scan only reaches pages linked from '/', so unlinked routes (most of an
++    app's real attack surface) are never tested. This gathers seeds from two sources and
++    resolves each against `base_url`, restricted to the base host so the scan stays in scope:
++      1. endpoints the crawl already discovered (katana finding's `sample`), and
++      2. an operator-provided path/URL list via the VAPT_WEBVULN_SEED_PATHS env var
++         (comma / whitespace / newline separated) — a zero-config hook until the engagement
++         gains a proper 'seed endpoints' field (Stage 2).
++    De-duped and bounded to `cap`."""
++    from urllib.parse import urljoin, urlparse
++
++    base = base_url.rstrip("/") + "/"
++    base_host = urlparse(base_url).hostname
++    raw: list[str] = []
++    # (1) crawl-discovered endpoints (katana sample)
++    for fid in db.execute(select(Finding.id).where(Finding.run_id == scope.run_id)).scalars().all():
++        for o in db.execute(
++            select(FindingObservation).where(FindingObservation.finding_id == fid)
++        ).scalars().all():
++            if o.source_tool == "katana":
++                raw += [str(u) for u in (o.detail or {}).get("sample", [])]
++    # (2) operator-provided paths/URLs
++    raw += [p for p in re.split(r"[\s,]+", os.environ.get("VAPT_WEBVULN_SEED_PATHS", "")) if p]
++
++    seeds: list[str] = []
++    seen: set[str] = set()
++    for item in raw:
++        item = item.strip()
++        if not item:
++            continue
++        url = item if item.lower().startswith(("http://", "https://")) \
++            else urljoin(base, item.lstrip("/"))
++        if urlparse(url).hostname != base_host:
++            continue                       # keep seeds on the in-scope host
++        if url not in seen:
++            seen.add(url)
++            seeds.append(url)
++        if len(seeds) >= cap:
++            break
++    return seeds
++
++
+ # Ports that actually front a TLS service — a tls_check (testssl.sh) only makes sense
+ # against one of these; run against a plain-HTTP/closed host it just errors out.
+ _TLS_PORTS = {443, 465, 563, 636, 853, 989, 990, 992, 993, 994, 995, 1443, 2376, 2484,
+--- a/services/orchestrator/vapt_orch/graph/engagement.py
++++ b/services/orchestrator/vapt_orch/graph/engagement.py
+@@ -644,7 +644,13 @@
+             if n >= 4:                     # bound how many endpoints are actively tested
+                 break
+             tag = ep.get("port") or ep.get("scheme")
+-            plan.append(("wapiti", {"target": scope.target, **ep}, f"webvuln-wapiti-{tag}"))
++            # Seed wapiti with endpoints the bare-root crawl would miss (crawl-discovered +
++            # operator-provided), and crawl a bit deeper, so unlinked routes get tested.
++            base_url = f"{ep['scheme']}://{scope.target}" + (f":{ep['port']}" if ep.get("port") else "")
++            seeds = phases.webvuln_seed_urls(db, scope, base_url=base_url)
++            plan.append(("wapiti",
++                         {"target": scope.target, **ep, "seeds": seeds, "depth": 10},
++                         f"webvuln-wapiti-{tag}"))
+             plan.append(("nuclei_intrusive",
+                          {"target": scope.target, "severity": "high,critical", **ep},
+                          f"webvuln-nuclei-{tag}"))

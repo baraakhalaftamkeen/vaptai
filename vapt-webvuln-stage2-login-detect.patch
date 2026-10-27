@@ -1,0 +1,76 @@
+--- a/packages/agents/vapt_agents/phases.py
++++ b/packages/agents/vapt_agents/phases.py
+@@ -276,6 +276,57 @@
+     return seeds
+ 
+ 
++# Path tails that mark a login / authentication entry point, most specific first. The crawl
++# and content-discovery phases already surface these (e.g. /auth/login, /login, /signin), so
++# the authenticated scan can find WHERE to log in without the operator typing a URL. Matched
++# against the end of a discovered URL's path, so "/login" won't match "/mylogin".
++_LOGIN_URL_HINTS = (
++    "/auth/login", "/account/login", "/accounts/login", "/users/sign_in", "/user/login",
++    "/admin/login", "/login", "/signin", "/sign-in", "/session/new", "/auth",
++)
++
++
++def detect_login_url(db: Session, scope: RunScope, *, base_url: str) -> str | None:
++    """Best-guess login-form URL for one base (scheme://host[:port]), taken from what the
++    recon/probe discovery ALREADY found — so an authenticated scan can log itself in without
++    the operator supplying the URL.
++
++    Scans the same discovered endpoint set as `webvuln_seed_urls` (katana crawl + feroxbuster
++    content discovery, stored in each finding's `detail.sample`) for a path that looks like a
++    login endpoint, preferring the most specific hint and, within a hint, the shortest path
++    (closest to the bare login page, not a sub-page). In-scope host only. Returns None when
++    nothing matches, in which case the scan simply runs unauthenticated as before. Makes no
++    new requests — it only reads URLs discovery already recorded."""
++    from urllib.parse import urljoin, urlparse
++
++    base = base_url.rstrip("/") + "/"
++    base_host = urlparse(base_url).hostname
++    cands: list[str] = []
++    seen: set[str] = set()
++    for fid in db.execute(select(Finding.id).where(Finding.run_id == scope.run_id)).scalars().all():
++        for o in db.execute(
++            select(FindingObservation).where(FindingObservation.finding_id == fid)
++        ).scalars().all():
++            sample = (o.detail or {}).get("sample")
++            if not isinstance(sample, list):
++                continue
++            for u in sample:
++                u = str(u).strip()
++                if not u:
++                    continue
++                url = u if u.lower().startswith(("http://", "https://")) \
++                    else urljoin(base, u.lstrip("/"))
++                if urlparse(url).hostname != base_host or url in seen:
++                    continue
++                seen.add(url)
++                cands.append(url)
++    for hint in _LOGIN_URL_HINTS:
++        matches = [c for c in cands if urlparse(c).path.rstrip("/").lower().endswith(hint)]
++        if matches:
++            return sorted(matches, key=lambda c: len(urlparse(c).path))[0]
++    return None
++
++
+ # Ports that actually front a TLS service — a tls_check (testssl.sh) only makes sense
+ # against one of these; run against a plain-HTTP/closed host it just errors out.
+ _TLS_PORTS = {443, 465, 563, 636, 853, 989, 990, 992, 993, 994, 995, 1443, 2376, 2484,
+--- a/services/orchestrator/vapt_orch/graph/engagement.py
++++ b/services/orchestrator/vapt_orch/graph/engagement.py
+@@ -648,8 +648,12 @@
+             # operator-provided), and crawl a bit deeper, so unlinked routes get tested.
+             base_url = f"{ep['scheme']}://{scope.target}" + (f":{ep['port']}" if ep.get("port") else "")
+             seeds = phases.webvuln_seed_urls(db, scope, base_url=base_url)
++            # Auto-detect the login form from what discovery already found, so an
++            # authenticated scan logs in there with no operator-set URL (None => unauth).
++            login_url = phases.detect_login_url(db, scope, base_url=base_url)
+             plan.append(("wapiti",
+-                         {"target": scope.target, **ep, "seeds": seeds, "depth": 10},
++                         {"target": scope.target, **ep, "seeds": seeds, "depth": 10,
++                          "login_url": login_url},
+                          f"webvuln-wapiti-{tag}"))
+             plan.append(("nuclei_intrusive",
+                          {"target": scope.target, "severity": "high,critical", **ep},
