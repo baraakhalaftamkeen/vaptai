@@ -865,6 +865,14 @@ _SHIPPED_RECON_FETCH_BIN = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))),
     "workers", "bin", "vapt-recon-fetch",
 )
+_SHIPPED_WEAK_CRED_PROBE_BIN = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))),
+    "workers", "bin", "vapt-weak-cred-probe",
+)
+_SHIPPED_XXE_PROBE_BIN = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))),
+    "workers", "bin", "vapt-xxe-probe",
+)
 
 
 def _build_csp_check(args: dict) -> list[str]:
@@ -953,6 +961,123 @@ def _build_stored_xss_probe(args: dict) -> list[str]:
         ):
             raise ValueError(f"invalid stored_xss_probe data: {data!r}")
         argv += ["--data", data]
+    return argv
+
+
+def _build_weak_cred_probe(args: dict) -> list[str]:
+    """Argv for the weak-credential probe.
+
+    POSTs a bounded set (≤16) of common default credential pairs against
+    a login form and classifies success by response-diff signals (status
+    redirect, session cookie emission, body-size shift, absence of a
+    failure marker). Catches the classic default-cred bug on apps that
+    ship with a web DB manager (phpLiteAdmin, Tomcat, Jenkins).
+
+    args:
+      target          — in-scope host (REQUIRED, scope-checked).
+      url             — full http(s) POST URL of the login form (REQUIRED).
+      username_field  — form field name for the username (default: "username").
+                        Pass empty string / "__PASSWORD_ONLY__" sentinel for
+                        password-only forms (phpLiteAdmin shape).
+      password_field  — form field name for the password (default: "password").
+      extra_fields    — "k=v,k2=v2" string of hidden/required extras the
+                        form expects on every submit (CSRF tokens, submit
+                        button name=value, etc.). Pass "" / "__NONE__" if
+                        none; the probe tolerates missing --extra-fields.
+
+    Bounded: 16 pairs max, one request each, 150s wall-clock budget. No
+    shell, no eval, no cred-stuffing sweep. Argv-only.
+    """
+    binary = os.environ.get("VAPT_WEAK_CRED_PROBE_BIN", _SHIPPED_WEAK_CRED_PROBE_BIN)
+    target = _valid_host(str(args["target"]))
+    url = str(args.get("url", "")).strip()
+    if not url.lower().startswith(("http://", "https://")):
+        raise ValueError(f"weak_cred_probe needs full http(s) url: {url!r}")
+    _reject_option_like(url)
+    if urlparse(url).hostname != target:
+        raise ValueError(f"weak_cred_probe url off-scope: {url!r}")
+    argv = [binary, "--target", target, "--url", url]
+    # Username field — accept the sentinel for password-only mode.
+    uf = str(args.get("username_field", "username")).strip()
+    if uf == "":
+        uf = "__PASSWORD_ONLY__"
+    _reject_option_like(uf)
+    if uf != "__PASSWORD_ONLY__" and not re.fullmatch(
+            r"[A-Za-z0-9_.\-\[\]]{1,64}", uf):
+        raise ValueError(f"invalid weak_cred_probe username_field: {uf!r}")
+    argv += ["--username-field", uf]
+    pf = str(args.get("password_field", "password")).strip() or "password"
+    _reject_option_like(pf)
+    if not re.fullmatch(r"[A-Za-z0-9_.\-\[\]]{1,64}", pf):
+        raise ValueError(f"invalid weak_cred_probe password_field: {pf!r}")
+    argv += ["--password-field", pf]
+    extras = str(args.get("extra_fields", "")).strip() or "__NONE__"
+    _reject_option_like(extras)
+    # Validate the k=v,k=v shape (OR the sentinel). Keep forgiving: empty
+    # values are fine (common for checkbox pre-fill), but keys must be
+    # simple identifiers so a malformed field can't inject argv.
+    if extras != "__NONE__":
+        for _pair in extras.split(","):
+            _pair = _pair.strip()
+            if not _pair:
+                continue
+            if "=" not in _pair:
+                raise ValueError(f"invalid weak_cred_probe extras shape: {extras!r}")
+            _k, _, _v = _pair.partition("=")
+            if not re.fullmatch(r"[A-Za-z0-9_.\-\[\]]{1,64}", _k.strip()):
+                raise ValueError(f"invalid weak_cred_probe extras key: {_k!r}")
+            if any(ch in _v for ch in ("\r", "\n", "\x00", "&", ",")):
+                raise ValueError(f"invalid weak_cred_probe extras value: {_v!r}")
+    argv += ["--extra-fields", extras]
+    return argv
+
+
+def _build_xxe_probe(args: dict) -> list[str]:
+    """Argv for the deterministic XXE probe.
+
+    Sends up to 6 XML External Entity payload shapes to a POST (or GET)
+    endpoint and classifies response-body file-leaks as confirmed XXE.
+    Payloads target /etc/passwd, /etc/hostname, Windows win.ini, and
+    PHP's base64 stream filter. ONE request per payload; stops on first
+    confirmed hit.
+
+    args:
+      target        — in-scope host (REQUIRED, scope-checked).
+      url           — full http(s) URL that accepts XML (REQUIRED).
+      method        — "post" (default) or "get".
+      param         — form-field / query-string name to carry the XML
+                      (default: raw body on POST, "xml" on GET).
+      extra_fields  — optional k=v[,k=v,...] CSRF tokens / hidden ids.
+
+    All payloads are read-only file-disclosure shapes — never emits
+    system() / exec() tags, never attempts OOB callbacks to attacker
+    hosts, never writes files. argv-only, shell=False.
+    """
+    binary = os.environ.get("VAPT_XXE_PROBE_BIN", _SHIPPED_XXE_PROBE_BIN)
+    target = _valid_host(str(args["target"]))
+    url = str(args.get("url", "")).strip()
+    if not url.lower().startswith(("http://", "https://")):
+        raise ValueError(f"xxe_probe needs full http(s) url: {url!r}")
+    _reject_option_like(url)
+    if urlparse(url).hostname != target:
+        raise ValueError(f"xxe_probe url off-scope: {url!r}")
+    method = str(args.get("method", "post")).strip().lower()
+    if method not in ("get", "post"):
+        raise ValueError(f"xxe_probe method must be get|post: {method!r}")
+    param = str(args.get("param", "")).strip()
+    if param and not re.fullmatch(r"[A-Za-z0-9_.\-\[\]]{1,64}", param):
+        raise ValueError(f"invalid xxe_probe param: {param!r}")
+    extras = str(args.get("extra_fields", "")).strip()
+    if extras:
+        if not re.fullmatch(
+            r"[A-Za-z0-9_.\-\[\]]+=[^&\s]*(?:,[A-Za-z0-9_.\-\[\]]+=[^&\s]*)*",
+                extras):
+            raise ValueError(f"invalid xxe_probe extras shape: {extras!r}")
+    argv = [binary, "--target", target, "--url", url, "--method", method]
+    if param:
+        argv += ["--param", param]
+    if extras:
+        argv += ["--extra-fields", extras]
     return argv
 
 
@@ -1079,12 +1204,17 @@ def _build_idor_probe(args: dict) -> list[str]:
     args:
       target — in-scope host (REQUIRED).
       urls   — comma-separated list of in-scope http(s) URLs with numeric IDs (REQUIRED).
+      mode   — "read" (default, GET-based view IDOR) or "delete" (POST/DELETE
+               destructive IDOR on /order/delete, /order/cancel, etc.).
 
     The probe's internal filter keeps only URLs matching `/\\d{1,10}` AND the target host;
     off-scope / non-ID URLs are discarded, so an over-eager caller can't DoS the target.
     """
     binary = os.environ.get("VAPT_IDOR_PROBE_BIN", _SHIPPED_IDOR_PROBE_BIN)
     target = _valid_host(str(args["target"]))
+    mode = str(args.get("mode", "read")).strip().lower()
+    if mode not in ("read", "delete"):
+        raise ValueError(f"idor_probe: invalid mode {mode!r} (expected read|delete)")
     urls_raw = str(args.get("urls", "")).strip()
     if not urls_raw:
         raise ValueError("idor_probe needs comma-separated urls")
@@ -1131,7 +1261,10 @@ def _build_idor_probe(args: dict) -> list[str]:
             break
     if not kept:
         raise ValueError("idor_probe: no in-scope object/listing urls to probe")
-    return [binary, "--target", target, "--urls", ",".join(kept)]
+    cmd = [binary, "--target", target, "--urls", ",".join(kept)]
+    if mode == "delete":
+        cmd += ["--mode", "delete"]
+    return cmd
 
 
 def _build_web_param_probe(args: dict) -> list[str]:
@@ -1583,6 +1716,52 @@ REGISTRY.register(
 )
 REGISTRY.register(
     ToolSpec(
+        id="weak_cred_probe",
+        version="1.0",
+        # P2 — the probe sends up to 16 auth attempts. Each is a valid
+        # single POST (not brute-force stuffing), but it IS trying to
+        # authenticate so SCAN+ATTACK only, human-gated by default.
+        policy_class=PolicyClass.P2_INTRUSIVE,
+        allowed_agents=[AgentRole.SCAN, AgentRole.ATTACK],
+        supported_modes=["black_box", "gray_box", "white_box"],
+        build_argv=_build_weak_cred_probe,
+        # 180s budget: 1 baseline + 16 attempts × ~2-5s each ≈ 85s typical;
+        # 150s is the probe's own wall budget and we leave 30s of slack
+        # for subprocess overhead.
+        timeout_s=180,
+        description="Weak-credential probe — tries ~16 common default "
+                    "pairs (admin/admin, root/root, tomcat/tomcat, "
+                    "phpLiteAdmin admin/admin) against a known HTTP "
+                    "login form. Confirms a default-cred bug without "
+                    "a full brute-force sweep. Bounded, argv-only, P2.",
+    )
+)
+REGISTRY.register(
+    ToolSpec(
+        id="xxe_probe",
+        version="1.0",
+        # P2 — the probe sends XML payloads attempting file disclosure
+        # (file://, php://filter). Payloads are read-only (never emits
+        # system() tags), but ARE sending attack-shaped requests, so
+        # SCAN+VALIDATE only, human-gated by default.
+        policy_class=PolicyClass.P2_INTRUSIVE,
+        allowed_agents=[AgentRole.SCAN, AgentRole.VALIDATE],
+        supported_modes=["black_box", "gray_box", "white_box"],
+        build_argv=_build_xxe_probe,
+        # 120s budget: 6 payloads × 10s each + subprocess overhead.
+        # Each payload stops at first confirmation so typical runs
+        # take 10-30s against a vulnerable target.
+        timeout_s=120,
+        description="XML External Entity (XXE) probe — sends 6 payload "
+                    "shapes (SYSTEM entity /etc/passwd, parameter-entity "
+                    "blind, PHP base64 filter, SOAP envelope) to a known "
+                    "XML-intake endpoint. Confirms file-disclosure XXE "
+                    "when the response leaks the target file content. "
+                    "Argv-only, bounded, P2.",
+    )
+)
+REGISTRY.register(
+    ToolSpec(
         id="yaml_deserialization_probe",
         version="1.0",
         # P2 — the probe sends a payload that TRIGGERS deserialization. The
@@ -1795,7 +1974,9 @@ REGISTRY.register(
         build_argv=_build_idor_probe,
         timeout_s=240,
         description="Deterministic IDOR probe — two accounts, numeric-ID path rewriting, "
-                    "cross-tenant diff detection. Requires approval.",
+                    "cross-tenant diff detection. mode=read (default) for GET-based "
+                    "view IDOR; mode=delete for POST/DELETE destructive IDOR. "
+                    "Requires approval.",
     )
 )
 # dalfox: XSS fuzzer (reflected + DOM via headless Chrome). Covers the DOM-XSS gap our

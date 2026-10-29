@@ -98,9 +98,22 @@ def _plannable_tools(planning: AgentManifest, scan: AgentManifest) -> list:
 
 def _args_from_step(tool_id: str, step: dict) -> dict:
     args: dict = {}
+    # Allowed arg keys the model may supply directly. `urls`/`url`/`path`/`view_url`
+    # /`post_url` added 2026-10-28 so URL-requiring tools (dom_xss_probe, idor_probe,
+    # js_endpoint_miner, etc.) actually receive their args when the LLM provides them.
+    # Previously, dom_xss_probe planned by the LLM dispatched with args={} and the
+    # argv builder raised ValueError, which killed the whole engagement (the bloghub
+    # 2026-10-28 run died at scan-10). Values still pass through the registry's own
+    # scope + shape validation before any subprocess runs.
+    _ALLOWED_ARG_KEYS = (
+        "ports", "severity", "target",
+        "urls", "url", "path", "view_url", "post_url",
+    )
     if isinstance(step.get("args"), dict):          # some models nest args
-        args.update({k: v for k, v in step["args"].items() if k in ("ports", "severity", "target")})
-    for k in ("ports", "severity"):
+        args.update({k: v for k, v in step["args"].items() if k in _ALLOWED_ARG_KEYS})
+    for k in _ALLOWED_ARG_KEYS:
+        if k == "target":
+            continue
         if isinstance(step.get(k), str) and step[k].strip():
             args[k] = step[k].strip()
     args.pop("target", None)                        # target always comes from scope, never the model

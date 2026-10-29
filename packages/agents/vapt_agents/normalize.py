@@ -126,6 +126,10 @@ def normalize(tool_id: str, result_observations: list[dict]) -> list[Observation
         return _csp_check(text)
     if tool_id == "yaml_deserialization_probe":
         return _yaml_deser_probe(text)
+    if tool_id == "weak_cred_probe":
+        return _weak_cred_probe(text)
+    if tool_id == "xxe_probe":
+        return _xxe_probe(text)
     if tool_id == "dom_xss_probe":
         return _dom_xss_probe(text)
     if tool_id == "wafw00f":
@@ -917,12 +921,22 @@ def _idor_probe(text: str) -> list[Observation]:
         if sev not in ("info", "low", "medium", "high", "critical"):
             sev = "high"
         verified = bool(f.get("confirmed"))
-        title = f"IDOR {'confirmed' if verified else 'candidate'}" + \
-                (f" ({param})" if param else "")
+        ftype = str(f.get("type", "idor"))
+        method = str(f.get("method", "")).strip()
+        is_delete = ftype == "idor_delete"
+        if is_delete:
+            label = "Destructive IDOR"
+            sev = "critical" if verified else sev
+        else:
+            label = "IDOR"
+        title = f"{label} {'confirmed' if verified else 'candidate'}" + \
+                (f" ({method} " if method else " (") + \
+                (f"{param})" if param else ")")
         out.append(Observation(
             "idor_probe", title[:300], sev,
             {"url": url, "param": param, "evidence": evidence,
-             "confirmed": verified},
+             "confirmed": verified, "method": method,
+             "subtype": ftype},
         ))
         if len(out) >= 20:
             break
@@ -1161,6 +1175,118 @@ def _dom_xss_probe(text: str) -> list[Observation]:
                 "confirmed": confirmed,
                 "trace": trace[:10],
             },
+        ))
+    return out
+
+
+def _weak_cred_probe(text: str) -> list[Observation]:
+    """Parse the JSON record emitted by `workers/bin/vapt-weak-cred-probe`.
+    A confirmed hit = `findings[].confirmed=True` with `type=weak_credentials`.
+    Promotes to CRITICAL via `_PROOF_SOURCE_TOOLS` (weak_cred_probe added to
+    that set). The trace is captured as an info observation so an operator
+    reading the ledger can see WHICH pairs were tried, even when nothing
+    hit (useful for tuning the default pair list on an app with a custom
+    marker regex).
+    """
+    data = _first_json(text or "")
+    if not isinstance(data, dict):
+        return []
+    out: list[Observation] = []
+    findings = data.get("findings") if isinstance(data.get("findings"), list) else []
+    trace = data.get("trace") if isinstance(data.get("trace"), list) else []
+    for f in findings:
+        if not isinstance(f, dict):
+            continue
+        confirmed = bool(f.get("confirmed"))
+        sev = str(f.get("severity") or ("critical" if confirmed else "info")).strip().lower()
+        if sev not in ("info", "low", "medium", "high", "critical"):
+            sev = "critical" if confirmed else "info"
+        user = str(f.get("user", ""))[:60]
+        url = str(f.get("url", ""))[:300]
+        title = (f"Weak credentials: default login works ({user!r}) at {url}"
+                 if confirmed
+                 else f"weak_cred_probe: no default credential hit ({url})")
+        out.append(Observation(
+            "weak_cred_probe",
+            title[:300],
+            sev,
+            {
+                "class": "weak_credentials",
+                "url": url,
+                "user": user,
+                "evidence": str(f.get("evidence", ""))[:300],
+                "confirmed": confirmed,
+                # Redact passwords from the detail payload — the full
+                # trace keeps them for in-session audit but we don't want
+                # a finding record carrying the exact credential pair.
+                "trace": [{k: v for k, v in (r or {}).items() if k != "pass"}
+                          for r in trace[:12]],
+            },
+        ))
+    # If no findings were produced but we have a trace, surface it as an
+    # info observation so operators see the probe fired and classified
+    # every pair as negative. Mirrors _web_param_probe's "trace on empty"
+    # behaviour.
+    if not findings and trace:
+        out.append(Observation(
+            "weak_cred_probe",
+            "weak_cred_probe: 0 defaults succeeded (trace captured)",
+            "info",
+            {"class": "weak_credentials", "trace_count": len(trace),
+             "trace_sample": [{k: v for k, v in (r or {}).items()
+                               if k != "pass"} for r in trace[:5]]},
+        ))
+    return out
+
+
+def _xxe_probe(text: str) -> list[Observation]:
+    """Parse the JSON record emitted by `workers/bin/vapt-xxe-probe`.
+    A confirmed hit = `findings[].confirmed=True` with `type=xxe`.
+    Promotes to CRITICAL via `_PROOF_SOURCE_TOOLS` (xxe_probe added to that
+    set). The trace captures every payload shape tried + response status +
+    whether it matched, so an operator can tell "no XXE" from "wrong payload
+    shape for this parser".
+    """
+    data = _first_json(text or "")
+    if not isinstance(data, dict):
+        return []
+    out: list[Observation] = []
+    findings = data.get("findings") if isinstance(data.get("findings"), list) else []
+    trace = data.get("trace") if isinstance(data.get("trace"), list) else []
+    for f in findings:
+        if not isinstance(f, dict):
+            continue
+        confirmed = bool(f.get("confirmed"))
+        sev = str(f.get("severity") or ("critical" if confirmed else "info")).strip().lower()
+        if sev not in ("info", "low", "medium", "high", "critical"):
+            sev = "critical" if confirmed else "info"
+        url = str(f.get("url", ""))[:300]
+        payload = str(f.get("payload", ""))[:60]
+        title = (f"XXE confirmed ({payload}) at {url}"
+                 if confirmed
+                 else f"xxe_probe: no XXE detected ({url})")
+        out.append(Observation(
+            "xxe_probe",
+            title[:300],
+            sev,
+            {
+                "class": "xxe",
+                "url": url,
+                "payload": payload,
+                "evidence": str(f.get("evidence", ""))[:400],
+                "confirmed": confirmed,
+                "trace": trace[:8],
+            },
+        ))
+    # Diagnostic observation when every payload came back negative — mirrors
+    # the "0 defaults succeeded" trace surfaced by _weak_cred_probe.
+    if not findings and trace:
+        out.append(Observation(
+            "xxe_probe",
+            "xxe_probe: no XXE detected (trace captured)",
+            "info",
+            {"class": "xxe", "trace_count": len(trace),
+             "trace_sample": trace[:6]},
         ))
     return out
 

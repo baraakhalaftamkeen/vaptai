@@ -1,0 +1,385 @@
+#!/usr/bin/env python3
+"""JS endpoint miner + OpenAPI spec discovery (P1 passive).
+
+Fetches .js files referenced by the target's served HTML, mines them for
+URL-shaped strings (`/api/v1/users`, `/admin/config`, `/.well-known/...`),
+also probes a short list of common API-spec endpoints (`/openapi.json`,
+`/swagger.json`, `/api-docs`, `/.well-known/openapi.json`) and parses JSON
+specs for an endpoint inventory.
+
+Why this exists:
+  Static HTML + katana + feroxbuster + authed BFS can only find endpoints
+  that are LINKED somewhere (`<a href>`, `<form action>`, `<script src>`).
+  Many apps bundle minified JS that references hundreds of `/api/*` or
+  `/admin/*` paths that no HTML page links to. Mining those strings
+  surfaces unlinked endpoints that would otherwise be invisible to a
+  black-box scan.
+
+Output:
+  Single JSON blob on stdout:
+    {"target": "...", "bases": [...], "js_files_fetched": N,
+     "endpoints_discovered": ["https://host/api/v1/x", ...],
+     "spec_endpoints": {"openapi.json": {"found": true, "paths": [...]}},
+     "total": M, "elapsed_s": T}
+
+Governance posture:
+  - argv-only, no shell
+  - Rejects off-scope URLs via --target host match
+  - Bounded wall-clock, bounded per-JS-file size (1MB), bounded total files
+  - Uses the authenticated cookie from VAPT_WEB_LOGIN_COOKIE if present
+    (same mechanism as recon_fetch) so authed-only JS bundles also get mined
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+import time
+from html.parser import HTMLParser
+from urllib.parse import urljoin, urlparse, urldefrag
+
+import requests
+
+
+_IP_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
+_HOSTLIKE_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$")
+
+# A URL-shaped string in JS: starts with `/`, contains only path-safe chars,
+# at least 4 chars long, doesn't look like a comment or regex noise. Captures
+# both plain `/api/users` and `/api/v1/items/{id}`. Deliberately excludes
+# protocol-relative (`//`) and query-only (`?x=y`) strings.
+_URL_IN_JS_RE = re.compile(
+    r"""['"`]
+        (
+          /
+          (?!/)                                     # not //cdn.example.com
+          [a-zA-Z0-9_\-./{}:$]
+          [a-zA-Z0-9_\-./{}:$]{3,160}
+          (?:\?[a-zA-Z0-9_\-./={}&$]*)?             # optional query
+        )
+        ['"`]
+    """,
+    re.VERBOSE,
+)
+# Exclusions — strings that match the pattern but aren't endpoints.
+_JS_EXCLUDE_RE = re.compile(
+    r"""(?xi)
+    ^(
+      /\d+(/\d+)*/?        # CSS/version like /12/34
+      |/\\n|/\\t|/\\r      # escaped whitespace
+      |/[*][a-z]           # /* comment start (shouldn't match our regex but defensive)
+      |/\.\.               # ../ relative paths
+      |/[a-z]{1,2}$        # tiny strings like /a /ab (rarely real endpoints)
+    )$
+    """
+)
+
+# API-spec endpoints we probe speculatively. Keep this list small + standard
+# names only — a hit is a huge win (full endpoint inventory for free), a miss
+# costs one 2-sec HEAD/GET.
+_SPEC_ENDPOINTS = (
+    "openapi.json", "openapi.yaml", "openapi.yml",
+    "swagger.json", "swagger.yaml", "swagger.yml",
+    "api-docs", "api/docs", "api/openapi.json",
+    "v3/api-docs", "v2/api-docs",
+    ".well-known/openapi.json",
+    "actuator/mappings",   # Spring Boot actuator — leaks all @RequestMapping routes
+)
+
+
+class _ScriptSrcParser(HTMLParser):
+    """Pulls `<script src=...>` and `<link rel="modulepreload" href=...>` + bare
+    .js references from served HTML. Also captures any `<a href="...js">` style
+    static JS asset links."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.srcs: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str]]) -> None:
+        a = dict(attrs)
+        # <script src="..."> and <script src="..." type="module">
+        if tag == "script" and a.get("src"):
+            self.srcs.append(a["src"])
+        # Modulepreload is how modern SPAs reference non-src ESM modules
+        elif tag == "link":
+            if (a.get("rel", "").lower() in ("modulepreload", "preload")
+                    and a.get("as", "").lower() == "script"):
+                h = a.get("href")
+                if h:
+                    self.srcs.append(h)
+
+
+def _die(msg: str, code: int = 2) -> None:
+    sys.stderr.write(f"vapt-js-endpoint-miner: {msg}\n")
+    sys.exit(code)
+
+
+def _valid_target(host: str) -> str:
+    """Accept IP or hostname — delegating the full RFC check to the orchestrator's
+    scope-membership check at dispatch time; here we just do shape validation."""
+    if _IP_RE.match(host):
+        return host
+    if _HOSTLIKE_RE.match(host) and all(len(p) <= 63 for p in host.split(".")):
+        return host
+    raise ValueError(f"invalid target host: {host!r}")
+
+
+def _get(sess: requests.Session, url: str, *, timeout: int = 10,
+          max_bytes: int = 1 << 20) -> tuple[int, str, str]:
+    """GET with hard byte cap. Returns (status, content_type, body)."""
+    try:
+        r = sess.get(url, timeout=timeout, allow_redirects=True, stream=True)
+        ct = r.headers.get("Content-Type", "")
+        chunks: list[bytes] = []
+        got = 0
+        for chunk in r.iter_content(chunk_size=4096):
+            if not chunk:
+                continue
+            chunks.append(chunk)
+            got += len(chunk)
+            if got >= max_bytes:
+                break
+        try:
+            body = b"".join(chunks).decode(r.encoding or "utf-8",
+                                            errors="replace")
+        except Exception:
+            body = b"".join(chunks).decode("utf-8", errors="replace")
+        return r.status_code, ct, body
+    except Exception:
+        return 0, "", ""
+
+
+def _mine_js(body: str, base_host: str) -> list[str]:
+    """Extract /path-shaped strings from a JS body, filter noise, restrict
+    to same-host (we return path-only URLs; caller joins with base)."""
+    hits: set[str] = set()
+    for m in _URL_IN_JS_RE.finditer(body):
+        path = m.group(1).strip()
+        # Drop obvious noise matches.
+        head = path.split("?", 1)[0]
+        if _JS_EXCLUDE_RE.match(head):
+            continue
+        # Drop binary-looking garbage (base64, long hex, etc.).
+        if head.count("/") > 20:
+            continue
+        # Drop paths with no alpha chars at all (e.g. /123/456).
+        if not re.search(r"[a-zA-Z]", head.lstrip("/")):
+            continue
+        hits.add(path)
+    return sorted(hits)
+
+
+def _parse_openapi(body: str) -> list[str] | None:
+    """If body is a valid OpenAPI/Swagger JSON, return the list of path strings.
+    Returns None for non-OpenAPI JSON or non-JSON. YAML specs would need a
+    parser (not shipped — most apps serve JSON specs)."""
+    try:
+        d = json.loads(body)
+    except Exception:
+        return None
+    if not isinstance(d, dict):
+        return None
+    # OpenAPI 3.x or Swagger 2.x both have a top-level "paths" dict.
+    paths = d.get("paths")
+    if isinstance(paths, dict):
+        return [p for p in paths.keys() if isinstance(p, str) and p.startswith("/")]
+    # Spring Boot actuator/mappings — "contexts.*.mappings.dispatcherServlets.*"
+    ctxs = d.get("contexts")
+    if isinstance(ctxs, dict):
+        found: set[str] = set()
+        for _ctx in ctxs.values():
+            if not isinstance(_ctx, dict):
+                continue
+            m = (_ctx.get("mappings", {}) or {}).get("dispatcherServlets",
+                                                      {}) or {}
+            for _srv_entries in m.values():
+                if not isinstance(_srv_entries, list):
+                    continue
+                for entry in _srv_entries:
+                    pred = (entry or {}).get("details", {}).get(
+                        "requestMappingConditions", {}).get("patterns", []) or []
+                    for p in pred:
+                        if isinstance(p, str) and p.startswith("/"):
+                            found.add(p)
+        if found:
+            return sorted(found)
+    return None
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(
+        prog="vapt-js-endpoint-miner",
+        description="Mine .js files + API specs for unlinked endpoints.")
+    p.add_argument("--target", required=True,
+                   help="In-scope target host (IP or domain).")
+    p.add_argument("--base-urls", required=True,
+                   help="Comma-separated web base URLs to crawl + probe "
+                        "(e.g. http://x:5000,http://x:80).")
+    p.add_argument("--seed-pages", default="",
+                   help="Comma-separated extra pages to fetch for <script src> "
+                        "discovery (optional; defaults to each base's /).")
+    p.add_argument("--max-js", type=int, default=20,
+                   help="Max JS files to fetch total (default 20).")
+    p.add_argument("--timeout", type=int, default=120,
+                   help="Overall subprocess wall-clock cap (default 120s).")
+    args = p.parse_args()
+
+    try:
+        target = _valid_target(args.target.strip())
+    except ValueError as e:
+        _die(str(e))
+
+    bases = [b.strip().rstrip("/") for b in args.base_urls.split(",")
+             if b.strip()]
+    if not bases:
+        _die("at least one --base-urls entry required")
+    for b in bases:
+        try:
+            bp = urlparse(b)
+            if bp.hostname != target:
+                _die(f"base-url off-scope: {b!r} (host {bp.hostname} != target "
+                     f"{target})")
+        except Exception as e:
+            _die(f"bad base-url {b!r}: {e}")
+
+    seed_pages: list[str] = []
+    if args.seed_pages:
+        for s in args.seed_pages.split(","):
+            s = s.strip()
+            if not s:
+                continue
+            if urlparse(s).hostname != target:
+                continue  # silently drop off-scope seeds
+            seed_pages.append(s)
+    # Always include each base's "/" as a seed.
+    for b in bases:
+        seed_pages.append(b + "/")
+
+    max_js = max(1, min(args.max_js, 50))
+    timeout = max(30, min(args.timeout, 300))
+    deadline = time.monotonic() + timeout
+
+    sess = requests.Session()
+    cookie = os.environ.get("VAPT_WEB_LOGIN_COOKIE", "").strip()
+    if cookie and all(c not in cookie for c in ("\r", "\n", "\x00")):
+        sess.headers["Cookie"] = cookie
+    sess.headers["User-Agent"] = ("Mozilla/5.0 (compatible; "
+                                   "VAPT-AI/2.0 js-endpoint-miner)")
+
+    # 1. Collect <script src=...> URLs from each seed page.
+    js_urls: list[str] = []
+    seen_js: set[str] = set()
+    seen_seeds: set[str] = set()
+    for sp in seed_pages:
+        if time.monotonic() > deadline:
+            break
+        if sp in seen_seeds:
+            continue
+        seen_seeds.add(sp)
+        status, ct, body = _get(sess, sp, timeout=8)
+        if status == 0 or "html" not in ct.lower():
+            continue
+        parser = _ScriptSrcParser()
+        try:
+            parser.feed(body[:300_000])
+        except Exception:
+            pass
+        for src in parser.srcs:
+            try:
+                abs_url = urljoin(sp, src)
+            except Exception:
+                continue
+            abs_url = urldefrag(abs_url)[0]
+            if urlparse(abs_url).hostname != target:
+                continue
+            if abs_url in seen_js:
+                continue
+            # Only include URLs that look like .js (or ESM w/o extension —
+            # keep broad; the content-type check at fetch time filters).
+            if not re.search(r"\.(mjs|js)(?:$|\?)", abs_url, re.IGNORECASE):
+                # Still include if the path looks ESM-like (chunk-abcd1234, etc.)
+                if not re.search(r"/(chunk|module|assets?)[-./]",
+                                 abs_url, re.IGNORECASE):
+                    continue
+            seen_js.add(abs_url)
+            js_urls.append(abs_url)
+            if len(js_urls) >= max_js:
+                break
+        if len(js_urls) >= max_js:
+            break
+
+    # 2. Fetch each JS, mine for /path-shaped strings.
+    endpoints: set[str] = set()
+    js_fetched = 0
+    for ju in js_urls[:max_js]:
+        if time.monotonic() > deadline:
+            break
+        status, ct, body = _get(sess, ju, timeout=8)
+        if status == 0 or not body:
+            continue
+        js_fetched += 1
+        for path in _mine_js(body, target):
+            # Build full URL on each base.
+            for b in bases:
+                full = urljoin(b + "/", path.lstrip("/"))
+                if urlparse(full).hostname == target:
+                    endpoints.add(urldefrag(full)[0])
+
+    # 3. Probe common API-spec endpoints on each base; parse JSON specs.
+    spec_results: dict = {}
+    for b in bases:
+        if time.monotonic() > deadline:
+            break
+        for sp_path in _SPEC_ENDPOINTS:
+            if time.monotonic() > deadline:
+                break
+            url = b + "/" + sp_path
+            status, ct, body = _get(sess, url, timeout=5)
+            key = b + "/" + sp_path
+            if status != 200 or not body:
+                spec_results[key] = {"found": False, "status": status}
+                continue
+            # Only JSON specs are parsed. YAML would need PyYAML (not a dep
+            # of this wrapper); if it's YAML we still report the hit so an
+            # operator can inspect manually.
+            if "json" in ct.lower() or body.strip().startswith("{"):
+                parsed = _parse_openapi(body)
+                if parsed:
+                    spec_results[key] = {"found": True,
+                                          "status": status,
+                                          "paths": parsed[:200]}
+                    # Add every spec path to the discovered endpoint set.
+                    for sp_endpoint in parsed:
+                        full = urljoin(b + "/", sp_endpoint.lstrip("/"))
+                        if urlparse(full).hostname == target:
+                            endpoints.add(urldefrag(full)[0])
+                else:
+                    spec_results[key] = {"found": True,
+                                          "status": status,
+                                          "paths": [],
+                                          "note": "fetched but not an OpenAPI/"
+                                                  "Swagger-shaped JSON"}
+            else:
+                spec_results[key] = {"found": True, "status": status,
+                                      "content_type": ct[:60],
+                                      "note": "non-JSON spec (YAML?) — not parsed"}
+
+    out = {
+        "target": target,
+        "bases": bases,
+        "js_files_fetched": js_fetched,
+        "js_urls_seen": len(js_urls),
+        "endpoints_discovered": sorted(endpoints)[:300],
+        "spec_endpoints": spec_results,
+        "total": len(endpoints),
+        "elapsed_s": round(timeout - max(0, deadline - time.monotonic()), 2),
+    }
+    print(json.dumps(out))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

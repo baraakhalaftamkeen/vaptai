@@ -180,6 +180,17 @@ SCAN = AgentManifest(
         # (Stage 3) uses this to explore the authenticated surface and derive
         # targeted probes from real form shapes, instead of guessing. P1.
         "recon_fetch",
+        # Weak-cred probe — tries ~16 common default pairs (admin/admin,
+        # tomcat/tomcat, phpLiteAdmin admin/admin) against a known HTTP
+        # login form. Catches the classic default-cred bug that chains
+        # to full RCE on apps shipping a web DB manager. P2 approval-gated.
+        "weak_cred_probe",
+        # XXE probe — sends 6 payload shapes (file:// SYSTEM, parameter-
+        # entity blind, PHP base64 filter, SOAP envelope) to an XML-
+        # intake endpoint. Confirms file-disclosure XXE by matching the
+        # leaked /etc/passwd / win.ini / <?php content in the response.
+        # P2 approval-gated.
+        "xxe_probe",
         *_cat_ids(AgentRole.SCAN),
     ),
     risk_ceiling=PolicyClass.P2_INTRUSIVE,   # may PROPOSE intrusive; policy + human still gate it
@@ -196,10 +207,18 @@ SCAN = AgentManifest(
     # Raised 64 → 160 (2026-10-26): the dynamic LLM webvuln pipeline (primary +
     # reactive + recon-agent) appends up to ~15 extra items to the plan AFTER
     # the deterministic tiers finish; on an app whose deterministic plan is
-    # ~110 items the LLM items were silently starved at iter 64. 160 leaves
-    # comfortable headroom; max_wall_seconds=3600 is still the real wall-clock
-    # ceiling, so overshoot can't actually waste operator time.
-    max_iterations=160,
+    # ~110 items the LLM items were silently starved at iter 64.
+    # Raised 160 → 240 (2026-10-28): on DineHub v3 the deterministic plan grew
+    # to 173 items (adminprobe×30 + formprobe×30 + probe×44 + others), so 160
+    # was still cutting off 13 items at the end. LLM items are now hoisted up
+    # to right after IDOR so budget trim hits low-signal probes, not LLM.
+    # Raised 240 → 320 (2026-10-28 pre-run audit): post-fix plan tally is
+    # ~230-240 deterministic + 20 LLM steps + headroom for discovery growth
+    # across webvuln iterations. 320 keeps the budget trim away from
+    # anything we care about (LLM items hoisted + bounded tiers), and
+    # max_wall_seconds=3600 is not enforced anywhere in the orchestrator
+    # (declarative only), so iterations are the ONLY ceiling.
+    max_iterations=320,
     max_wall_seconds=3600,
     escalation_conditions=("approval_required",),
 )
@@ -215,7 +234,15 @@ VALIDATE = AgentManifest(
     state_reads=("scope_ref", "candidate_finding_refs"),
     state_writes=("validated_finding_refs", "phase", "log"),
     model_profile="validation",
-    max_iterations=32,
+    # Bumped 32 → 48 (2026-10-28). The DineHub 2026-10-27 run surfaced 28
+    # candidates with 17 confirmed — 11 unvalidated. Some are genuine
+    # non-validatable (version-match-only CVEs stay inconclusive, info
+    # severities skip validation), but with the fix-batch surfacing MORE
+    # candidates (weak_cred_probe, body-pattern findings, extra sqli_detect
+    # on password param, dalfox on admin textareas), 32 could get tight.
+    # Each validate action is cheap (one http_probe per finding, ~1-20s);
+    # 48 is still safe wall-clock-wise.
+    max_iterations=48,
     max_wall_seconds=1800,
     max_tokens=2048,
     max_cost_usd=0.05,

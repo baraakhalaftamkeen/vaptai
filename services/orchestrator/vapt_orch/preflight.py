@@ -42,6 +42,10 @@ _REQUIRED_BINARIES = (
     "vapt-stored-xss-probe",
     "vapt-csp-check",
     "vapt-yaml-deser-probe",
+    "vapt-waybacklister",
+    "vapt-js-endpoint-miner",
+    "vapt-weak-cred-probe",
+    "vapt-xxe-probe",
 )
 
 

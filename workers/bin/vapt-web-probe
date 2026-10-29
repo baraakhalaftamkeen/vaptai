@@ -38,6 +38,9 @@ import json
 import os
 import re
 import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlencode, urljoin, urlparse
 
 try:
@@ -50,6 +53,20 @@ _UA = "vapt-web-probe/1.0 (authorized assessment)"
 _TIMEOUT = 10
 _CANARY_HOST = "example.invalid"      # obviously-synthetic DNS token (in-band fallback)
 _CANARY_URL = f"https://{_CANARY_HOST}/vapt-canary"
+
+# Speedup Fix 1 (2026-10-28): parallelism knob. Default of 4 workers gives
+# a 3-4× per-probe wall-clock reduction while keeping concurrent request
+# rate against the target bounded (4 req at a time; well under typical
+# Flask ~50 req/sec capacity). Operator can override via env for
+# aggressive scans against known-robust targets (set 8-12) or dial down
+# to serial behaviour (set 1) on fragile lab apps.
+_WORKER_COUNT = max(1, int(os.environ.get("VAPT_WEB_PROBE_WORKERS", "4")))
+# Early-exit cutoff: when a confirmed finding lands mid-batch, stop
+# submitting new HTTP calls. In-flight calls finish on their own but
+# their results are discarded. This bounds wasted work after a hit.
+# Set to 0 to disable early exit (useful for e.g. XSS surface-mapping
+# where multiple findings per probe matter).
+_EARLY_EXIT = int(os.environ.get("VAPT_WEB_PROBE_EARLY_EXIT", "1"))
 
 
 def _oast_canary(label: str) -> str | None:
@@ -294,7 +311,16 @@ def _load_cookie() -> tuple[str, str]:
 
 
 class _Session:
-    """Thin wrapper so every request lands in the shared `trace` list for diagnostics."""
+    """Thin wrapper so every request lands in the shared `trace` list for diagnostics.
+
+    THREAD-SAFE (2026-10-28 Speedup Fix 1): callers may invoke `get`/`post`
+    concurrently from a ThreadPoolExecutor. requests.Session itself is thread-
+    safe for parallel HTTP calls (urllib3 pool handles concurrency), so we
+    only need a lock around the two pieces of SHARED MUTABLE STATE: the
+    budget counter (atomic decrement + bounds check) and the trace list
+    (append + length cap). Each parallel GET then races on the HTTP wire —
+    that's where the actual wall-clock savings come from.
+    """
     def __init__(self, cookie: str, insecure: bool):
         s = requests.Session()
         s.headers.update({"User-Agent": _UA, "Accept": "*/*"})
@@ -306,6 +332,20 @@ class _Session:
                 requests.packages.urllib3.disable_warnings()  # type: ignore[attr-defined]
             except Exception:
                 pass
+        # Expand urllib3's default pool size (10) to match the worker count
+        # we'll fan out to. Without this, concurrent requests queue inside
+        # the connection pool — negating the thread-pool parallelism we add.
+        # Pool size = worker count × 2 for headroom when a probe both GETs
+        # and POSTs the same host.
+        try:
+            from requests.adapters import HTTPAdapter
+            _pool_size = max(16, _WORKER_COUNT * 4)
+            _ad = HTTPAdapter(pool_connections=_pool_size,
+                              pool_maxsize=_pool_size, max_retries=0)
+            s.mount("http://", _ad)
+            s.mount("https://", _ad)
+        except Exception:
+            pass
         self.s = s
         self.trace: list[dict] = []
         # Hard cap on requests per invocation. Raised from 160 → 320 when the SSTI/SQLi/XSS
@@ -313,36 +353,53 @@ class _Session:
         # and when stacked with the existing 7 classes the old cap sometimes starved the
         # late ones. 320 covers the full probe at ~2.5x the common per-probe ceiling.
         self.budget = 320
+        self._lock = threading.Lock()
 
     def _record(self, url: str, status: int | None, cls: str, note: str = ""):
+        # Called while holding the lock from the budget check — no re-lock needed.
         if len(self.trace) >= _TRACE_CAP:
             return
         self.trace.append({"url": url[:200], "status": status,
                            "cls": cls, "note": note[:100]})
 
+    def _reserve_budget(self) -> bool:
+        """Atomically consume one budget slot. Return True if the request
+        can proceed, False if the budget is exhausted. Keeps the budget
+        accurate across concurrent threads — without the lock, two
+        parallel calls could both see budget=1 and both decrement to 0,
+        over-firing by one. Cheap operation; the HTTP call itself is
+        where the real time is spent."""
+        with self._lock:
+            if self.budget <= 0:
+                return False
+            self.budget -= 1
+            return True
+
     def get(self, url: str, cls: str, allow_redirects: bool = False):
-        if self.budget <= 0:
+        if not self._reserve_budget():
             return None
-        self.budget -= 1
         try:
             r = self.s.get(url, timeout=_TIMEOUT, allow_redirects=allow_redirects)
-            self._record(url, r.status_code, cls)
+            with self._lock:
+                self._record(url, r.status_code, cls)
             return r
         except Exception as e:
-            self._record(url, None, cls, f"err:{type(e).__name__}")
+            with self._lock:
+                self._record(url, None, cls, f"err:{type(e).__name__}")
             return None
 
     def post(self, url: str, data, headers, cls: str):
-        if self.budget <= 0:
+        if not self._reserve_budget():
             return None
-        self.budget -= 1
         try:
             r = self.s.post(url, data=data, headers=headers,
                             timeout=_TIMEOUT, allow_redirects=False)
-            self._record(url, r.status_code, cls)
+            with self._lock:
+                self._record(url, r.status_code, cls)
             return r
         except Exception as e:
-            self._record(url, None, cls, f"err:{type(e).__name__}")
+            with self._lock:
+                self._record(url, None, cls, f"err:{type(e).__name__}")
             return None
 
 
@@ -380,26 +437,98 @@ def _param_list(pinned: str, common: tuple[str, ...]) -> list[str]:
     return out
 
 
-def _probe_open_redirect(sess: _Session, base_url: str, pinned_param: str) -> list[dict]:
+def _parallel_fire(sess: _Session, cls: str, specs: list[dict],
+                   classify) -> list[dict]:
+    """Fire a batch of HTTP calls concurrently and classify responses.
+
+    Each ``specs`` entry is a dict with:
+      * ``method`` — "get" (default) or "post"
+      * ``url``    — full URL (callers build these up front)
+      * ``allow_redirects`` — bool, defaults False
+      * ``post_data`` — for POST only
+      * ``post_headers`` — for POST only
+      * ``meta`` — arbitrary dict passed back to ``classify`` for context
+                   (e.g. the param name, the payload used, the probe tag).
+
+    ``classify(spec, response)`` is called for each completed request;
+    it returns a dict (becomes a finding) OR None (no hit). When
+    ``_EARLY_EXIT`` is set, the first non-None classifier result stops
+    further submissions and the function returns.
+
+    All callers converge on this helper so the thread-pool configuration,
+    short-circuit semantics, and timing collection stay consistent.
+    Thread-safety is provided by ``_Session``'s own lock; this helper
+    adds no shared mutable state beyond the futures dict.
+    """
     out: list[dict] = []
+    if not specs:
+        return out
+    # Cap worker count to batch size — no benefit from more workers than work.
+    workers = max(1, min(_WORKER_COUNT, len(specs)))
+
+    def _call(spec):
+        if spec.get("method", "get") == "post":
+            return sess.post(spec["url"],
+                             data=spec.get("post_data"),
+                             headers=spec.get("post_headers"),
+                             cls=cls), spec
+        return sess.get(spec["url"], cls=cls,
+                        allow_redirects=bool(spec.get("allow_redirects"))), spec
+
+    hit = False
+    with ThreadPoolExecutor(max_workers=workers,
+                            thread_name_prefix="webprobe") as pool:
+        futs = {pool.submit(_call, s): s for s in specs}
+        for fut in as_completed(futs):
+            try:
+                r, spec = fut.result()
+            except Exception:
+                continue
+            if r is None:
+                continue
+            finding = classify(spec, r)
+            if finding is not None:
+                out.append(finding)
+                if _EARLY_EXIT:
+                    hit = True
+                    # Cancel pending futures. In-flight requests on
+                    # worker threads can't actually be interrupted
+                    # (requests.get doesn't support thread-level
+                    # cancellation), but we stop any that haven't
+                    # started yet.
+                    for other in futs:
+                        if not other.done():
+                            other.cancel()
+                    break
+    return out
+
+
+def _probe_open_redirect(sess: _Session, base_url: str, pinned_param: str) -> list[dict]:
+    # Build the full fan-out of (param, url) pairs up front so the parallel
+    # fire can hit them all in one pool. Open-redirect test is simple: one
+    # payload per param, so the batch size is just len(params).
+    specs: list[dict] = []
     for p in _param_list(pinned_param, _REDIRECT_PARAMS):
         url = f"{base_url}{'&' if '?' in base_url else '?'}{urlencode({p: _CANARY_URL})}"
-        r = sess.get(url, cls="open_redirect", allow_redirects=False)
-        if r is None:
-            continue
+        specs.append({"url": url, "allow_redirects": False,
+                      "meta": {"param": p}})
+
+    def classify(spec, r):
+        p = spec["meta"]["param"]
         loc = r.headers.get("Location", "")
         if 300 <= r.status_code < 400 and _CANARY_HOST in loc:
-            out.append({"type": "open_redirect", "severity": "medium",
-                        "url": url, "param": p, "evidence": f"Location: {loc[:200]}",
-                        "confirmed": True})
-            return out
+            return {"type": "open_redirect", "severity": "medium",
+                    "url": spec["url"], "param": p,
+                    "evidence": f"Location: {loc[:200]}",
+                    "confirmed": True}
         if r.text and f'url={_CANARY_URL}'.lower() in r.text.lower():
-            out.append({"type": "open_redirect", "severity": "medium",
-                        "url": url, "param": p,
-                        "evidence": "meta-refresh to canary host",
-                        "confirmed": True})
-            return out
-    return out
+            return {"type": "open_redirect", "severity": "medium",
+                    "url": spec["url"], "param": p,
+                    "evidence": "meta-refresh to canary host",
+                    "confirmed": True}
+        return None
+
+    return _parallel_fire(sess, "open_redirect", specs, classify)
 
 
 _PASSWD_SIGS = [
@@ -422,38 +551,47 @@ def _probe_path_traversal(sess: _Session, base_url: str, pinned_param: str) -> l
                 "/etc/passwd",
                 "file:///etc/passwd",
                 "C:\\windows\\win.ini")
-    out: list[dict] = []
+    specs: list[dict] = []
     for p in _param_list(pinned_param, _FILE_PARAMS):
         for payload in payloads:
             url = f"{base_url}{'&' if '?' in base_url else '?'}{urlencode({p: payload})}"
-            r = sess.get(url, cls="path_traversal", allow_redirects=True)
-            if r is None or not r.text:
-                continue
-            for rx, label in _PASSWD_SIGS:
-                if rx.search(r.text):
-                    out.append({"type": "path_traversal", "severity": "high",
-                                "url": url, "param": p,
-                                "evidence": label,
-                                "confirmed": True})
-                    return out
-            if any(s in r.text for s in _WININI_SIGS):
-                out.append({"type": "path_traversal", "severity": "high",
-                            "url": url, "param": p,
-                            "evidence": "windows win.ini signature",
-                            "confirmed": True})
-                return out
-            # Binary file response (ELF/PK/PE/PDF) when the probe asked for a well-known
-            # unix/windows file: strong signal the server opened an arbitrary file and
-            # returned it, even without a textual signature.
+            specs.append({"url": url, "allow_redirects": True,
+                          "meta": {"param": p, "payload": payload}})
+
+    def classify(spec, r):
+        if not r.text:
+            # ELF/PE magic in binary content — fall through to the body
+            # check even when text is empty.
             head = r.content[:8] if r.content else b""
             if head.startswith((b"\x7fELF", b"MZ")) and (
-                    "passwd" in payload or "win.ini" in payload):
-                out.append({"type": "path_traversal", "severity": "high",
-                            "url": url, "param": p,
-                            "evidence": f"binary file served for {payload} (magic {head[:4]!r})",
-                            "confirmed": True})
-                return out
-    return out
+                    "passwd" in spec["meta"]["payload"]
+                    or "win.ini" in spec["meta"]["payload"]):
+                return {"type": "path_traversal", "severity": "high",
+                        "url": spec["url"], "param": spec["meta"]["param"],
+                        "evidence": f"binary file served for {spec['meta']['payload']} (magic {head[:4]!r})",
+                        "confirmed": True}
+            return None
+        for rx, label in _PASSWD_SIGS:
+            if rx.search(r.text):
+                return {"type": "path_traversal", "severity": "high",
+                        "url": spec["url"], "param": spec["meta"]["param"],
+                        "evidence": label, "confirmed": True}
+        if any(s in r.text for s in _WININI_SIGS):
+            return {"type": "path_traversal", "severity": "high",
+                    "url": spec["url"], "param": spec["meta"]["param"],
+                    "evidence": "windows win.ini signature",
+                    "confirmed": True}
+        head = r.content[:8] if r.content else b""
+        if head.startswith((b"\x7fELF", b"MZ")) and (
+                "passwd" in spec["meta"]["payload"]
+                or "win.ini" in spec["meta"]["payload"]):
+            return {"type": "path_traversal", "severity": "high",
+                    "url": spec["url"], "param": spec["meta"]["param"],
+                    "evidence": f"binary file served for {spec['meta']['payload']} (magic {head[:4]!r})",
+                    "confirmed": True}
+        return None
+
+    return _parallel_fire(sess, "path_traversal", specs, classify)
 
 
 def _probe_ssrf_localhost(sess: _Session, base_url: str, pinned_param: str) -> list[dict]:
@@ -493,42 +631,54 @@ def _probe_ssrf_localhost(sess: _Session, base_url: str, pinned_param: str) -> l
         r"\bSecretAccessKey\b|\bAKIA[0-9A-Z]{16}\b|\bASIA[0-9A-Z]{16}\b|"
         r"\baccess_key\b|computeMetadata|\bIMDS\b|Metadata-Flavor",
         re.IGNORECASE)
-    out: list[dict] = []
+    # Blind-SSRF OAST canaries fire FIRST (one per param). These are
+    # fire-and-forget: the callback lands on interactsh later, so the
+    # response here doesn't matter and we don't need to parallelize them
+    # — the batch is small (1 per param). We keep them SERIAL on purpose
+    # so each param's canary has a unique label the normalizer can tie
+    # back to the right param after the callback arrives.
     for p in _param_list(pinned_param, _SSRF_PARAMS):
-        # Blind SSRF via OAST — fire first per param so the callback fires even if the
-        # in-band probes return empty bodies.
         oast = _oast_canary(f"ssrf-{p}")
         if oast:
             url = f"{base_url}{'&' if '?' in base_url else '?'}{urlencode({p: oast})}"
             sess.get(url, cls="ssrf_blind_oast", allow_redirects=False)
+
+    # In-band probes — fan out all (param × probe URL) pairs in parallel.
+    specs: list[dict] = []
+    for p in _param_list(pinned_param, _SSRF_PARAMS):
         for probe in probes:
             url = f"{base_url}{'&' if '?' in base_url else '?'}{urlencode({p: probe})}"
-            r = sess.get(url, cls="ssrf_localhost", allow_redirects=True)
-            if r is None or not r.text:
-                continue
-            m = sig_re.search(r.text)
-            if m:
-                # Promote severity to critical when ANYWHERE in the response body
-                # contains credential material — not just the first-matched token.
-                # DineHub's mock metadata leads with "ami-id" (a banner-like marker)
-                # but the AKIA key and iam-credentials sit later in the same body;
-                # a cred_hit scan over the full body avoids misranking a critical
-                # credential leak as merely high.
-                body_lo = r.text.lower()
-                cred_hit = any(k in body_lo for k in
-                               ("akia", "asia", "iam-credentials", "accesskeyid",
-                                "secretaccesskey", "access_key"))
-                hit = m.group(0)
-                sev = "critical" if cred_hit else "high"
-                evidence = (f"metadata/credentials exfiltrated via SSRF ({probe}) "
-                            f"— response matched {hit[:30]!r} + credential-shaped "
-                            f"tokens in body") if cred_hit else \
-                           f"local service banner reflected ({probe})"
-                out.append({"type": "ssrf_localhost", "severity": sev,
-                            "url": url, "param": p,
-                            "evidence": evidence, "confirmed": True})
-                return out
-    return out
+            specs.append({"url": url, "allow_redirects": True,
+                          "meta": {"param": p, "probe": probe}})
+
+    def classify(spec, r):
+        if not r.text:
+            return None
+        m = sig_re.search(r.text)
+        if not m:
+            return None
+        # Promote severity to critical when ANYWHERE in the response body
+        # contains credential material — not just the first-matched token.
+        # DineHub's mock metadata leads with "ami-id" (a banner-like marker)
+        # but the AKIA key and iam-credentials sit later in the same body;
+        # a cred_hit scan over the full body avoids misranking a critical
+        # credential leak as merely high.
+        body_lo = r.text.lower()
+        cred_hit = any(k in body_lo for k in
+                       ("akia", "asia", "iam-credentials", "accesskeyid",
+                        "secretaccesskey", "access_key"))
+        hit = m.group(0)
+        sev = "critical" if cred_hit else "high"
+        probe = spec["meta"]["probe"]
+        evidence = (f"metadata/credentials exfiltrated via SSRF ({probe}) "
+                    f"— response matched {hit[:30]!r} + credential-shaped "
+                    f"tokens in body") if cred_hit else \
+                   f"local service banner reflected ({probe})"
+        return {"type": "ssrf_localhost", "severity": sev,
+                "url": spec["url"], "param": spec["meta"]["param"],
+                "evidence": evidence, "confirmed": True}
+
+    return _parallel_fire(sess, "ssrf_localhost", specs, classify)
 
 
 def _probe_sensitive_content(sess: _Session, base: str, target_host: str) -> list[dict]:
@@ -546,23 +696,30 @@ def _probe_sensitive_content(sess: _Session, base: str, target_host: str) -> lis
     for p in _SENS_PATHS:
         full = urljoin(base, p)
         _targets.append((full, p))
+    # Dedup target list up front, scope-check each, then fire in parallel.
     _seen: set[str] = set()
+    specs: list[dict] = []
     for full, p in _targets:
         if full in _seen or not _in_scope(target_host, full):
             continue
         _seen.add(full)
-        r = sess.get(full, cls="sensitive_content", allow_redirects=True)
-        if r is None or r.status_code >= 400 or not r.text:
-            continue
+        specs.append({"url": full, "allow_redirects": True,
+                      "meta": {"path": p}})
+
+    def classify(spec, r):
+        if r.status_code >= 400 or not r.text:
+            return None
         for rx, label in _SENS_PATTERNS:
             m = rx.search(r.text)
             if m:
-                out.append({"type": "sensitive_content", "severity": "high",
-                            "url": full, "param": "",
-                            "evidence": f"{label} at {p} ({m.group(0)[:60]}…)",
-                            "confirmed": True})
-                break
-    return out
+                return {"type": "sensitive_content", "severity": "high",
+                        "url": spec["url"], "param": "",
+                        "evidence": f"{label} at {spec['meta']['path']} "
+                                    f"({m.group(0)[:60]}…)",
+                        "confirmed": True}
+        return None
+
+    return _parallel_fire(sess, "sensitive_content", specs, classify)
 
 
 _CMD_PARAMS = ("cmd", "command", "exec", "query", "run", "ping", "host", "ip",
@@ -990,44 +1147,67 @@ def main() -> int:
     findings: list[dict] = []
     method = args.method
     content_type = args.data_content_type
+    # Per-class timing capture (Speedup Fix 1 observability). Lets an
+    # operator reading the ledger see WHICH class was the slow one so
+    # the next tuning iteration knows where to spend thread budget. One
+    # entry per class actually run, elapsed_ms + findings_emitted.
+    timings: list[dict] = []
+
+    def _run(cls_name: str, fn, *fn_args):
+        t0 = time.time()
+        try:
+            res = fn(*fn_args)
+        except Exception as e:
+            timings.append({"class": cls_name, "elapsed_ms": int((time.time() - t0) * 1000),
+                             "error": f"{type(e).__name__}: {str(e)[:100]}",
+                             "findings": 0})
+            return []
+        timings.append({"class": cls_name, "elapsed_ms": int((time.time() - t0) * 1000),
+                         "findings": len(res) if res else 0})
+        return res or []
+
     try:
         if "open_redirect" in classes:
-            findings += _probe_open_redirect(sess, base_url, args.param)
+            findings += _run("open_redirect", _probe_open_redirect, sess, base_url, args.param)
         if "path_traversal" in classes:
-            findings += _probe_path_traversal(sess, base_url, args.param)
+            findings += _run("path_traversal", _probe_path_traversal, sess, base_url, args.param)
         if "ssrf_localhost" in classes:
-            findings += _probe_ssrf_localhost(sess, base_url, args.param)
+            findings += _run("ssrf_localhost", _probe_ssrf_localhost, sess, base_url, args.param)
         if "sensitive_content" in classes:
-            findings += _probe_sensitive_content(sess, base_url, args.target)
+            findings += _run("sensitive_content", _probe_sensitive_content, sess, base_url, args.target)
         if "xxe" in classes:
-            findings += _probe_xxe(sess, base_url)
+            findings += _run("xxe", _probe_xxe, sess, base_url)
         if "cmd_injection" in classes:
-            findings += _probe_cmd_injection(sess, base_url, args.param)
+            findings += _run("cmd_injection", _probe_cmd_injection, sess, base_url, args.param)
         if "crlf" in classes:
-            findings += _probe_crlf(sess, base_url, args.param)
+            findings += _run("crlf", _probe_crlf, sess, base_url, args.param)
         if "ssti" in classes:
-            findings += _probe_ssti(sess, base_url, args.param, method, content_type)
+            findings += _run("ssti", _probe_ssti, sess, base_url, args.param, method, content_type)
         # "sqli" expands to both boolean + time variants; the operator can pin one.
         if "sqli" in classes or "sqli_boolean" in classes:
-            findings += _probe_sqli_boolean(sess, base_url, args.param,
-                                             method, content_type)
+            findings += _run("sqli_boolean", _probe_sqli_boolean, sess, base_url, args.param,
+                              method, content_type)
         if "sqli" in classes or "sqli_time" in classes:
-            findings += _probe_sqli_time(sess, base_url, args.param,
-                                          method, content_type)
+            findings += _run("sqli_time", _probe_sqli_time, sess, base_url, args.param,
+                              method, content_type)
         # "xss" is the reflected variant (DOM-XSS lives in dalfox).
         if "xss" in classes or "xss_reflected" in classes:
-            findings += _probe_xss_reflected(sess, base_url, args.param,
-                                              method, content_type)
+            findings += _run("xss_reflected", _probe_xss_reflected, sess, base_url, args.param,
+                              method, content_type)
     except Exception as e:
         print(json.dumps({"error": f"probe failed: {e}",
                           "findings": findings, "trace": sess.trace,
-                          "cookie_src": cookie_src}))
+                          "cookie_src": cookie_src,
+                          "timings": timings,
+                          "concurrency": _WORKER_COUNT}))
         return 0
 
     _budget_cap = 320  # keep in sync with _Session.__init__
     record = {"findings": findings, "trace": sess.trace,
               "cookie_src": cookie_src,
-              "budget_used": _budget_cap - sess.budget}
+              "budget_used": _budget_cap - sess.budget,
+              "timings": timings,
+              "concurrency": _WORKER_COUNT}
     if args.debug:
         print(f"[vapt-web-probe] cookie={cookie_src} "
               f"budget_used={_budget_cap - sess.budget} "

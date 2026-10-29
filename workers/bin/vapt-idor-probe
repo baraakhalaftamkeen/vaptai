@@ -31,11 +31,22 @@ Public per-resource pages (/restaurant/*/menu, /products/*, …) are skipped:
 every user is supposed to see them, so they are never IDOR candidates.
 
 Emits ONE JSON record to stdout:
-    {"findings": [{"type": "idor", "severity": "high", "url", "param",
-                   "evidence", "confirmed": true}, ...],
+    {"findings": [{"type": "idor"|"idor_delete", "severity": "high"|"critical",
+                   "url", "param", "method"?, "evidence", "confirmed": true}, ...],
      "trace":    [{"url", "status", "note"}, ...]}
 
-Safety: GET only, bounded request budget, in-scope-only URLs, argv-only.
+Safety: GET-only in read mode, bounded request budget, in-scope-only URLs,
+argv-only. Delete mode uses POST/DELETE but ONLY against destructive-action
+endpoints (order/delete, order/cancel, …) — never against object-view URLs.
+
+Delete mode (--mode delete)
+---------------------------
+Targets destructive endpoints: /order/delete, /order/cancel, etc. For each
+such endpoint, sends a POST (or DELETE) request as a NON-owner with the
+owner's object ID in the body (or query). If the response indicates success
+(200/302, no denial markers) while an anonymous request is denied, that
+confirms a cross-tenant destructive IDOR. This catches the pattern where
+GET-based IDOR is patched but POST delete/cancel actions lack authz.
 """
 from __future__ import annotations
 
@@ -53,7 +64,7 @@ except Exception as e:
     print(json.dumps({"error": f"requests not available: {e}", "findings": []}))
     sys.exit(0)
 
-_UA = "vapt-idor-probe/3.0 (authorized assessment)"
+_UA = "vapt-idor-probe/3.1 (authorized assessment)"
 _TIMEOUT = 10
 _BUDGET = 160
 _MIN_BODY = 400          # a real object page is substantial; below this is a stub/denied
@@ -398,6 +409,9 @@ def main() -> int:
     ap.add_argument("--target", required=True)
     ap.add_argument("--urls", default="",
                     help="comma-separated in-scope seed URLs (object + listing hints)")
+    ap.add_argument("--mode", choices=("read", "delete"), default="read",
+                    help="read = GET-based view IDOR (default); "
+                         "delete = POST/DELETE destructive IDOR")
     args = ap.parse_args()
     target = args.target
     run_id = os.environ.get("VAPT_RUN_ID", "").strip()
@@ -421,23 +435,28 @@ def main() -> int:
             break
 
     budget_box = [_BUDGET]
-    trace: list[dict] = [{"accounts": ",".join(l for l, _ in users), "note": "sessions"}]
+    trace: list[dict] = [{"accounts": ",".join(l for l, _ in users),
+                          "mode": args.mode, "note": "sessions"}]
 
-    # 1) Harvest each user's own object URLs from their listing pages (establishes ownership).
-    owned = _harvest(users, bases, target, budget_box, trace)
-    # 2) Also treat any seeded URL that already points at a specific object as a
-    #    candidate — but we only know its owner if harvesting attributed it.
-    for u in seed_urls:
-        if _looks_like_object_url(u):
-            owned.setdefault(u, _harvest_owner(users, u, budget_box, trace))
+    if args.mode == "delete":
+        findings = _delete_probe(users, bases, target, seed_urls,
+                                 budget_box, trace)
+    else:
+        # 1) Harvest each user's own object URLs from their listing pages (establishes ownership).
+        owned = _harvest(users, bases, target, budget_box, trace)
+        # 2) Also treat any seeded URL that already points at a specific object as a
+        #    candidate — but we only know its owner if harvesting attributed it.
+        for u in seed_urls:
+            if _looks_like_object_url(u):
+                owned.setdefault(u, _harvest_owner(users, u, budget_box, trace))
 
-    owned = {u: o for u, o in owned.items() if o}  # keep only owner-attributed URLs
+        owned = {u: o for u, o in owned.items() if o}  # keep only owner-attributed URLs
 
-    findings = _cross_access(users, owned, budget_box, trace)
+        findings = _cross_access(users, owned, budget_box, trace)
 
-    # 3) Secondary: numeric enumeration on seeded numeric URLs (non-public).
-    enum_seeds = [u for u in seed_urls if not _is_public_data(u) and _numeric_targets(u)]
-    findings += _enumerate(users, enum_seeds, budget_box, trace)
+        # 3) Secondary: numeric enumeration on seeded numeric URLs (non-public).
+        enum_seeds = [u for u in seed_urls if not _is_public_data(u) and _numeric_targets(u)]
+        findings += _enumerate(users, enum_seeds, budget_box, trace)
 
     # De-dup findings by (type, url).
     seen = set()
@@ -452,6 +471,152 @@ def main() -> int:
 
     print(json.dumps({"findings": uniq, "trace": trace[:60]}))
     return 0
+
+
+_DESTRUCTIVE_PATH_RE = re.compile(
+    r"/(?:order|orders|invoice|invoices|receipt|receipts|booking|bookings|"
+    r"ticket|tickets|reservation|reservations|payment|payments|transaction|"
+    r"transactions|document|documents|report|reports|message|messages|"
+    r"item|items|comment|comments|post|posts|account|accounts|"
+    r"user|users|profile)"
+    r"/(?:delete|cancel|remove|revoke|archive|close)"
+    r"(?:/|$|\?)",
+    re.IGNORECASE,
+)
+
+_DESTRUCTIVE_LISTING_PATHS = (
+    "/order/delete", "/orders/delete", "/order/cancel", "/orders/cancel",
+    "/user/delete", "/users/delete", "/account/delete", "/accounts/delete",
+    "/profile/delete", "/item/delete", "/post/delete", "/comment/delete",
+    "/booking/cancel", "/ticket/cancel", "/reservation/cancel",
+    "/invoice/cancel", "/receipt/delete", "/message/delete",
+)
+
+_SUCCESS_RE = re.compile(
+    r"success|deleted|cancelled|canceled|removed|archived|"
+    r"has been (deleted|cancelled|canceled|removed)",
+    re.IGNORECASE,
+)
+
+
+def _post_or_delete(sess, url, body, method, budget_box):
+    if budget_box[0] <= 0:
+        return None
+    budget_box[0] -= 1
+    try:
+        if method == "DELETE":
+            return sess.delete(url, data=body, timeout=_TIMEOUT,
+                               allow_redirects=False)
+        return sess.post(url, data=body, timeout=_TIMEOUT,
+                         allow_redirects=False)
+    except Exception:
+        return None
+
+
+def _destructive_success(resp) -> bool:
+    if resp is None:
+        return False
+    if resp.status_code in (200, 302):
+        if _DENIED_RE.search(resp.text or ""):
+            return False
+        if _LOGIN_FORM_RE.search(resp.text or ""):
+            return False
+        return True
+    return False
+
+
+def _delete_probe(users, bases, target, seed_urls, budget_box, trace):
+    """Cross-tenant destructive IDOR: can user B delete/cancel user A's object?"""
+    findings: list[dict] = []
+    if len(users) < 2:
+        return findings
+
+    owned = _harvest(users, bases, target, budget_box, trace)
+    for u in seed_urls:
+        if _looks_like_object_url(u):
+            owned.setdefault(u, _harvest_owner(users, u, budget_box, trace))
+    owned = {u: o for u, o in owned.items() if o}
+    if not owned:
+        trace.append({"note": "delete mode: no owned objects to test"})
+        return findings
+
+    anon = _session("")
+
+    for obj_url, owner in owned.items():
+        if budget_box[0] <= 0:
+            break
+        parsed = urlparse(obj_url)
+        obj_id = None
+        obj_param = None
+        for name, value in parse_qsl(parsed.query, keep_blank_values=True):
+            if name.lower() in _ID_PARAM_NAMES and value:
+                obj_id = value
+                obj_param = name
+                break
+        if not obj_id:
+            segments = [s for s in (parsed.path or "").split("/") if s]
+            if segments and _TOKEN_RE.fullmatch(segments[-1]):
+                obj_id = segments[-1]
+                obj_param = "id"
+        if not obj_id:
+            continue
+
+        for base in bases:
+            if budget_box[0] <= 0:
+                break
+            for dpath in _DESTRUCTIVE_LISTING_PATHS:
+                if budget_box[0] <= 0:
+                    break
+                action_url = base.rstrip("/") + dpath
+                if not _in_scope(target, action_url):
+                    continue
+                body = {obj_param or "id": obj_id}
+
+                for method in ("POST", "DELETE"):
+                    if budget_box[0] <= 0:
+                        break
+                    anon_resp = _post_or_delete(anon, action_url, body,
+                                                method, budget_box)
+                    if _destructive_success(anon_resp):
+                        trace.append({"url": action_url, "method": method,
+                                      "note": "anon succeeded — no auth at all"})
+                        continue
+
+                    for ylabel, ycookie in users:
+                        if ylabel == owner:
+                            continue
+                        if budget_box[0] <= 0:
+                            break
+                        yr = _post_or_delete(_session(ycookie), action_url,
+                                             body, method, budget_box)
+                        if _destructive_success(yr):
+                            evidence = (
+                                f"non-owner '{ylabel}' sent {method} to "
+                                f"{action_url} with {obj_param or 'id'}="
+                                f"{obj_id} (owned by '{owner}') — got "
+                                f"HTTP {yr.status_code} indicating success; "
+                                f"cross-tenant destructive IDOR"
+                            )
+                            findings.append({
+                                "type": "idor_delete",
+                                "severity": "critical",
+                                "url": action_url,
+                                "param": obj_param or "id",
+                                "method": method,
+                                "evidence": evidence,
+                                "confirmed": True,
+                            })
+                            trace.append({
+                                "url": action_url, "method": method,
+                                "status": yr.status_code,
+                                "note": f"{ylabel} destructive IDOR confirmed"})
+                            break
+                        else:
+                            trace.append({
+                                "url": action_url, "method": method,
+                                "status": getattr(yr, "status_code", None),
+                                "note": f"{ylabel} denied (good)"})
+    return findings
 
 
 def _harvest_owner(users, url, budget_box, trace):

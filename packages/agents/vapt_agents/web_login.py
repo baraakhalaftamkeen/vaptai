@@ -91,13 +91,19 @@ def obtain_session_cookie(login_url: str, username: str, password: str,
     try:
         sess = requests.Session()
         # GET first so we pick up any CSRF/anti-forgery cookie the server sets.
+        # Use the FINAL url after redirects (e.g. HTTP→HTTPS 301) so the POST
+        # goes directly to the right scheme and nginx doesn't 301-downgrade it
+        # from POST to GET (RFC 7231: user agents MAY change POST→GET on 301).
+        effective_login_url = login_url
         try:
             r = sess.get(login_url, timeout=timeout_s, allow_redirects=True)
             html = r.text if r.ok else ""
+            if r.url:
+                effective_login_url = r.url
         except Exception:
             html = ""
         user_field, pass_field = _detect_form_fields(html)
-        action = _detect_form_action(html, login_url)
+        action = _detect_form_action(html, effective_login_url)
         # Pull any hidden fields (CSRF token etc.) so the POST matches what the browser would send.
         hidden = {}
         for m in _INPUT_RE.finditer(html):
@@ -111,7 +117,7 @@ def obtain_session_cookie(login_url: str, username: str, password: str,
                 hidden[name] = vm.group(1) if vm else ""
 
         data = {user_field: username, pass_field: password, **hidden}
-        host_before = urlparse(login_url).hostname
+        host_before = urlparse(effective_login_url).hostname
         resp = sess.post(action, data=data, timeout=timeout_s, allow_redirects=True)
         # Stay in-scope: the login must not redirect us off-host (a safety guard, not auth proof).
         if urlparse(resp.url).hostname != host_before:

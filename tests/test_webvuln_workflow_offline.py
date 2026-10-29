@@ -570,3 +570,277 @@ def test_end_to_end_dinehub_signals(db):
     wp_obs = normalize("web_param_probe",
                        [{"stdout": FIXTURES["web_param_probe_ssrf_confirmed"]}])
     assert wp_obs and wp_obs[0].detail["class"] == "ssrf_localhost"
+
+
+# ---------------------------------------------------------------------------
+# 12. Recon-agent URL recovery (schema-confusion auto-correct)
+# ---------------------------------------------------------------------------
+# These test the module-level `recon_agent_recover_url` helper that fixes
+# the Qwen3.6 failure mode where the model emits
+#     {"action":"propose","tool_id":"ssti_detect","param":"url",
+#      "rationale":"Confirm SSTI on http://host:5000/admin/offer"}
+# with the actual URL embedded in rationale but NO top-level url field.
+# Prior behaviour was to reject 12× in a row → turns_cap_hit → 0 proposals.
+# The fix recovers the URL and dispatches the proposal with param cleared
+# so it doesn't carry forward as a bogus form-field name.
+def test_recon_agent_recover_url_from_rationale():
+    from vapt_orch.graph.engagement import recon_agent_recover_url
+    step = {
+        "action": "propose",
+        "tool_id": "ssti_detect",
+        "param": "url",
+        "rationale": "Confirm SSTI on http://172.25.188.23:5000/admin/offer.",
+    }
+    url, src, param = recon_agent_recover_url(step, "172.25.188.23")
+    # Trailing sentence period must be stripped.
+    assert url == "http://172.25.188.23:5000/admin/offer"
+    assert src == "rationale"
+    # param="url" is the schema-confusion artifact — must be dropped.
+    assert param == ""
+
+
+def test_recon_agent_strips_trailing_punctuation():
+    """URLs extracted from prose sentences must drop trailing .,;:!? chars so
+    they parse correctly downstream."""
+    from vapt_orch.graph.engagement import _url_in_text
+    assert _url_in_text("hit http://host/x.") == "http://host/x"
+    assert _url_in_text("hit http://host/x,") == "http://host/x"
+    assert _url_in_text("hit http://host/x; next") == "http://host/x"
+    assert _url_in_text("hit http://host/x!") == "http://host/x"
+    assert _url_in_text("hit http://host/x?q=1!") == "http://host/x?q=1"
+    # URL that legitimately has a dot in path (not trailing) must keep it.
+    assert _url_in_text("hit http://host/a.b/c and then") == "http://host/a.b/c"
+
+
+def test_recon_agent_recover_url_from_param_literal_url():
+    """Model wrote the URL into the `param` field by mistake."""
+    from vapt_orch.graph.engagement import recon_agent_recover_url
+    step = {
+        "action": "propose",
+        "tool_id": "csp_check",
+        "param": "http://172.25.188.23:5000/admin/announcement",
+        "rationale": "Check CSP posture.",
+    }
+    url, src, param = recon_agent_recover_url(step, "172.25.188.23")
+    assert url == "http://172.25.188.23:5000/admin/announcement"
+    assert src == "param"
+    # param was the URL itself — must be dropped so it doesn't carry forward.
+    assert param == ""
+
+
+def test_recon_agent_recover_url_from_data():
+    """URL in neither rationale nor param, but present in data."""
+    from vapt_orch.graph.engagement import recon_agent_recover_url
+    step = {
+        "action": "propose",
+        "tool_id": "web_param_probe",
+        "param": "url",
+        "data": "target=http://172.25.188.23:5000/fetch/logo",
+    }
+    url, src, param = recon_agent_recover_url(step, "172.25.188.23")
+    assert url == "http://172.25.188.23:5000/fetch/logo"
+    assert src == "data"
+    assert param == ""
+
+
+def test_recon_agent_recover_rejects_off_scope_url():
+    """URL present but off-scope → no recovery (caller falls through to reject)."""
+    from vapt_orch.graph.engagement import recon_agent_recover_url
+    step = {
+        "action": "propose",
+        "tool_id": "ssti_detect",
+        "rationale": "Try SSTI on http://evil.com/x.",
+    }
+    url, src, param = recon_agent_recover_url(step, "172.25.188.23")
+    assert url == ""
+    assert src == ""
+
+
+def test_recon_agent_recover_nothing_to_recover():
+    """No URL anywhere → no recovery."""
+    from vapt_orch.graph.engagement import recon_agent_recover_url
+    step = {
+        "action": "propose",
+        "tool_id": "ssti_detect",
+        "param": "url",
+        "rationale": "I think there's an injection somewhere.",
+    }
+    url, src, param = recon_agent_recover_url(step, "172.25.188.23")
+    assert url == ""
+    assert src == ""
+    assert param == "url"  # unchanged — caller still rejects
+
+
+def test_recon_agent_preserves_real_field_name_param():
+    """When the model actually did populate url correctly AND param is a real
+    field name (not the string 'url'), the helper doesn't need to run — but if
+    it does, the real param name must survive. SSRF endpoints have a real
+    field named `url` (e.g. /fetch/logo?url=...) — handle that case too."""
+    from vapt_orch.graph.engagement import recon_agent_recover_url
+    # Rationale URL + real param name (not "url"). Param must survive.
+    step = {
+        "action": "propose",
+        "tool_id": "sqli_detect",
+        "param": "username",
+        "rationale": "Try SQLi on http://172.25.188.23:5000/auth/login.",
+    }
+    url, src, param = recon_agent_recover_url(step, "172.25.188.23")
+    assert url.startswith("http://172.25.188.23:5000/auth/login")
+    assert src == "rationale"
+    # "username" is a real form field, not the string "url" — must survive.
+    assert param == "username"
+
+
+def test_recon_agent_recover_url_module_helper_strips_url_literal():
+    """The common schema-confusion case: model emits `param:"url"` while meaning
+    'this probe tests the url parameter'. The helper strips it since we can't
+    tell if 'url' is a real form field name (some SSRF endpoints have one), so
+    we take the safer path of dropping it when we're already auto-correcting
+    a missing-url scenario."""
+    from vapt_orch.graph.engagement import recon_agent_recover_url
+    step = {
+        "action": "propose",
+        "tool_id": "ssti_detect",
+        "param": "URL",  # case-insensitive strip
+        "rationale": "SSTI on http://172.25.188.23:5000/admin/offer.",
+    }
+    url, src, param = recon_agent_recover_url(step, "172.25.188.23")
+    assert url
+    assert param == ""
+
+
+def test_recon_agent_recover_path_only_rationale_with_base_hints():
+    """Live-observed Qwen/gpt-oss failure mode: rationale names a PATH
+    (not a full URL) + a real param name. Must synthesize URL by combining
+    with a form_map base_hint. Live smoke test on 2026-10-28 confirmed
+    gpt-oss-20b emits exactly this shape:
+      {"action":"propose","tool_id":"ssti_detect","param":"content",
+       "rationale":"Confirm Jinja2 SSTI on content textarea of /admin/announcement."}
+    """
+    from vapt_orch.graph.engagement import recon_agent_recover_url
+    step = {
+        "action": "propose",
+        "tool_id": "ssti_detect",
+        "param": "content",
+        "rationale": "Confirm Jinja2 SSTI on content textarea of /admin/announcement.",
+    }
+    base_hints = [
+        "http://172.25.188.23:5000/admin/announcement",
+        "http://172.25.188.23:5000/admin/offer",
+    ]
+    url, src, param = recon_agent_recover_url(step, "172.25.188.23", base_hints)
+    assert url == "http://172.25.188.23:5000/admin/announcement", f"got {url}"
+    assert src == "path"
+    # Real param name must survive — this is a legit field name, not "url".
+    assert param == "content"
+
+
+def test_recon_agent_path_recovery_without_base_hints_rejects():
+    """Without base_hints, a path-only rationale cannot be resolved to a URL
+    and we must fall through to the reject path."""
+    from vapt_orch.graph.engagement import recon_agent_recover_url
+    step = {
+        "action": "propose",
+        "tool_id": "ssti_detect",
+        "param": "content",
+        "rationale": "SSTI on /admin/announcement.",
+    }
+    url, src, _ = recon_agent_recover_url(step, "172.25.188.23")  # no base_hints
+    assert url == ""
+    assert src == ""
+
+
+def test_recon_agent_path_recovery_prefers_prefix_match():
+    """Multiple base_hints — must pick the one whose path prefix matches the
+    rationale's recovered path."""
+    from vapt_orch.graph.engagement import recon_agent_recover_url
+    step = {
+        "action": "propose",
+        "tool_id": "sqli_detect",
+        "param": "password",
+        "rationale": "SQLi on /auth/login password field.",
+    }
+    base_hints = [
+        "http://172.25.188.23:5000/admin/announcement",
+        "http://172.25.188.23:5000/auth/login",
+        "http://172.25.188.23:5000/admin/offer",
+    ]
+    url, src, param = recon_agent_recover_url(step, "172.25.188.23", base_hints)
+    assert url == "http://172.25.188.23:5000/auth/login", f"got {url}"
+    assert src == "path"
+    assert param == "password"
+
+
+def test_recon_agent_path_in_text_helper():
+    """The _path_in_text helper extracts paths from prose correctly."""
+    from vapt_orch.graph.engagement import _path_in_text
+    assert _path_in_text("SSTI on /admin/announcement.") == "/admin/announcement"
+    assert _path_in_text("hit /api/v1/users next") == "/api/v1/users"
+    assert _path_in_text("look at /admin/x?id=1 for IDOR") == "/admin/x?id=1"
+    # No path = empty
+    assert _path_in_text("just some prose") == ""
+    # Bare slash = empty (not useful)
+    assert _path_in_text("the / character") == ""
+
+
+def test_recon_agent_full_url_takes_priority_over_path():
+    """If both a full URL AND a path appear, full URL wins (don't synth)."""
+    from vapt_orch.graph.engagement import recon_agent_recover_url
+    step = {
+        "action": "propose",
+        "tool_id": "ssti_detect",
+        "rationale": ("Try SSTI on http://172.25.188.23:5000/admin/offer "
+                      "which is similar to /admin/announcement."),
+    }
+    base_hints = ["http://172.25.188.23:5000/admin/announcement"]
+    url, src, _ = recon_agent_recover_url(step, "172.25.188.23", base_hints)
+    # Full URL wins, synthesized path is not used.
+    assert url == "http://172.25.188.23:5000/admin/offer"
+    assert src == "rationale"
+
+
+# ---------------------------------------------------------------------------
+# 13. Weak-cred register-form skip (false-positive prevention)
+# ---------------------------------------------------------------------------
+# The orchestrator's weak_cred dispatcher must SKIP signup/registration
+# forms. Submitting admin/admin to /register creates a new user named
+# "admin" and the server 302s + sets a session cookie → classified as
+# login-success. DineHub 2026-10-28 run surfaced two critical false
+# positives this way (at /register and at /phpliteadmin.php which was
+# a valid hit but the register one wasn't). This test validates the
+# path-based skip logic.
+def test_weak_cred_signup_skip_path_patterns():
+    """The signup-URL skip patterns must match the common registration
+    paths (and the common variants) while leaving login paths alone."""
+    from urllib.parse import urlparse
+    _SIGNUP_HINTS = (
+        "/register", "/signup", "/sign-up", "/sign_up",
+        "/create-account", "/create_account", "/join",
+        "/registration", "/new-user", "/new_user",
+    )
+
+    def _should_skip(url: str) -> bool:
+        path = (urlparse(url).path or "").lower()
+        return any(h in path for h in _SIGNUP_HINTS)
+
+    # Must skip (signup/registration):
+    assert _should_skip("http://host/register")
+    assert _should_skip("http://host:5000/register")
+    assert _should_skip("http://host/signup")
+    assert _should_skip("http://host/auth/register")
+    assert _should_skip("http://host/account/sign-up")
+    assert _should_skip("http://host/join")
+    assert _should_skip("http://host/user/registration")
+    assert _should_skip("http://host/users/new-user")
+    # Case-insensitive
+    assert _should_skip("http://host/REGISTER")
+    assert _should_skip("http://host/Sign-Up")
+
+    # Must NOT skip (login/auth paths):
+    assert not _should_skip("http://host/login")
+    assert not _should_skip("http://host/auth/login")
+    assert not _should_skip("http://host/signin")  # signin is login, not signup
+    assert not _should_skip("http://host/sign-in")
+    assert not _should_skip("http://host/admin")
+    assert not _should_skip("http://host/phpliteadmin.php")
+    assert not _should_skip("http://host/wp-login.php")

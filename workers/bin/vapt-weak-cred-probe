@@ -1,0 +1,331 @@
+#!/usr/bin/env python3
+"""Deterministic weak-credential probe for a known HTTP login form.
+
+Submits a bounded set of common default credentials against a POST login
+endpoint and classifies the response as login-success vs login-failure
+using multiple signals (status redirect, session cookie emission, body-size
+diff, and absence/presence of a known login/error marker). Catches the
+classic default-admin bugs that break application security the moment the
+app ships (phpLiteAdmin `admin/admin`, Tomcat `tomcat/tomcat`, generic
+`admin/password`).
+
+Usage:
+  vapt-weak-cred-probe --target <host> --url <login-POST-url>
+    [--username-field username] [--password-field password]
+    [--extra-fields k=v,k2=v2]
+    [--marker 'invalid'|'incorrect'|'wrong'|'try again'|'login failed']
+
+Design (argv-only, no shell, no eval, in-scope-only):
+  * ≤ 16 (user, pass) pairs; configurable via a built-in list below.
+  * 10 s per attempt, 150 s total wall clock.
+  * ONE request per credential pair — never a full brute-force sweep.
+  * Each pair is tried against a FRESH session (no cookie carryover) so
+    one pair's success doesn't poison the next pair's response.
+  * NEVER tries LDAP/SSH/SMB creds — only HTTP form POST.
+  * NEVER follows redirects — we need the raw 302 Location to classify.
+
+Output: ONE JSON record to stdout:
+    {"findings": [{"type": "weak_credentials", "severity": "critical",
+                   "url": "<url>", "user": "<u>",
+                   "evidence": "<diff summary>", "confirmed": true}],
+     "trace":    [{"user","pass","status","set_cookie","loc","len","note"}, ...]}
+
+Fails SAFE on every error (empty findings, trace preserved for audit).
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+from urllib.parse import urlparse
+
+try:
+    import requests
+except Exception as e:
+    print(json.dumps({"error": f"requests not available: {e}", "findings": []}))
+    sys.exit(0)
+
+_UA = "vapt-weak-cred-probe/1.0 (authorized assessment)"
+_REQ_TIMEOUT = 10
+_TOTAL_BUDGET_S = 150
+
+# Common default credential pairs. Ordered by prior-art hit rate on
+# penetration-test datasets: admin/admin first, then password/admin/root
+# variants, then product-specific defaults. Keep small — this is a probe
+# for CLASSIC defaults, not a cred-stuffing sweep.
+_DEFAULT_PAIRS: tuple[tuple[str, str], ...] = (
+    ("admin",         "admin"),
+    ("admin",         "password"),
+    ("admin",         "admin123"),
+    ("admin",         "12345"),
+    ("admin",         "root"),
+    ("admin",         ""),
+    ("administrator", "administrator"),
+    ("administrator", "password"),
+    ("root",          "root"),
+    ("root",          "toor"),
+    ("root",          "password"),
+    ("test",          "test"),
+    ("demo",          "demo"),
+    ("user",          "user"),
+    ("guest",         "guest"),
+    ("tomcat",        "tomcat"),
+)
+
+# Password-only form variant (phpLiteAdmin ships with just a password
+# field + hidden login submit, no username). When argv flags set the
+# username-field to the empty string, we iterate just the password half.
+_PASSWORD_ONLY: tuple[str, ...] = (
+    "admin",
+    "password",
+    "admin123",
+    "root",
+    "12345",
+    "",
+    "phpliteadmin",
+    "letmein",
+    "changeme",
+)
+
+# Body fragments that STRONGLY suggest the login still failed. We don't
+# depend solely on this (false negatives — some apps re-render the form
+# silently). Lowercased comparison; case-insensitive.
+_FAILURE_MARKERS = (
+    "invalid",
+    "incorrect",
+    "wrong",
+    "try again",
+    "login failed",
+    "authentication failed",
+    "bad username",
+    "bad password",
+    "not valid",
+    "please log in",
+    "please login",
+    "sign in",
+)
+
+
+def _in_scope(target_host: str, url: str) -> bool:
+    try:
+        return urlparse(url).hostname == target_host
+    except Exception:
+        return False
+
+
+def _web_cookie() -> str:
+    """Not actually used — this tool deliberately runs cookie-less so each
+    attempted pair gets a FRESH session (no cross-contamination). Kept as a
+    helper only to match the shape of other probe wrappers in case we later
+    need to carry a captured anti-CSRF token."""
+    return ""
+
+
+def _parse_extras(s: str) -> dict:
+    out: dict[str, str] = {}
+    if not s:
+        return out
+    for part in s.split(","):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        k, _, v = part.partition("=")
+        k = k.strip()
+        v = v.strip()
+        if k:
+            out[k] = v
+    return out
+
+
+def _try_pair(url: str, data: dict, timeout: int) -> dict:
+    """Submit one credential pair. Returns a classification dict."""
+    t0 = time.time()
+    try:
+        r = requests.post(
+            url, data=data, timeout=timeout, allow_redirects=False,
+            headers={"User-Agent": _UA, "Accept": "text/html,*/*"},
+            verify=False,
+        )
+        elapsed = time.time() - t0
+        body = (r.text or "")
+        set_cookie = r.headers.get("Set-Cookie", "") or ""
+        loc = r.headers.get("Location", "") or ""
+        return {
+            "status": r.status_code,
+            "elapsed_ms": int(elapsed * 1000),
+            "set_cookie": set_cookie[:300],
+            "loc": loc[:300],
+            "body": body,
+            "len": len(body),
+        }
+    except Exception as e:
+        return {"status": 0, "note": f"{type(e).__name__}: {str(e)[:160]}",
+                "elapsed_ms": int((time.time() - t0) * 1000),
+                "set_cookie": "", "loc": "", "body": "", "len": 0}
+
+
+def _looks_like_login_success(baseline: dict, attempt: dict) -> tuple[bool, str]:
+    """Compare attempt against a known-bad baseline (random creds). Return
+    (success, reason). Multiple signals; ANY two agreeing promote to
+    'likely success' — ONE signal alone is too noisy. Reason string names
+    which signals fired for the ledger."""
+    reasons: list[str] = []
+
+    # 1) 3xx redirect to a path that isn't the login page itself — classic
+    # post-login redirect to /dashboard, /admin, /, etc.
+    if 300 <= attempt["status"] < 400 and attempt["loc"]:
+        _loc = attempt["loc"].lower()
+        if "login" not in _loc and "signin" not in _loc:
+            reasons.append(f"redirect→{attempt['loc'][:80]}")
+
+    # 2) Set-Cookie header mentions a session identifier (vs baseline).
+    base_sc = (baseline.get("set_cookie") or "").lower()
+    att_sc = (attempt.get("set_cookie") or "").lower()
+    _session_toks = ("session", "sessid", "sid", "token", "auth", "jwt",
+                     "phpsessid")
+    base_has_sess = any(t in base_sc for t in _session_toks)
+    att_has_sess = any(t in att_sc for t in _session_toks)
+    if att_has_sess and not base_has_sess:
+        reasons.append("new-session-cookie")
+    # Different session cookie VALUE (both have one, but different value)
+    # usually means the server rotated session on login.
+    elif att_has_sess and base_has_sess and att_sc != base_sc:
+        # Only count if the base one does NOT contain the attempt's token
+        # (otherwise we just got a different random SID both times).
+        if abs(len(att_sc) - len(base_sc)) > 20:
+            reasons.append("session-rotated")
+
+    # 3) Body-size diff: successful login response is usually SMALLER
+    # (minimal redirect page) or LARGER (dashboard) than a baseline that
+    # re-renders the login form. A tight match to baseline length → failure.
+    bl = baseline.get("len", 0)
+    al = attempt.get("len", 0)
+    if bl > 0 and abs(al - bl) > max(100, bl * 0.3):
+        reasons.append(f"body-size-diff({bl}→{al})")
+
+    # 4) Absence of failure markers (if baseline body had them and attempt
+    # body doesn't). This is the strongest signal when markers are present.
+    base_body = (baseline.get("body") or "").lower()
+    att_body = (attempt.get("body") or "").lower()
+    base_had_marker = any(m in base_body for m in _FAILURE_MARKERS)
+    att_has_marker = any(m in att_body for m in _FAILURE_MARKERS)
+    if base_had_marker and not att_has_marker:
+        reasons.append("failure-marker-gone")
+
+    # Classification: need ≥ 2 agreeing signals OR 1 very-strong signal
+    # (redirect-away-from-login OR failure-marker-gone).
+    strong = ("redirect→" in " ".join(reasons)
+              or "failure-marker-gone" in reasons)
+    return (strong or len(reasons) >= 2), ", ".join(reasons) or "no signal"
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Deterministic weak-credential probe")
+    ap.add_argument("--target", required=True,
+                    help="Scope host (login URL must match this host).")
+    ap.add_argument("--url", required=True,
+                    help="POST URL of the login form.")
+    ap.add_argument("--username-field", default="username",
+                    help="Form field name for the username. Pass '' for "
+                         "password-only forms (e.g. phpLiteAdmin).")
+    ap.add_argument("--password-field", default="password",
+                    help="Form field name for the password.")
+    ap.add_argument("--extra-fields", default="",
+                    help="Hidden/required fields to include with every "
+                         "attempt as k=v,k2=v2 (e.g. 'login=Log+In,remember=')")
+    args = ap.parse_args()
+
+    url = args.url.strip()
+    if not url.lower().startswith(("http://", "https://")):
+        print(json.dumps({"error": "url must be http(s)", "findings": []}))
+        return 0
+    if not _in_scope(args.target, url):
+        print(json.dumps({"error": "url off-scope", "findings": []}))
+        return 0
+
+    # Sentinel handling — see catalog `_resolve` for context. The orchestrator
+    # calls through the governed harness, which hits `_mk_build` which drops
+    # empty-string resolved values AND the preceding flag — misaligning
+    # argparse. We work around that by passing sentinels and translating
+    # them back to "no value" here.
+    _xf = args.extra_fields.strip()
+    extras = _parse_extras("" if _xf == "__NONE__" else _xf)
+    _uf = args.username_field.strip()
+    user_field = "" if _uf == "__PASSWORD_ONLY__" else _uf
+    pw_field = args.password_field.strip() or "password"
+
+    try:
+        requests.packages.urllib3.disable_warnings()  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+    trace: list[dict] = []
+    findings: list[dict] = []
+    t_start = time.time()
+
+    # Baseline: submit obviously-random credentials FIRST so later attempts
+    # can be classified against this known-bad response (headers, body size,
+    # markers). If baseline itself times out or errors, we can still try
+    # attempts but detection becomes less reliable.
+    _base_user = "a7f3e9c1zxq_notareal_user"
+    _base_pw = "9f2a7cXR4lQp_notareal_pw"
+    _base_data: dict[str, str] = dict(extras)
+    if user_field:
+        _base_data[user_field] = _base_user
+    _base_data[pw_field] = _base_pw
+    baseline = _try_pair(url, _base_data, _REQ_TIMEOUT)
+    trace.append({"phase": "baseline", "user": _base_user,
+                  "status": baseline["status"],
+                  "set_cookie": baseline.get("set_cookie", "")[:120],
+                  "loc": baseline.get("loc", "")[:120],
+                  "len": baseline.get("len", 0),
+                  "note": baseline.get("note", "")})
+
+    # Pick the credential list based on whether the form has a username.
+    if user_field:
+        pairs = list(_DEFAULT_PAIRS)
+    else:
+        pairs = [("", pw) for pw in _PASSWORD_ONLY]
+
+    for (u, pw) in pairs:
+        if time.time() - t_start > _TOTAL_BUDGET_S:
+            trace.append({"phase": "budget", "note": "wall budget exhausted"})
+            break
+        data: dict[str, str] = dict(extras)
+        if user_field:
+            data[user_field] = u
+        data[pw_field] = pw
+        att = _try_pair(url, data, _REQ_TIMEOUT)
+        succ, reason = _looks_like_login_success(baseline, att)
+        row = {"user": u, "pass": pw, "status": att["status"],
+               "set_cookie": att.get("set_cookie", "")[:120],
+               "loc": att.get("loc", "")[:120],
+               "len": att.get("len", 0),
+               "note": att.get("note", ""),
+               "signals": reason, "likely_success": succ}
+        trace.append(row)
+        if succ:
+            findings.append({
+                "type": "weak_credentials",
+                "severity": "critical",
+                "url": url,
+                "user": u,
+                # Password redacted in the finding payload — the trace keeps
+                # the full pair for audit, but the user-facing finding only
+                # needs to say "default creds work" with the username.
+                "evidence": f"Login succeeded with user={u!r}; signals: {reason}",
+                "confirmed": True,
+            })
+            # Stop on first confirmed success — further attempts would just
+            # noise up the trace. Rare apps have multiple default accounts
+            # but one confirmed finding is enough to escalate the issue.
+            break
+
+    print(json.dumps({"findings": findings, "trace": trace}))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

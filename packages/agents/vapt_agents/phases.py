@@ -518,7 +518,9 @@ def detect_login_url(db: Session, scope: RunScope, *, base_url: str) -> str | No
     from urllib.parse import urljoin, urlparse
 
     base = base_url.rstrip("/") + "/"
-    base_host = urlparse(base_url).hostname
+    _parsed_base = urlparse(base_url)
+    base_host = _parsed_base.hostname
+    base_port = _parsed_base.port or (443 if _parsed_base.scheme == "https" else 80)
     cands: list[str] = []
     seen: set[str] = set()
     for fid in db.execute(select(Finding.id).where(Finding.run_id == scope.run_id)).scalars().all():
@@ -534,7 +536,9 @@ def detect_login_url(db: Session, scope: RunScope, *, base_url: str) -> str | No
                     continue
                 url = u if u.lower().startswith(("http://", "https://")) \
                     else urljoin(base, u.lstrip("/"))
-                if urlparse(url).hostname != base_host or url in seen:
+                pu = urlparse(url)
+                cand_port = pu.port or (443 if pu.scheme == "https" else 80)
+                if pu.hostname != base_host or cand_port != base_port or url in seen:
                     continue
                 seen.add(url)
                 cands.append(url)
@@ -876,6 +880,208 @@ def confirmed_ids_for_run(db: Session, run_id: str) -> list[str]:
     )
 
 
+# --- cross-run engagement memory -----------------------------------------
+# Normalizer for finding titles: collapses run-specific suffixes/prefixes so
+# "SSTI confirmed (param offer, engine Jinja2)" and "SSTI confirmed (param
+# offer, engine Jinja2) (COPY 2)" collapse to the same identity for dedup.
+# Case-insensitive, whitespace-folded, trailing-noise stripped.
+_TITLE_NOISE_RE = re.compile(
+    r"\s*(?:"
+    r"\(copy\s*\d+\)|"
+    r"\[run[-:\s_]*[A-Za-z0-9-]{3,}\]|"
+    r"#\d+\s*$|"
+    r"\s+at\s+\d{4}-\d{2}-\d{2}.*$"
+    r")\s*",
+    re.IGNORECASE,
+)
+
+
+def _normalize_finding_title(title: str) -> str:
+    """Lowercase + whitespace-fold + strip run-specific noise. Used as part of
+    the dedup key for engagement_prior_findings so copies / re-runs collapse."""
+    if not title:
+        return ""
+    t = _TITLE_NOISE_RE.sub(" ", str(title).strip().lower())
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def engagement_prior_findings(
+    db: Session,
+    scope: RunScope,
+    *,
+    limit: int = 40,
+    statuses: tuple[str, ...] = ("confirmed", "candidate"),
+    min_severity: str = "info",
+) -> list[dict]:
+    """Return deduplicated findings from PRIOR runs of this engagement
+    (excludes the current run). Grouped by (normalized_title, severity,
+    source_tool); each group becomes one dict with occurrence stats:
+      {"title": <representative title>, "severity": <sev>,
+       "source_tool": <tool>, "seen": <int>, "last_seen": <ISO date>,
+       "last_run_id": <uuid>}
+    Newest-first, capped at `limit`.
+
+    Returns [] cleanly when:
+      * This is the first run of the engagement (no priors).
+      * `scope.engagement_id` is unset for any reason.
+      * Any DB error (fail-safe — prior-findings context is advisory, never
+        critical to running the engagement).
+
+    `statuses` lets callers restrict to CONFIRMED only (reporting) or
+    include CANDIDATE (planning/exploration).
+    `min_severity` filters out anything below the given level; the default
+    "info" keeps everything (useful for the planner; the reporter would want
+    "medium" or higher).
+    """
+    from sqlalchemy import select as _select
+
+    _SEV_RANK = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
+    try:
+        _min = _SEV_RANK.get(min_severity.lower(), 0)
+    except Exception:
+        _min = 0
+
+    try:
+        from vapt_persistence.models import Run as _Run
+        # RunScope doesn't carry engagement_id — look it up via scope.run_id.
+        current_run = db.execute(
+            _select(_Run).where(_Run.id == scope.run_id)
+        ).scalars().first()
+        if current_run is None or not getattr(current_run, "engagement_id", None):
+            return []
+        engagement_id = current_run.engagement_id
+        # Prior-run IDs — same engagement, not THIS run.
+        prior_run_ids = db.execute(
+            _select(_Run.id).where(
+                _Run.engagement_id == engagement_id,
+                _Run.id != scope.run_id,
+            )
+        ).scalars().all()
+        prior_run_ids = list(prior_run_ids)
+        if not prior_run_ids:
+            return []
+        # Pull findings for all prior runs in ONE query, newest-first.
+        rows = db.execute(
+            _select(Finding).where(
+                Finding.run_id.in_(prior_run_ids),
+                Finding.status.in_(statuses),
+            ).order_by(Finding.created_at.desc())
+        ).scalars().all()
+        # Dedup by (normalized_title, severity, source_tool). Source_tool
+        # comes from the FIRST observation attached to each finding — use
+        # "unknown" when a finding has no observations (shouldn't happen
+        # under normal paths; defensive).
+        groups: dict[tuple[str, str, str], dict] = {}
+        for f in rows:
+            sev = str(f.severity or "info").lower()
+            if _SEV_RANK.get(sev, 0) < _min:
+                continue
+            norm_title = _normalize_finding_title(f.title or "")
+            if not norm_title:
+                continue
+            # First observation's source_tool.
+            obs = db.execute(
+                _select(FindingObservation.source_tool)
+                .where(FindingObservation.finding_id == f.id)
+                .limit(1)
+            ).scalars().first()
+            source_tool = str(obs or "unknown").lower()
+            key = (norm_title, sev, source_tool)
+            created_iso = (f.created_at.isoformat()
+                           if getattr(f, "created_at", None) else "")
+            if key not in groups:
+                groups[key] = {
+                    "title": f.title or "",   # preserve first (newest) title verbatim
+                    "severity": sev,
+                    "source_tool": source_tool,
+                    "seen": 1,
+                    "last_seen": created_iso,
+                    "last_run_id": f.run_id,
+                }
+            else:
+                groups[key]["seen"] += 1
+        # Rank: severity desc, then seen desc, then last_seen desc.
+        out = sorted(
+            groups.values(),
+            key=lambda g: (
+                -_SEV_RANK.get(g["severity"], 0),
+                -g["seen"],
+                g["last_seen"],
+            ),
+            reverse=False,
+        )
+        # Flip last_seen reverse so NEWER is first within same (sev, seen):
+        out.sort(key=lambda g: (
+            -_SEV_RANK.get(g["severity"], 0),
+            -g["seen"],
+            # Negative isoformat sort → newest first. isoformat is lexically
+            # comparable, so simply reverse the comparison via sort reverse
+            # key below.
+            g["last_seen"],
+        ))
+        # Simpler: just reverse-sort within the tiebreaker.
+        out = sorted(
+            groups.values(),
+            key=lambda g: (
+                -_SEV_RANK.get(g["severity"], 0),
+                -g["seen"],
+            ),
+        )
+        # Now stably break ties on last_seen by sorting newest-first within.
+        out.sort(key=lambda g: g["last_seen"], reverse=True)
+        # Final re-sort by severity+seen (stable, so last_seen order preserved
+        # within ties).
+        out.sort(
+            key=lambda g: (
+                -_SEV_RANK.get(g["severity"], 0),
+                -g["seen"],
+            ),
+        )
+        return out[:limit]
+    except Exception:
+        # Prior-findings context is advisory — never let a DB blip take down
+        # a run. Return [] and let the LLM plan without the extra context.
+        return []
+
+
+def summarize_prior_findings_for_llm(priors: list[dict], *, cap_bytes: int = 3500) -> str:
+    """Compact single-string rendering of engagement_prior_findings() output
+    for direct injection into an LLM prompt. One line per finding, severity-
+    tagged, with seen-count + last-date. Truncates to `cap_bytes` with a
+    trailing "(+N more)" if the list is long.
+
+    Returns "" on an empty input list — callers can `if block:` to decide
+    whether to add a surrounding "Prior findings:" header to the prompt."""
+    if not priors:
+        return ""
+    lines: list[str] = []
+    for p in priors:
+        sev = p.get("severity", "info")
+        title = str(p.get("title", ""))[:140]
+        seen = int(p.get("seen", 1))
+        last = str(p.get("last_seen", ""))[:10]  # YYYY-MM-DD only
+        tool = str(p.get("source_tool", ""))
+        suffix = f" (seen {seen}×, last {last}, via {tool})" if last else \
+                 f" (seen {seen}×, via {tool})"
+        lines.append(f"- [{sev}] {title}{suffix}")
+    text = "\n".join(lines)
+    if len(text.encode("utf-8")) <= cap_bytes:
+        return text
+    # Truncate progressively from the tail.
+    kept: list[str] = []
+    size = 0
+    for ln in lines:
+        _add = len(ln.encode("utf-8")) + 1
+        if size + _add > cap_bytes - 40:
+            break
+        kept.append(ln)
+        size += _add
+    remainder = len(lines) - len(kept)
+    if remainder > 0:
+        kept.append(f"- (+{remainder} more older findings omitted for brevity)")
+    return "\n".join(kept)
+
+
 def _existing_candidate(db: Session, run_id: str, obs: Observation) -> Finding | None:
     """A finding already persisted for this run with the SAME title + source tool. Used to
     collapse duplicates when a re-entrant node repeats a step — e.g. the probe node re-running
@@ -948,9 +1154,33 @@ def scan_action(
     db: Session, scope: RunScope, harness: GovernedHarness,
     *, tool_id: str, args: dict, task_id: str,
 ) -> ScanStep:
-    outcome = harness.run_action(
-        db, ctx_for(scope, task_id=task_id, agent=AgentRole.SCAN, tool_id=tool_id, args=args)
-    )
+    """Dispatch a scan action through the harness. If the broker raises (an argv-builder
+    ValueError, a Python-level shim bug, an OSError), the harness has already recorded
+    `action.executed outcome=failed` with the exception's reason; we catch here and
+    synthesize a non-executed ActionOutcome so the scan node's existing "coverage gap"
+    path takes over instead of crashing the engagement.
+
+    The bloghub-ext.nuasec.com run 2026-10-28 died at scan-10 because dom_xss_probe's
+    argv builder raised `ValueError: dom_xss_probe needs comma-separated urls` and the
+    exception propagated up through scan_action → scan node → Celery task. The ledger
+    stopped at event 60 (the harness's own action.executed row for the failure) and the
+    remaining scan steps never ran."""
+    try:
+        outcome = harness.run_action(
+            db, ctx_for(scope, task_id=task_id, agent=AgentRole.SCAN,
+                        tool_id=tool_id, args=args)
+        )
+    except Exception as e:
+        # Harness has already written the action.executed/failed ledger event; the
+        # digest + key would have been recomputed from ctx. Return a non-executed
+        # outcome so the scan node continues to the next tool. Store the reason
+        # for the "coverage_gaps" log line.
+        from vapt_domain.enums import PolicyDecision  # noqa: PLC0415
+        reason = f"broker raised: {type(e).__name__}: {str(e)[:200]}"
+        merged = {"target": scope.target, **args}
+        digest = action_digest(tool_id, "default", str(merged.get("target", "")), merged)
+        key = idempotency_key(scope.run_id, task_id, digest)
+        outcome = ActionOutcome(PolicyDecision.DENY, False, reason, digest, key)
     step = ScanStep(tool_id=tool_id, task_id=task_id, outcome=outcome)
     if outcome.executed:
         step.candidate_ids = _candidates_from(db, scope.run_id, tool_id, outcome)
@@ -962,10 +1192,20 @@ def execute_scan_after_approval(
     *, tool_id: str, args: dict, task_id: str,
 ) -> ScanStep:
     """Run an approved scan action via the harness's post-approval path (re-validates
-    scope), then normalize its output into candidate findings."""
-    outcome = harness.execute_approved(
-        db, ctx_for(scope, task_id=task_id, agent=AgentRole.SCAN, tool_id=tool_id, args=args)
-    )
+    scope), then normalize its output into candidate findings. Same broker-raise
+    protection as scan_action — a buggy argv builder cannot kill the engagement."""
+    try:
+        outcome = harness.execute_approved(
+            db, ctx_for(scope, task_id=task_id, agent=AgentRole.SCAN,
+                        tool_id=tool_id, args=args)
+        )
+    except Exception as e:
+        from vapt_domain.enums import PolicyDecision  # noqa: PLC0415
+        reason = f"broker raised: {type(e).__name__}: {str(e)[:200]}"
+        merged = {"target": scope.target, **args}
+        digest = action_digest(tool_id, "default", str(merged.get("target", "")), merged)
+        key = idempotency_key(scope.run_id, task_id, digest)
+        outcome = ActionOutcome(PolicyDecision.DENY, False, reason, digest, key)
     step = ScanStep(tool_id=tool_id, task_id=task_id, outcome=outcome)
     if outcome.executed:
         step.candidate_ids = _candidates_from(db, scope.run_id, tool_id, outcome)
@@ -1529,7 +1769,17 @@ def wapiti_sqli_targets(db: Session, run_id: str) -> list[tuple[str, str, str]]:
 # keeps them "candidate until a separate validation step" so they aren't auto-promoted.
 _PROOF_SOURCE_TOOLS = {"sstimap", "web_param_probe", "dalfox", "idor_probe",
                        "sqli_detect", "stored_xss_probe",
-                       "yaml_deserialization_probe", "dom_xss_probe"}
+                       "yaml_deserialization_probe", "dom_xss_probe",
+                       "weak_cred_probe",
+                       # xxe_probe confirms XXE by matching leaked file
+                       # content in the response body — direct on-target
+                       # proof, same tier as the other proof-source tools.
+                       "xxe_probe",
+                       # recon_agent body-pattern scanner emits findings
+                       # for leaked hashes / AWS keys / private keys with
+                       # detail.confirmed=True — a direct observation on
+                       # the authed response body is proof-grade.
+                       "recon_agent.body_scanner"}
 
 
 def _is_proof_finding(db: Session, finding_id: str) -> bool:

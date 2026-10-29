@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+"""Wrapper for anmolksachan/wayBackLister — queries Wayback Machine for
+historical URLs on an in-scope domain, actively probes directory-shaped
+paths for still-exposed "Index of /" listings. Emits structured JSON for
+the normalizer.
+
+Governance posture:
+- argv-only (no shell)
+- Single --domain input, rejects IPs (Wayback has no IP data) and multi-
+  domain modes (-f, -auto) that the upstream tool supports
+- Bounded wall-clock (upstream internal timeouts + our subprocess timeout)
+- stdout = one JSON blob; stderr = passthrough from upstream for debug
+- Exit 0 on run completion (hits or no hits); non-zero only on invalid
+  input or wrapper-internal error
+
+Install location of upstream (override with VAPT_WAYBACKLISTER_SCRIPT env):
+  /home/pt-team/tools/wayBackLister/waybacklister.py
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+
+
+_DOMAIN_RE = re.compile(
+    r"^(?=.{1,253}$)(?:(?!-)[A-Za-z0-9-]{1,63}(?<!-)\.)+[A-Za-z]{2,}$"
+)
+_IP_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
+# "[+] Directory Listing Found: http://example.com/old/"
+_HIT_RE = re.compile(
+    r"^\s*\[\+\]\s*Directory\s+Listing\s+Found\s*:\s*(https?://\S+)\s*$",
+    re.IGNORECASE,
+)
+# "[+] Found 42 unique paths for example.com. Checking..."
+_PATHS_RE = re.compile(
+    r"^\s*\[\+\]\s*Found\s+(\d+)\s+unique\s+paths", re.IGNORECASE)
+
+
+def _die(msg: str, code: int = 2) -> None:
+    sys.stderr.write(f"vapt-waybacklister: {msg}\n")
+    sys.exit(code)
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(
+        prog="vapt-waybacklister",
+        description="Bounded wayBackLister wrapper — single-domain scope only.")
+    p.add_argument("--domain", required=True,
+                   help="In-scope domain (e.g. example.com). IPs rejected.")
+    p.add_argument("--threads", type=int, default=10,
+                   help="Thread count forwarded to upstream (bounded 1..32).")
+    p.add_argument("--timeout", type=int, default=300,
+                   help="Subprocess wall-clock cap in seconds (bounded 30..900).")
+    args = p.parse_args()
+
+    domain = args.domain.strip().lower()
+    if _IP_RE.match(domain):
+        _die("Wayback Machine has no data for IP targets; "
+             "waybacklister needs a domain.")
+    if not _DOMAIN_RE.match(domain):
+        _die(f"invalid domain shape: {domain!r}")
+    threads = max(1, min(int(args.threads), 32))
+    timeout = max(30, min(int(args.timeout), 900))
+
+    script = os.environ.get(
+        "VAPT_WAYBACKLISTER_SCRIPT",
+        "/home/pt-team/tools/wayBackLister/waybacklister.py",
+    )
+    if not os.path.isfile(script):
+        _die(f"upstream script not found: {script!r}; "
+             "clone https://github.com/anmolksachan/wayBackLister into "
+             "~/tools/ or set VAPT_WAYBACKLISTER_SCRIPT",
+             code=3)
+
+    argv = [sys.executable, script, "-d", domain, "-t", str(threads)]
+    try:
+        pr = subprocess.run(argv, capture_output=True, text=True,
+                            timeout=timeout, check=False)
+    except subprocess.TimeoutExpired:
+        print(json.dumps({"domain": domain, "listings": [], "total": 0,
+                          "error": f"timeout after {timeout}s"}))
+        return 0
+    except Exception as e:
+        print(json.dumps({"domain": domain, "listings": [], "total": 0,
+                          "error": f"{type(e).__name__}: {e}"}))
+        return 0
+
+    listings: list[str] = []
+    paths_count: int | None = None
+    for line in (pr.stdout or "").splitlines():
+        m = _HIT_RE.match(line)
+        if m:
+            # Dedup within one run.
+            u = m.group(1).strip()
+            if u and u not in listings:
+                listings.append(u)
+            continue
+        m = _PATHS_RE.match(line)
+        if m:
+            try:
+                paths_count = int(m.group(1))
+            except ValueError:
+                paths_count = None
+
+    out = {
+        "domain": domain,
+        "listings": listings,
+        "total": len(listings),
+        "paths_examined": paths_count,
+        "exit_code": pr.returncode,
+    }
+    # Keep stderr for operator inspection via the ledger's broker log.
+    if pr.stderr:
+        sys.stderr.write(pr.stderr)
+    print(json.dumps(out))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

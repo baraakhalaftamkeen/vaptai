@@ -58,6 +58,50 @@ def _resolve(tok: str, args: dict):
         return str(args.get("ports", "")).strip() or None
     if tok == "{wordlist}":
         return os.environ.get("VAPT_WORDLIST", _WORDLIST_DEFAULT)
+    if tok == "{base_urls}":
+        # Comma-joined list of in-scope web base URLs. The caller passes
+        # args["base_urls"] as a list OR a comma-separated string; we
+        # normalize to a single comma string that the js_endpoint_miner
+        # (and future multi-base tools) parse out.
+        bu = args.get("base_urls")
+        if isinstance(bu, list):
+            return ",".join(str(x).strip() for x in bu if str(x).strip())
+        return str(bu or "").strip() or None
+    if tok == "{username_field}":
+        # Form field name for weak_cred_probe. Defaults to "username".
+        # Explicit empty string ('') from the orchestrator means "password-
+        # only form" (phpLiteAdmin shape). But _mk_build drops empty-string
+        # resolved values, which would also drop the preceding --username-
+        # field flag and desync argparse. So we return a sentinel string
+        # for the password-only case; the probe treats it as "no username".
+        v = args.get("username_field")
+        if v is None:
+            return "username"
+        if str(v) == "":
+            return "__PASSWORD_ONLY__"
+        return str(v)
+    if tok == "{password_field}":
+        v = args.get("password_field")
+        return str(v) if v else "password"
+    if tok == "{extra_fields}":
+        # Hidden/required fields the login form expects on every submit
+        # (e.g. phpLiteAdmin's `login=Log+In&remember=`). Caller passes
+        # args["extra_fields"] as a k=v,k2=v2 string. If no extras, return
+        # the sentinel "__NONE__" (not empty) so _mk_build still appends
+        # the flag+value pair and argparse doesn't desync. The probe
+        # treats __NONE__ as "no extras".
+        s = str(args.get("extra_fields") or "").strip()
+        return s if s else "__NONE__"
+    if tok == "{method}":
+        # HTTP method (xxe_probe uses post/get). Default: post.
+        return str(args.get("method") or "post").lower()
+    if tok == "{param}":
+        # Query-string / form-field name (xxe_probe optional). Empty is
+        # a legit "use the probe's default" case; return "__NONE__" so
+        # _mk_build appends the flag without desyncing argparse — the
+        # xxe_probe wrapper treats __NONE__ as no override.
+        v = str(args.get("param") or "").strip()
+        return v if v else "__NONE__"
     return tok  # literal
 
 
@@ -112,6 +156,26 @@ CATALOG: list[tuple] = [
     ("dnsrecon",    ["dnsrecon"],     ["-d", "{domain}"],                            _P1, [_RE, _SC], "network"),
     ("waybackurls", ["waybackurls"],  ["{domain}"],                                  _P0, [_RE, _SC], "network"),
     ("gau",         ["gau"],          ["--subs", "{domain}"],                        _P0, [_RE, _SC], "network"),
+    # waybacklister: Wayback archive + ACTIVE directory-listing probe. Different
+    # value class from waybackurls/gau: not just URL enumeration — detects which
+    # of those historical paths still return a live "Index of /" page. P1 because
+    # it sends live GETs to probe exposure. Domain targets only (upstream wrapper
+    # rejects IPs; Wayback has no data for raw IP endpoints).
+    ("waybacklister", ["vapt-waybacklister"],
+                      ["--domain", "{domain}", "--threads", "10"],
+                      _P1, [_RE, _SC], "network"),
+    # js_endpoint_miner: mines served .js files for /path-shaped strings
+    # and probes /openapi.json / /swagger.json / /actuator/mappings for API
+    # specs. P1 passive — just reads what the server already serves. Catches
+    # UNLINKED endpoints that bundled JS references but no HTML page links to
+    # (the common pattern for `/api/v1/*` routes in modern SPAs). Argv-only
+    # wrapper under workers/bin; auto-fed into discovered_endpoint_urls via
+    # the engagement normalizer.
+    ("js_endpoint_miner", ["vapt-js-endpoint-miner"],
+                          ["--target", "{target}",
+                           "--base-urls", "{base_urls}",
+                           "--max-js", "20"],
+                          _P1, [_RE, _SC], "network"),
     ("katana",      ["katana"],       ["-silent", "-u", "{url}", "-d", "5", "-jc", "-kf", "all"], _P1, [_RE, _SC], "network"),  # -d 5: crawl deeper than default 3; -jc: parse JS for endpoints (finds app/API routes like /api/debug, /order not present as plain links); -kf all: robots.txt + sitemap.xml
     ("whatweb",     ["whatweb"],      ["--quiet", "--no-errors", "{url}"],           _P1, [_RE, _SC], "network"),
     ("wafw00f",     ["wafw00f"],      ["{url}"],                                     _P1, [_RE, _SC], "network"),
@@ -155,6 +219,25 @@ CATALOG: list[tuple] = [
     ("ghauri",      ["ghauri"],       ["-u", "{url}", "--batch"],                    _P2, [_AT], "network"),
     ("commix",      ["commix"],       ["-u", "{url}", "--batch"],                    _P2, [_AT], "network"),
     ("sstimap",     ["sstimap", "sstimap.py"], ["-u", "{url}"],                      _P2, [_AT], "network"),
+    # weak_cred_probe: tries ~16 common default credential pairs against a known
+    # login form. P2 (sends auth attempts), SCAN/ATTACK. Catches the classic
+    # phpLiteAdmin admin/admin, Tomcat tomcat/tomcat, generic admin/password
+    # defaults. Argv-only wrapper under workers/bin. Bounded (16 pairs max,
+    # one request each, 150s total budget), no shell, no brute-force sweep.
+    ("weak_cred_probe", ["vapt-weak-cred-probe"],
+                        ["--target", "{target}", "--url", "{url}",
+                         "--username-field", "{username_field}",
+                         "--password-field", "{password_field}",
+                         "--extra-fields", "{extra_fields}"],
+                        _P2, [_SC, _AT], "network"),
+    # xxe_probe: sends 6 XXE payload shapes (file:// SYSTEM entity, parameter-
+    # entity blind, PHP base64 filter, SOAP envelope) to an XML-intake endpoint.
+    # Read-only payloads (no system() tags). argv-only, bounded, P2.
+    ("xxe_probe",   ["vapt-xxe-probe"],
+                    ["--target", "{target}", "--url", "{url}",
+                     "--method", "{method}", "--param", "{param}",
+                     "--extra-fields", "{extra_fields}"],
+                    _P2, [_SC, _VA], "network"),
     ("dotdotpwn",   ["dotdotpwn"],    ["-m", "http", "-h", "{target}", "-q"],        _P2, [_AT], "network"),
     ("fuxploider",  ["fuxploider"],   ["-u", "{url}", "--not-regex", "nonexistent"], _P2, [_AT], "network"),
     ("nosqlmap",    ["nosqlmap", "NoSQLMap"], ["--url", "{url}"],                    _P2, [_AT], "network"),
@@ -195,6 +278,10 @@ _PURPOSE: dict[str, str] = {
     "dnsrecon": "DNS enumeration (records, zone transfer attempt, brute). Domain targets.",
     "waybackurls": "Historical URLs for a domain from the Wayback Machine (endpoint discovery).",
     "gau": "Known URLs for a domain from Wayback/CommonCrawl/OTX (endpoint discovery).",
+    "waybacklister": "Finds still-exposed 'Index of /' directory listings by probing historical paths from the Wayback Machine. Domain targets. Catches forgotten exposed directories scanners of live-only content miss.",
+    "js_endpoint_miner": "Mines served .js files for /path-shaped URL strings and probes common API-spec endpoints (/openapi.json, /swagger.json, /actuator/mappings). Discovers UNLINKED endpoints that bundled JavaScript references but no HTML page links to — a major class of hidden surface in modern SPAs and REST APIs. P1 passive.",
+    "weak_cred_probe": "Tries ~16 common default credential pairs (admin/admin, root/root, tomcat/tomcat, phpLiteAdmin admin/admin, etc.) against a known HTTP login form. Catches the classic default-cred bug that chains to full compromise. Argv-only, bounded (16 attempts, 150s budget), P2 approval-gated.",
+    "xxe_probe": "Sends 6 XML External Entity payload shapes (file:// SYSTEM entity, parameter-entity blind, PHP base64 filter, SOAP envelope wrapper) to a known XML-intake endpoint. Confirms file-disclosure XXE by matching leaked /etc/passwd / /etc/hostname / win.ini / <?php content in the response body. Argv-only, bounded (6 payloads, 90s budget), P2 approval-gated.",
     "katana": "Active web crawler — discovers endpoints/links on a live HTTP(S) site. Use when a web service is open.",
     "whatweb": "Web technology fingerprint (server, CMS, frameworks) for an HTTP(S) URL. First step on any web service.",
     "wafw00f": "Detects whether a WAF fronts an HTTP(S) site. Use before active web testing.",
