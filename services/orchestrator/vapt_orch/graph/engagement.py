@@ -113,11 +113,14 @@ def _path_in_text(txt: str) -> str:
     return path if "/" in path and len(path) > 1 else ""
 
 
-def _probe_target_reachable(target: str, *, timeout_s: int = 15) -> tuple[bool, dict]:
+def _probe_target_reachable(target: str, *, timeout_s: int = 15,
+                            allowed_ports: str = "") -> tuple[bool, dict]:
     """HTTP(S) reachability probe for the intake pre-flight.
 
-    Returns (reachable, detail_dict). Tries HTTPS first, then HTTP. Fail-safe: any
-    exception degrades to unreachable rather than crashing the graph."""
+    Returns (reachable, detail_dict). Tries HTTPS first, then HTTP. When
+    ``allowed_ports`` lists non-standard ports (e.g. "4000"), those are probed
+    too so that localhost:4000-style targets don't fail at intake. Fail-safe:
+    any exception degrades to unreachable rather than crashing the graph."""
     try:
         import requests as _req
         from urllib.parse import urlparse as _up
@@ -129,6 +132,13 @@ def _probe_target_reachable(target: str, *, timeout_s: int = 15) -> tuple[bool, 
         probe_urls = [target]
     else:
         probe_urls = [f"https://{target}", f"http://{target}"]
+        # Also try non-standard ports from the scope so e.g. localhost + port
+        # 4000 probes http://localhost:4000 instead of only :80/:443.
+        if allowed_ports:
+            for p in allowed_ports.split(","):
+                p = p.strip()
+                if p and p not in ("80", "443"):
+                    probe_urls.append(f"http://{target}:{p}")
 
     detail: dict = {}
     for url in probe_urls:
@@ -349,7 +359,8 @@ def build_engagement_graph(
         log: list[str] = [f"intake: run {scope.run_id} accepted"]
 
         # ---- 1. Target reachability probe ------------------------------------
-        reachable, probe_detail = _probe_target_reachable(scope.target)
+        reachable, probe_detail = _probe_target_reachable(
+            scope.target, allowed_ports=scope.allowed_ports)
         if reachable:
             log.append(f"intake: target reachable ({probe_detail.get('url')} → {probe_detail.get('status')})")
 
@@ -385,6 +396,12 @@ def build_engagement_graph(
                 bases = [target.rstrip("/")]
             else:
                 bases = [f"https://{target}", f"http://{target}"]
+                # Also try non-standard ports from the scope.
+                if scope.allowed_ports:
+                    for _ap in scope.allowed_ports.split(","):
+                        _ap = _ap.strip()
+                        if _ap and _ap not in ("80", "443"):
+                            bases.append(f"http://{target}:{_ap}")
 
             candidate_login_urls: list[str] = []
             for base in bases:
