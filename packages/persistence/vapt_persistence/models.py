@@ -48,6 +48,7 @@ class User(Base):
     email: Mapped[str | None] = mapped_column(String(255), unique=True)
     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)  # Argon2id
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    permissions: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = created_column()
 
     memberships: Mapped[list[Membership]] = relationship(back_populates="user")
@@ -93,12 +94,15 @@ class Engagement(Base):
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     testing_mode: Mapped[str] = mapped_column(String(20), nullable=False)
     target_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    target_description: Mapped[str | None] = mapped_column(Text, nullable=True)
     scope_version: Mapped[int] = mapped_column(Integer, default=1)
     created_at: Mapped[datetime] = created_column()
 
     project: Mapped[Project] = relationship(back_populates="engagements")
-    scope_versions: Mapped[list[ScopeVersion]] = relationship(back_populates="engagement")
-    runs: Mapped[list[Run]] = relationship(back_populates="engagement")
+    scope_versions: Mapped[list[ScopeVersion]] = relationship(
+        back_populates="engagement", cascade="all, delete-orphan", passive_deletes=True)
+    runs: Mapped[list[Run]] = relationship(
+        back_populates="engagement", cascade="all, delete-orphan", passive_deletes=True)
 
 
 class ScopeVersion(Base):
@@ -263,6 +267,10 @@ class Finding(Base):
     status: Mapped[str] = mapped_column(String(30), default="candidate")
     severity: Mapped[str] = mapped_column(String(20), default="info")
     description: Mapped[str] = mapped_column(Text, default="")
+    target_url: Mapped[str] = mapped_column(String(1000), default="")
+    resolution_status: Mapped[str] = mapped_column(String(30), default="open")
+    notes: Mapped[str] = mapped_column(Text, default="")
+    enrichment: Mapped[dict | None] = mapped_column(JSON, default=None)
     created_at: Mapped[datetime] = created_column()
 
     run: Mapped[Run] = relationship(back_populates="findings")

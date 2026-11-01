@@ -61,6 +61,16 @@ class EngagementState(TypedDict, total=False):
     coverage_gaps: Annotated[list[str], operator.add]
     error_refs: Annotated[list[str], operator.add]
 
+    # Intake pre-flight results — carried forward so downstream nodes can read them.
+    intake_reachable: bool
+    intake_auth_status: str  # "ok" | "failed" | "no_credentials"
+    intake_login_url: str    # login URL used (if any)
+
+    # Wildcard engagement: live subdomains discovered during recon (subdomain enum +
+    # HTTP liveness probe). The scan/webvuln phases iterate over these instead of just
+    # scope.target. Empty for non-wildcard engagements.
+    discovered_hosts: Annotated[list[str], _merge_unique]
+
     cancellation_requested: bool
     report_ref: str | None
     # Drafted narrative carried between the remediate and report nodes (bounded summaries,

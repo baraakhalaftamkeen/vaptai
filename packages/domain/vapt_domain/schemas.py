@@ -87,7 +87,16 @@ class EngagementCreate(BaseModel):
     name: str = Field(min_length=1, max_length=200)
     testing_mode: TestingMode
     target_type: TargetType
+    target_description: str | None = Field(None, max_length=2000)
     scope: ScopeInput
+
+
+class EngagementUpdate(BaseModel):
+    name: str | None = Field(None, min_length=1, max_length=200)
+    target_description: str | None = None
+    testing_mode: TestingMode | None = None
+    target_type: TargetType | None = None
+    scope: ScopeInput | None = None
 
 
 class EngagementOut(BaseModel):
@@ -96,6 +105,7 @@ class EngagementOut(BaseModel):
     name: str
     testing_mode: TestingMode
     target_type: TargetType
+    target_description: str | None = None
     scope_version: int
     created_at: datetime
 
@@ -140,6 +150,8 @@ class RunCreate(BaseModel):
 class RunOut(BaseModel):
     id: UUID
     engagement_id: UUID
+    engagement_name: str = ""
+    testing_mode: str = ""
     status: RunStatus
     phase: str | None = None
     retest_of: UUID | None = None

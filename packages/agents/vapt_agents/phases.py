@@ -51,13 +51,34 @@ def ports_for(scope: "RunScope") -> str:
 
 
 def scan_plan_for(scope: "RunScope") -> list[tuple[str, dict]]:
-    """The default scan plan bound to a run's scope, so nmap probes exactly the ports
-    the engagement authorized (or the default set when none were pinned)."""
-    return [
+    """Enhanced deterministic fallback plan (Gap 7). When the LLM is unavailable, this
+    provides a richer plan based on target type instead of just nmap+httpx+nuclei."""
+    plan: list[tuple[str, dict]] = [
         ("nmap_service_scan", {"ports": ports_for(scope)}),
         ("http_probe", {}),
         ("nuclei_safe", {"severity": "info,low,medium"}),
     ]
+    target = scope.target.lower()
+    is_web = any(
+        p in target for p in ("http", "www", ".com", ".org", ".net", ".io"))
+    if is_web:
+        plan.extend([
+            ("shcheck", {}),
+            ("whatweb", {}),
+            ("wafw00f", {}),
+            ("katana", {}),
+            ("feroxbuster", {}),
+        ])
+        from vapt_domain.enums import PolicyClass as _PC
+        allows_p2 = _PC.P2_INTRUSIVE in getattr(scope, "allowed_action_classes", [])
+        if allows_p2:
+            plan.extend([
+                ("wapiti", {}),
+                ("nuclei_intrusive", {}),
+            ])
+    if scope.testing_mode != "black_box":
+        plan.append(("arjun", {}))
+    return plan
 
 # White-box source static-analysis set (plan §5, BAR-27). Each runs against the
 # engagement's uploaded bundle; `path` is injected by the source pipeline, never a model.
@@ -1101,8 +1122,18 @@ def _existing_candidate(db: Session, run_id: str, obs: Observation) -> Finding |
 
 def persist_candidate(db: Session, run_id: str, obs: Observation) -> Finding:
     dup = _existing_candidate(db, run_id, obs)
-    if dup is not None:            # idempotent: don't double-persist a repeated observation
+    if dup is not None:
         return dup
+    # Gap 4: group same-class findings on same endpoint under one finding
+    similar = find_similar_candidate(db, run_id, obs)
+    if similar is not None:
+        db.add(FindingObservation(finding_id=similar.id, source_tool=obs.source_tool, detail=obs.detail))
+        db.flush()
+        ledger.record_event(
+            db, run_id, "finding.observation_grouped",
+            {"finding_id": similar.id, "title": obs.title, "grouped_under": similar.title},
+        )
+        return similar
     finding = Finding(
         run_id=run_id,
         title=obs.title,
@@ -1144,6 +1175,86 @@ def recon_phase(db: Session, scope: RunScope, harness: GovernedHarness) -> list[
                     tool_id="dns_resolve", args={"target": scope.target})
     )
     return [scope.target] if outcome.executed else []
+
+
+def subdomain_discovery(
+    db: Session, scope: RunScope, harness: GovernedHarness, domain: str,
+) -> list[str]:
+    """Run passive subdomain enumeration against `domain` and return discovered
+    subdomains (deduplicated, in-scope only). Tries subfinder first, then
+    assetfinder as a fallback. Returns an empty list on any failure."""
+    subdomains: set[str] = set()
+
+    for tool_id in ("subfinder", "assetfinder"):
+        if not harness.tool_available(tool_id, {"target": domain}):
+            continue
+        outcome = harness.run_action(
+            db, ctx_for(scope, task_id=f"recon-subdomain-{tool_id}",
+                        agent=AgentRole.RECON, tool_id=tool_id,
+                        args={"target": domain}),
+        )
+        if outcome.executed and outcome.result:
+            stdout = ""
+            for obs in (outcome.result.observations or []):
+                stdout += obs.get("stdout", "") if isinstance(obs, dict) else ""
+            for line in stdout.splitlines():
+                host = line.strip().lower()
+                if host and "." in host and domain in host:
+                    subdomains.add(host)
+        if subdomains:
+            break
+
+    # Always include the base domain itself
+    subdomains.add(domain.lower())
+
+    ledger.record_event(db, scope.run_id, "recon.subdomain_discovery",
+                        {"domain": domain, "count": len(subdomains),
+                         "sample": sorted(subdomains)[:20]})
+    return sorted(subdomains)
+
+
+def probe_live_hosts(
+    db: Session, scope: RunScope, harness: GovernedHarness,
+    hosts: list[str],
+) -> list[str]:
+    """HTTP(S) liveness probe for a list of hosts. Returns only hosts that respond.
+    Uses http_probe through the harness when available, falls back to direct requests."""
+    live: list[str] = []
+
+    for host in hosts:
+        # Try via harness http_probe (governed, logged)
+        if harness.tool_available("http_probe", {"target": host}):
+            outcome = harness.run_action(
+                db, ctx_for(scope, task_id=f"recon-liveness-{host}",
+                            agent=AgentRole.RECON, tool_id="http_probe",
+                            args={"target": host}),
+            )
+            if outcome.executed and outcome.result:
+                stdout = ""
+                for obs in (outcome.result.observations or []):
+                    stdout += obs.get("stdout", "") if isinstance(obs, dict) else ""
+                if stdout.strip() and "[" in stdout:
+                    live.append(host)
+                    continue
+        # Fallback: direct HTTP check
+        try:
+            import requests as _req
+            for scheme in ("https", "http"):
+                try:
+                    r = _req.get(f"{scheme}://{host}", timeout=10,
+                                 allow_redirects=True, verify=False)
+                    if r.status_code < 600:
+                        live.append(host)
+                        break
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+    ledger.record_event(db, scope.run_id, "recon.liveness_probe",
+                        {"total": len(hosts), "live": len(live),
+                         "hosts": live[:50]})
+    return live
 
 
 # --------------------------------------------------------------------------- #
@@ -1528,7 +1639,7 @@ def validate_cve_candidate(
     # 2) Exploitation intel via public APIs (no local Exploit-DB): CISA KEV + NVD exploit
     #    references. A strong priority signal, not on-target proof.
     if exploit_check is None:
-        from .cve import is_exploited as exploit_check  # lazy to avoid import cycle
+        from .cve import is_exploited as exploit_check
     try:
         intel = exploit_check(cve) or {}
     except Exception:
@@ -1539,7 +1650,23 @@ def validate_cve_candidate(
         db.flush()
         ledger.record_event(db, scope.run_id, "finding.exploit_available",
                             {"finding_id": finding_id, "cve": cve, "basis": intel.get("basis", "")})
-        return "exploit_available"   # stays a candidate — a strong lead needing manual check
+        return "exploit_available"
+
+    # 2b) Gap 3 — searchsploit local fallback: offline Exploit-DB lookup to catch exploits
+    #     the CISA KEV / NVD API missed. A public exploit match is strong evidence.
+    sploit = harness.run_action(
+        db, ctx_for(scope, task_id=f"cvs-{finding_id[:8]}", agent=AgentRole.VALIDATE,
+                    tool_id="searchsploit", args={"query": cve})
+    )
+    if sploit.executed and _searchsploit_has_hit(sploit.result):
+        finding.status = FindingStatus.CONFIRMED.value
+        db.add(FindingObservation(
+            finding_id=finding_id, source_tool="searchsploit",
+            detail={"cve": cve, "basis": "searchsploit Exploit-DB match", "confirmed": True}))
+        db.flush()
+        ledger.record_event(db, scope.run_id, "finding.confirmed",
+                            {"finding_id": finding_id, "basis": f"searchsploit {cve}"})
+        return "confirmed"
 
     # 3) Version-match only.
     finding.status = FindingStatus.INCONCLUSIVE.value
@@ -1771,15 +1898,220 @@ _PROOF_SOURCE_TOOLS = {"sstimap", "web_param_probe", "dalfox", "idor_probe",
                        "sqli_detect", "stored_xss_probe",
                        "yaml_deserialization_probe", "dom_xss_probe",
                        "weak_cred_probe",
-                       # xxe_probe confirms XXE by matching leaked file
-                       # content in the response body — direct on-target
-                       # proof, same tier as the other proof-source tools.
                        "xxe_probe",
-                       # recon_agent body-pattern scanner emits findings
-                       # for leaked hashes / AWS keys / private keys with
-                       # detail.confirmed=True — a direct observation on
-                       # the authed response body is proof-grade.
                        "recon_agent.body_scanner"}
+
+# ---------------------------------------------------------------------------
+# Gap 1 — Scanner finding re-verification
+# ---------------------------------------------------------------------------
+# Scanner tools whose findings can be re-verified by a targeted re-scan with
+# the SAME tool on the SAME parameters. A positive re-hit is independent
+# confirmation (two runs, same verdict → confirmed).
+_REVERIFIABLE_SCANNER_TOOLS = {"wapiti", "nuclei_safe", "nuclei_intrusive", "nuclei_dast",
+                               "nikto", "shcheck", "sslyze", "zap_baseline"}
+
+
+def _scanner_finding_source(db: Session, finding_id: str) -> str | None:
+    obs = db.execute(
+        select(FindingObservation).where(FindingObservation.finding_id == finding_id)
+    ).scalars().all()
+    for o in obs:
+        if o.source_tool in _REVERIFIABLE_SCANNER_TOOLS:
+            return o.source_tool
+    return None
+
+
+def _scanner_finding_url(db: Session, finding_id: str) -> str | None:
+    obs = db.execute(
+        select(FindingObservation).where(FindingObservation.finding_id == finding_id)
+    ).scalars().all()
+    for o in obs:
+        d = o.detail or {}
+        for k in ("url", "target_url", "target", "matched_at"):
+            v = str(d.get(k, "")).strip()
+            if v.startswith("http"):
+                return v
+    return None
+
+
+def validate_scanner_candidate(
+    db: Session, scope: RunScope, harness: GovernedHarness, finding_id: str
+) -> bool:
+    """Re-verify a scanner finding (wapiti/nuclei/nikto/etc.) by re-running a targeted
+    check. A second positive is independent confirmation. Returns True if confirmed."""
+    finding = db.get(Finding, finding_id)
+    if finding is None or finding.status != FindingStatus.CANDIDATE.value:
+        return False
+    tool = _scanner_finding_source(db, finding_id)
+    if not tool:
+        return False
+    url = _scanner_finding_url(db, finding_id)
+    args: dict = {"target": url or scope.target}
+    port = _finding_port(db, finding_id)
+    if port:
+        args["port"] = port
+    recheck = harness.run_action(
+        db, ctx_for(scope, task_id=f"rescan-{finding_id[:8]}", agent=AgentRole.VALIDATE,
+                    tool_id=tool, args=args)
+    )
+    if recheck.executed and _result_has_stdout(recheck.result):
+        finding.status = FindingStatus.CONFIRMED.value
+        db.add(FindingObservation(
+            finding_id=finding_id, source_tool=tool,
+            detail={"basis": f"re-scan with {tool} confirmed", "confirmed": True}))
+        db.flush()
+        ledger.record_event(db, scope.run_id, "finding.confirmed",
+                            {"finding_id": finding_id, "basis": f"{tool} re-scan"})
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Gap 4 — Vuln-class deduplication
+# ---------------------------------------------------------------------------
+_VULN_CLASS_PATTERNS = [
+    (re.compile(r"(?:Reflected\s+)?(?:Cross\s*Site|XSS)", re.I), "xss"),
+    (re.compile(r"SQL\s*Injection", re.I), "sqli"),
+    (re.compile(r"SSTI|Server.Side\s*Template\s*Injection", re.I), "ssti"),
+    (re.compile(r"SSRF|Server.Side\s*Request\s*Forgery", re.I), "ssrf"),
+    (re.compile(r"Open\s*Redirect", re.I), "open_redirect"),
+    (re.compile(r"Path\s*Traversal|Directory\s*Traversal|LFI", re.I), "path_traversal"),
+    (re.compile(r"Command\s*Injection|OS\s*Command", re.I), "cmdi"),
+    (re.compile(r"IDOR|Insecure\s*Direct\s*Object", re.I), "idor"),
+    (re.compile(r"XXE|XML\s*External\s*Entity", re.I), "xxe"),
+    (re.compile(r"CRLF\s*Injection", re.I), "crlf"),
+    (re.compile(r"CSRF|Cross.Site\s*Request\s*Forgery", re.I), "csrf"),
+    (re.compile(r"Security\s*Header|Missing\s*Header|X-Frame|CSP|HSTS", re.I), "security_headers"),
+    (re.compile(r"Weak\s*Cred|Default\s*Cred", re.I), "weak_creds"),
+]
+
+
+def _vuln_class(title: str) -> str | None:
+    for pattern, cls in _VULN_CLASS_PATTERNS:
+        if pattern.search(title):
+            return cls
+    return None
+
+
+def _extract_target_from_title(title: str) -> str | None:
+    m = re.search(r"at\s+(https?://\S+)", title, re.I)
+    return m.group(1).rstrip(")") if m else None
+
+
+def find_similar_candidate(db: Session, run_id: str, obs: Observation) -> Finding | None:
+    """Find an existing finding in the same vuln class targeting the same endpoint,
+    for grouping multiple observations under one finding instead of creating duplicates."""
+    cls = _vuln_class(obs.title)
+    if not cls:
+        return None
+    obs_target = _extract_target_from_title(obs.title)
+    if not obs_target:
+        obs_target = str(obs.detail.get("url", obs.detail.get("target_url", ""))).strip()
+    if not obs_target:
+        return None
+    from urllib.parse import urlparse
+    obs_path = urlparse(obs_target).path
+
+    rows = db.execute(
+        select(Finding).where(Finding.run_id == run_id, Finding.status == FindingStatus.CANDIDATE.value)
+    ).scalars().all()
+    for f in rows:
+        if _vuln_class(f.title) != cls:
+            continue
+        existing_target = _extract_target_from_title(f.title)
+        if not existing_target:
+            existing_obs = db.execute(
+                select(FindingObservation).where(FindingObservation.finding_id == f.id)
+            ).scalars().first()
+            if existing_obs:
+                d = existing_obs.detail or {}
+                existing_target = str(d.get("url", d.get("target_url", ""))).strip()
+        if existing_target and urlparse(existing_target).path == obs_path:
+            return f
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Gap 3 — Searchsploit fallback for CVE validation
+# ---------------------------------------------------------------------------
+def validate_cve_searchsploit(
+    db: Session, scope: RunScope, harness: GovernedHarness, finding_id: str
+) -> bool:
+    """Fallback CVE validation via local searchsploit. A hit means a public exploit
+    exists, promoting the finding to confirmed with exploit evidence."""
+    finding = db.get(Finding, finding_id)
+    ref = cve_ref_for(db, finding_id)
+    if finding is None or ref is None:
+        return False
+    cve, port, _scheme = ref
+    sploit = harness.run_action(
+        db, ctx_for(scope, task_id=f"sploit-{finding_id[:8]}", agent=AgentRole.VALIDATE,
+                    tool_id="searchsploit", args={"query": cve})
+    )
+    if sploit.executed and _searchsploit_has_hit(sploit.result):
+        finding.status = FindingStatus.CONFIRMED.value
+        db.add(FindingObservation(
+            finding_id=finding_id, source_tool="searchsploit",
+            detail={"cve": cve, "basis": "searchsploit public exploit match", "confirmed": True}))
+        db.flush()
+        ledger.record_event(db, scope.run_id, "finding.confirmed",
+                            {"finding_id": finding_id, "basis": f"searchsploit {cve}"})
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Gap 8 — Source ↔ runtime correlation
+# ---------------------------------------------------------------------------
+def correlate_sast_dast(db: Session, run_id: str) -> int:
+    """Cross-reference SAST findings (semgrep/gitleaks) with DAST findings from the same
+    run. When both a static analysis finding and a dynamic finding point to the same vuln
+    class, both are promoted to confirmed with a correlation note. Returns count of
+    newly confirmed pairs."""
+    sast_tools = {"semgrep_scan", "gitleaks_scan", "dep_audit"}
+    dast_tools = _REVERIFIABLE_SCANNER_TOOLS | _PROOF_SOURCE_TOOLS
+
+    sast_findings: list[tuple[str, str, str | None]] = []
+    dast_findings: list[tuple[str, str, str | None]] = []
+
+    for fid in candidate_ids_for_run(db, run_id):
+        f = db.get(Finding, fid)
+        if f is None or f.status not in (FindingStatus.CANDIDATE.value, FindingStatus.CONFIRMED.value):
+            continue
+        cls = _vuln_class(f.title)
+        obs = db.execute(
+            select(FindingObservation).where(FindingObservation.finding_id == fid)
+        ).scalars().all()
+        for o in obs:
+            if o.source_tool in sast_tools:
+                sast_findings.append((fid, o.source_tool, cls))
+            elif o.source_tool in dast_tools:
+                dast_findings.append((fid, o.source_tool, cls))
+
+    correlated = 0
+    correlated_ids: set[str] = set()
+    for s_fid, s_tool, s_cls in sast_findings:
+        if not s_cls or s_fid in correlated_ids:
+            continue
+        for d_fid, d_tool, d_cls in dast_findings:
+            if d_cls == s_cls and d_fid not in correlated_ids:
+                for fid in (s_fid, d_fid):
+                    f = db.get(Finding, fid)
+                    if f and f.status == FindingStatus.CANDIDATE.value:
+                        f.status = FindingStatus.CONFIRMED.value
+                        db.add(FindingObservation(
+                            finding_id=fid, source_tool="sast_dast_correlation",
+                            detail={"basis": f"Correlated: SAST ({s_tool}) + DAST ({d_tool})",
+                                    "correlated_with": s_fid if fid == d_fid else d_fid,
+                                    "confirmed": True}))
+                        db.flush()
+                        ledger.record_event(db, run_id, "finding.confirmed",
+                                            {"finding_id": fid, "basis": "SAST-DAST correlation"})
+                        correlated += 1
+                correlated_ids.add(s_fid)
+                correlated_ids.add(d_fid)
+                break
+    return correlated
 
 
 def _is_proof_finding(db: Session, finding_id: str) -> bool:

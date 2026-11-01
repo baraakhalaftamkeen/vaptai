@@ -6,7 +6,9 @@ and rotate the bootstrap password immediately.
 """
 from __future__ import annotations
 
-from sqlalchemy import select
+import logging
+
+from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 from vapt_domain.enums import Role
 from vapt_persistence import Base, get_engine
@@ -15,9 +17,36 @@ from vapt_persistence.models import Membership, Project, User
 from .config import get_settings
 from .security import hash_password
 
+log = logging.getLogger(__name__)
+
+_COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
+    ("findings", "target_url", "VARCHAR(1000) NOT NULL DEFAULT ''"),
+    ("findings", "resolution_status", "VARCHAR(30) NOT NULL DEFAULT 'open'"),
+    ("findings", "notes", "TEXT NOT NULL DEFAULT ''"),
+    ("findings", "enrichment", "JSON DEFAULT NULL"),
+]
+
+
+def _add_missing_columns(engine) -> None:
+    with engine.connect() as conn:
+        for table, column, col_def in _COLUMN_MIGRATIONS:
+            try:
+                conn.execute(text(f"SELECT `{column}` FROM `{table}` LIMIT 0"))
+            except Exception:
+                try:
+                    conn.execute(text(
+                        f"ALTER TABLE `{table}` ADD COLUMN `{column}` {col_def}"
+                    ))
+                    conn.commit()
+                    log.info("added column %s.%s", table, column)
+                except Exception as exc:
+                    log.warning("could not add column %s.%s: %s", table, column, exc)
+
 
 def create_all_dev() -> None:
-    Base.metadata.create_all(bind=get_engine())
+    engine = get_engine()
+    Base.metadata.create_all(bind=engine)
+    _add_missing_columns(engine)
 
 
 def seed_admin(db: Session) -> None:

@@ -130,7 +130,7 @@ export default function ApprovalsPage() {
                   <dl className="grid grid-cols-[72px_1fr] gap-x-3 gap-y-1 text-xs">
                     <dt className="text-ink-3">Run</dt>
                     <dd>
-                      <Link href={`/runs/${a.run_id}`} className="mono text-accent hover:underline">
+                      <Link href={`/runs/${a.run_id}`} className="mono text-primary hover:underline">
                         {a.run_id.slice(0, 8)}
                       </Link>
                     </dd>
@@ -170,7 +170,7 @@ export default function ApprovalsPage() {
                   </div>
                   <div className="flex flex-wrap gap-2 mb-2">
                     <input
-                      className="flex-1 min-w-[8rem] h-7 px-2 rounded bg-surface border border-line text-xs text-ink placeholder:text-ink-3 outline-none focus:border-accent-deep"
+                      className="flex-1 min-w-[8rem] h-7 px-2 rounded bg-surface border border-line text-xs text-ink placeholder:text-ink-3 outline-none focus:border-primary"
                       placeholder="admin username"
                       autoComplete="off"
                       disabled={busy === a.id}
@@ -178,7 +178,7 @@ export default function ApprovalsPage() {
                       onChange={(e) => setCred(a.id, "u", e.target.value)}
                     />
                     <input
-                      className="flex-1 min-w-[8rem] h-7 px-2 rounded bg-surface border border-line text-xs text-ink placeholder:text-ink-3 outline-none focus:border-accent-deep"
+                      className="flex-1 min-w-[8rem] h-7 px-2 rounded bg-surface border border-line text-xs text-ink placeholder:text-ink-3 outline-none focus:border-primary"
                       type="password"
                       placeholder="admin password"
                       autoComplete="new-password"
@@ -213,7 +213,7 @@ export default function ApprovalsPage() {
                         </div>
                         <div className="flex flex-wrap gap-2">
                           <input
-                            className="flex-1 min-w-[8rem] h-7 px-2 rounded bg-surface border border-line text-xs text-ink placeholder:text-ink-3 outline-none focus:border-accent-deep"
+                            className="flex-1 min-w-[8rem] h-7 px-2 rounded bg-surface border border-line text-xs text-ink placeholder:text-ink-3 outline-none focus:border-primary"
                             placeholder="user 1 username"
                             autoComplete="off"
                             disabled={busy === a.id}
@@ -221,7 +221,7 @@ export default function ApprovalsPage() {
                             onChange={(e) => setCred(a.id, "ub", e.target.value)}
                           />
                           <input
-                            className="flex-1 min-w-[8rem] h-7 px-2 rounded bg-surface border border-line text-xs text-ink placeholder:text-ink-3 outline-none focus:border-accent-deep"
+                            className="flex-1 min-w-[8rem] h-7 px-2 rounded bg-surface border border-line text-xs text-ink placeholder:text-ink-3 outline-none focus:border-primary"
                             type="password"
                             placeholder="user 1 password"
                             autoComplete="new-password"
@@ -240,7 +240,7 @@ export default function ApprovalsPage() {
                         </div>
                         <div className="flex flex-wrap gap-2">
                           <input
-                            className="flex-1 min-w-[8rem] h-7 px-2 rounded bg-surface border border-line text-xs text-ink placeholder:text-ink-3 outline-none focus:border-accent-deep"
+                            className="flex-1 min-w-[8rem] h-7 px-2 rounded bg-surface border border-line text-xs text-ink placeholder:text-ink-3 outline-none focus:border-primary"
                             placeholder="user 2 username"
                             autoComplete="off"
                             disabled={busy === a.id || !(creds[a.id]?.ub && creds[a.id]?.pb)}
@@ -248,7 +248,7 @@ export default function ApprovalsPage() {
                             onChange={(e) => setCred(a.id, "uc", e.target.value)}
                           />
                           <input
-                            className="flex-1 min-w-[8rem] h-7 px-2 rounded bg-surface border border-line text-xs text-ink placeholder:text-ink-3 outline-none focus:border-accent-deep"
+                            className="flex-1 min-w-[8rem] h-7 px-2 rounded bg-surface border border-line text-xs text-ink placeholder:text-ink-3 outline-none focus:border-primary"
                             type="password"
                             placeholder="user 2 password"
                             autoComplete="new-password"

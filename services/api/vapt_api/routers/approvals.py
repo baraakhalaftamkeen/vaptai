@@ -14,7 +14,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.orm import Session
-from vapt_domain.enums import ApprovalState, PolicyClass, Role, RunStatus
+from vapt_domain.enums import ApprovalState, PolicyClass, Role, RunStatus, TestingMode
 from vapt_domain.schemas import ApprovalOut
 from vapt_persistence import ledger, web_credentials
 from vapt_persistence.models import Approval, Engagement, Outbox, Run, ToolActionRecord
@@ -79,7 +79,10 @@ def _enrich(db: Session, appr: Approval) -> ApprovalOut:
     # slot we don't surface `needs_web_credentials`, so the dock just shows a normal approval
     # instead of re-asking for a password.
     if rec.tool_id == "wapiti" and args.get("login_url"):
-        if web_credentials.get_web_credentials(appr.run_id) is None:
+        run = db.get(Run, appr.run_id)
+        eng = db.get(Engagement, run.engagement_id) if run else None
+        is_black_box = eng and eng.testing_mode == TestingMode.BLACK_BOX.value
+        if not is_black_box and web_credentials.get_web_credentials(appr.run_id) is None:
             out.needs_web_credentials = True
             out.login_url = str(args["login_url"])
     return out
@@ -250,6 +253,11 @@ def submit_web_credentials(
     if not (rec and rec.tool_id == "wapiti" and login_url):
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
                             "approval is not an authenticated web scan")
+    run = db.get(Run, appr.run_id)
+    eng = db.get(Engagement, run.engagement_id) if run else None
+    if eng and eng.testing_mode == TestingMode.BLACK_BOX.value:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            "black-box engagement does not accept web credentials")
 
     try:
         web_credentials.set_web_credentials(appr.run_id, body.username, body.password)

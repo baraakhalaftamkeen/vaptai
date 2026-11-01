@@ -12,7 +12,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.orm import Session
-from vapt_domain.enums import Role, RunStatus
+from vapt_domain.enums import Role, RunStatus, TestingMode
 from vapt_domain.schemas import RunCreate, RunOut
 from vapt_persistence.models import Approval, Engagement, Outbox, Run, RunEvent
 
@@ -62,7 +62,8 @@ def create_run(
     creds_stashed = False
     creds_b_stashed = False
     creds_c_stashed = False
-    if body.web_username and body.web_password:
+    is_black_box = eng.testing_mode == TestingMode.BLACK_BOX.value
+    if not is_black_box and body.web_username and body.web_password:
         try:
             from vapt_persistence import web_credentials
             web_credentials.set_web_credentials(
@@ -104,14 +105,16 @@ def create_run(
 def list_runs(
     db: Session = Depends(get_db),
     user: CurrentUser = Depends(get_current_user),
-) -> list[Run]:
-    # Scope to runs whose engagement is in a project the user can read.
+) -> list[RunOut]:
     runs = db.execute(select(Run)).scalars().all()
-    visible = []
+    visible: list[RunOut] = []
     for r in runs:
         eng = db.get(Engagement, r.engagement_id)
         if eng and user.role_in(eng.project_id):
-            visible.append(r)
+            out = RunOut.model_validate(r)
+            out.engagement_name = eng.name
+            out.testing_mode = eng.testing_mode
+            visible.append(out)
     return visible
 
 
@@ -120,13 +123,225 @@ def get_run(
     run_id: str,
     db: Session = Depends(get_db),
     user: CurrentUser = Depends(get_current_user),
-) -> Run:
+) -> RunOut:
     run = db.get(Run, run_id)
     if run is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "run not found")
     eng = db.get(Engagement, run.engagement_id)
     require_project_role(eng.project_id, user, Role.VIEWER, Role.ANALYST, Role.LEAD, Role.REVIEWER)
-    return run
+    out = RunOut.model_validate(run)
+    out.engagement_name = eng.name
+    out.testing_mode = eng.testing_mode
+    return out
+
+
+class DiscoveryOut(BaseModel):
+    subdomains: list[str]
+    live_targets: list[str]
+    urls: list[str]
+    parameters: list[dict]
+    forms: list[dict]
+    technologies: list[str]
+
+
+def _safe_list(val: object) -> list:
+    return val if isinstance(val, list) else []
+
+
+def _add_url(urls: set[str], raw: object) -> None:
+    if isinstance(raw, str) and raw.startswith("http"):
+        urls.add(raw)
+
+
+@router.get("/{run_id}/discovery", response_model=DiscoveryOut)
+def run_discovery(
+    run_id: str,
+    db: Session = Depends(get_db),
+    user: CurrentUser = Depends(get_current_user),
+) -> DiscoveryOut:
+    """Extract discovery data (subdomains, URLs, params, forms) from run events."""
+    run = db.get(Run, run_id)
+    if run is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "run not found")
+    eng = db.get(Engagement, run.engagement_id)
+    require_project_role(eng.project_id, user, Role.VIEWER, Role.ANALYST, Role.LEAD, Role.REVIEWER)
+
+    events = db.execute(
+        select(RunEvent).where(RunEvent.run_id == run_id).order_by(RunEvent.seq)
+    ).scalars().all()
+
+    subdomains: set[str] = set()
+    live_targets: set[str] = set()
+    urls: set[str] = set()
+    parameters: list[dict] = []
+    param_seen: set[str] = set()
+    forms: list[dict] = []
+    technologies: set[str] = set()
+
+    for e in events:
+        p = e.payload or {}
+        kind = e.kind
+
+        # ── phase events ──
+        if kind == "phase.scan":
+            for h in _safe_list(p.get("discovered")):
+                if h:
+                    live_targets.add(str(h))
+
+        # ── action.proposed — richest source of target URLs ──
+        if kind == "action.proposed":
+            args = p.get("args", {}) if isinstance(p.get("args"), dict) else {}
+            _add_url(urls, args.get("url"))
+            _add_url(urls, args.get("target"))
+            target = p.get("target", "")
+            if target:
+                live_targets.add(str(target))
+
+        # ── action.executed / action.executing ──
+        if kind in ("action.executed", "action.executing"):
+            tool = p.get("tool", "")
+            args = p.get("args", {}) if isinstance(p.get("args"), dict) else {}
+            result = p.get("result", {}) if isinstance(p.get("result"), dict) else {}
+            target = p.get("target", "")
+            if target:
+                live_targets.add(str(target))
+            _add_url(urls, args.get("url"))
+            _add_url(urls, args.get("target"))
+
+            if tool in ("subfinder", "sublist3r"):
+                for s in _safe_list(result.get("subdomains")):
+                    subdomains.add(str(s))
+
+            if tool == "nmap":
+                t = args.get("target", "")
+                if t:
+                    live_targets.add(t)
+                for svc in _safe_list(result.get("services")):
+                    if isinstance(svc, dict):
+                        product = svc.get("product", "")
+                        if product:
+                            technologies.add(f"{product} {svc.get('version', '')}".strip())
+
+            if tool in ("katana", "gospider"):
+                for u in _safe_list(result.get("urls")):
+                    urls.add(str(u))
+                for u in (args.get("urls") or "").split(","):
+                    if u.strip():
+                        urls.add(u.strip())
+
+            if tool in ("arjun", "web_param_probe"):
+                found = _safe_list(result.get("parameters") or result.get("params"))
+                target_url = args.get("url", "") or args.get("target", "")
+                for param in found:
+                    key = f"{target_url}:{param}" if isinstance(param, str) else str(param)
+                    if key not in param_seen:
+                        param_seen.add(key)
+                        parameters.append({"url": target_url, "param": param})
+
+            if tool == "wapiti":
+                for u in _safe_list(result.get("crawled_urls")):
+                    urls.add(str(u))
+
+        # ── webvuln.param_spray — discovered parameters ──
+        if kind == "webvuln.param_spray":
+            for hit in _safe_list(p.get("hits")):
+                if isinstance(hit, dict):
+                    hit_url = hit.get("url", "")
+                    param = hit.get("param", "")
+                    _add_url(urls, hit_url)
+                    if param:
+                        key = f"{hit_url}:{param}"
+                        if key not in param_seen:
+                            param_seen.add(key)
+                            parameters.append({"url": hit_url, "param": param, "source": "param_spray"})
+
+        # ── webvuln.form_map — form inventory + summary parsing ──
+        if kind == "webvuln.form_map":
+            fm = p.get("forms") or p.get("form_map") or []
+            if isinstance(fm, list):
+                for f in fm:
+                    if isinstance(f, dict):
+                        forms.append(f)
+                        _add_url(urls, f.get("action") or f.get("url"))
+            summary = p.get("summary", "")
+            if isinstance(summary, str):
+                for part in summary.split("\n"):
+                    token = part.strip().split(" ")[0] if part.strip() else ""
+                    _add_url(urls, token)
+
+        # ── webvuln.authed_crawl — authenticated discovery ──
+        if kind == "webvuln.authed_crawl":
+            for u in _safe_list(p.get("sample")):
+                _add_url(urls, u)
+
+        # ── webvuln.js_endpoint_mining — JS-mined endpoints ──
+        if kind == "webvuln.js_endpoint_mining":
+            for u in _safe_list(p.get("sample")):
+                _add_url(urls, u)
+            for u in _safe_list(p.get("spec_endpoints_found")):
+                _add_url(urls, u)
+
+        # ── webvuln.admin_prehead — alive admin/sensitive paths ──
+        if kind == "webvuln.admin_prehead":
+            for u in _safe_list(p.get("alive_sample")):
+                _add_url(urls, u)
+
+        # ── webvuln.admin_wordlist_probe — dispatched probes ──
+        if kind == "webvuln.admin_wordlist_probe":
+            for item in _safe_list(p.get("sample")):
+                if isinstance(item, dict):
+                    _add_url(urls, item.get("url"))
+
+        # ── probe.arjun_targeting — parameter-probe candidates ──
+        if kind == "probe.arjun_targeting":
+            for u in _safe_list(p.get("sample")):
+                _add_url(urls, u)
+
+        # ── scan.auto_filled_urls ──
+        if kind == "scan.auto_filled_urls":
+            for u in _safe_list(p.get("sample")):
+                _add_url(urls, u)
+
+        # ── webvuln.recon_agent.fetch — recon agent probes ──
+        if kind == "webvuln.recon_agent.fetch":
+            _add_url(urls, p.get("url"))
+
+        # ── webvuln.recon_agent.body_findings ──
+        if kind == "webvuln.recon_agent.body_findings":
+            _add_url(urls, p.get("url"))
+
+        # ── webvuln.authenticated — login URL ──
+        if kind in ("webvuln.authenticated", "webvuln.authenticated_b", "webvuln.authenticated_c"):
+            _add_url(urls, p.get("login_url"))
+
+        # ── webvuln.llm_plan — LLM-discovered endpoints ──
+        if kind == "webvuln.llm_plan":
+            prompt = p.get("prompt_user", "")
+            if isinstance(prompt, str):
+                for token in prompt.split():
+                    if token.startswith("http://") or token.startswith("https://"):
+                        urls.add(token.rstrip(",").rstrip(")"))
+
+        # ── subdomain / recon events ──
+        if "subdomain" in kind.lower() or kind.startswith("recon."):
+            for s in _safe_list(p.get("subdomains")):
+                subdomains.add(str(s))
+            for s in _safe_list(p.get("discovered")):
+                if isinstance(s, str):
+                    subdomains.add(s)
+                elif isinstance(s, dict):
+                    h = s.get("host") or s.get("subdomain", "")
+                    if h:
+                        subdomains.add(str(h))
+
+    return DiscoveryOut(
+        subdomains=sorted(subdomains),
+        live_targets=sorted(live_targets),
+        urls=sorted(urls),
+        parameters=parameters[:500],
+        forms=forms[:100],
+        technologies=sorted(technologies),
+    )
 
 
 @router.get("/{run_id}/events", response_model=list[RunEventOut])

@@ -104,7 +104,7 @@ def test_graph_pauses_for_approval_then_resumes(db):
         s.commit()
 
     assert out["phase"] == "report"
-    assert pauses == 3                              # nmap, http_probe, nuclei_safe each gated
+    assert pauses == 8                              # 3 base + 5 web P1 tools, all gated (unsigned)
     # Approved scan actions yielded candidate findings...
     assert s.query(Finding).count() > 0, "approved scan actions should yield candidates"
     # ...but in an UNSIGNED run the validate re-probe is itself P1 and also needs

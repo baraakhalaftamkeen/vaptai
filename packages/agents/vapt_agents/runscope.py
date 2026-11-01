@@ -30,3 +30,9 @@ class RunScope:
     # authenticated-scanner intel (None = none supplied). Tenable.sc live intel is separate
     # and gated on the VAPT_TENABLE_* env vars, not this field.
     nessus_path: str | None = None
+    # Wildcard engagement: *.example.com triggers subdomain discovery in recon; the base
+    # domain (example.com) is used as the primary target for enumeration. Discovered live
+    # subdomains are stored in discovered_hosts and the scan iterates over all of them.
+    target_description: str = ""
+    is_wildcard: bool = False
+    wildcard_base: str = ""

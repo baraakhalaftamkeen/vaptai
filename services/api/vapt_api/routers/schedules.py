@@ -22,6 +22,7 @@ router = APIRouter(prefix="/api/v2/engagements", tags=["schedules"])
 class ScheduleCreate(BaseModel):
     interval_minutes: int = Field(ge=5, le=525600)   # 5 min .. 1 year
     enabled: bool = True
+    start_at: datetime | None = None
 
 
 class ScheduleOut(BaseModel):
@@ -63,12 +64,15 @@ def create_schedule(
     eng = _engagement(db, engagement_id)
     require_project_role(eng.project_id, user, Role.ANALYST, Role.LEAD)
     now = datetime.now(UTC)
+    start = body.start_at or (now + timedelta(minutes=body.interval_minutes))
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=UTC)
     sch = Schedule(
         engagement_id=engagement_id,
         cron=f"every {body.interval_minutes}m",
         interval_minutes=body.interval_minutes,
         enabled=body.enabled,
-        next_fire_at=now + timedelta(minutes=body.interval_minutes) if body.enabled else None,
+        next_fire_at=start if body.enabled else None,
     )
     db.add(sch)
     db.commit()

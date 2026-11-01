@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import delete as sa_delete, select
 from sqlalchemy.orm import Session
 from vapt_domain.enums import Role
 from vapt_persistence.models import Membership, User
@@ -19,6 +19,38 @@ router = APIRouter(prefix="/api/v2/users", tags=["users"])
 
 _ROLES = {r.value for r in Role}
 
+ALL_PERMISSIONS = [
+    "can_create_engagement",
+    "can_start_run",
+    "can_approve",
+    "can_edit_findings",
+    "can_manage_users",
+    "can_manage_tools",
+    "can_export",
+    "can_view_cves",
+]
+
+ROLE_DEFAULTS: dict[str, dict[str, bool]] = {
+    "admin":    {p: True for p in ALL_PERMISSIONS},
+    "lead":     {p: (p != "can_manage_users") for p in ALL_PERMISSIONS},
+    "analyst":  {p: p in ("can_create_engagement", "can_start_run", "can_edit_findings",
+                          "can_manage_tools", "can_view_cves") for p in ALL_PERMISSIONS},
+    "reviewer": {p: p in ("can_approve", "can_edit_findings", "can_view_cves",
+                          "can_export") for p in ALL_PERMISSIONS},
+    "viewer":   {p: p in ("can_view_cves",) for p in ALL_PERMISSIONS},
+}
+
+
+def _effective_permissions(role: str | None, stored: dict | None) -> dict[str, bool]:
+    base = ROLE_DEFAULTS.get(role or "", {p: False for p in ALL_PERMISSIONS})
+    if not stored:
+        return dict(base)
+    merged = dict(base)
+    for k in ALL_PERMISSIONS:
+        if k in stored:
+            merged[k] = bool(stored[k])
+    return merged
+
 
 class UserCreate(BaseModel):
     username: str = Field(min_length=3, max_length=100)
@@ -30,6 +62,7 @@ class UserCreate(BaseModel):
 class UserUpdate(BaseModel):
     role: str | None = None
     is_active: bool | None = None
+    permissions: dict[str, bool] | None = None
 
 
 class UserOut(BaseModel):
@@ -38,6 +71,7 @@ class UserOut(BaseModel):
     email: str | None
     is_active: bool
     role: str | None
+    permissions: dict[str, bool]
     created_at: str
 
 
@@ -55,9 +89,11 @@ def _role_for(db: Session, user_id: str, pid: str) -> str | None:
 
 
 def _out(db: Session, u: User, pid: str) -> UserOut:
+    role = _role_for(db, u.id, pid)
     return UserOut(
         id=u.id, username=u.username, email=u.email, is_active=u.is_active,
-        role=_role_for(db, u.id, pid), created_at=u.created_at.isoformat(),
+        role=role, permissions=_effective_permissions(role, u.permissions),
+        created_at=u.created_at.isoformat(),
     )
 
 
@@ -94,6 +130,19 @@ def create_user(
     return _out(db, u, pid)
 
 
+@router.get("/{user_id}", response_model=UserOut)
+def get_user(
+    user_id: str,
+    db: Session = Depends(get_db),
+    user: CurrentUser = Depends(get_current_user),
+) -> UserOut:
+    pid = _require_admin(db, user)
+    target = db.get(User, user_id)
+    if target is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "user not found")
+    return _out(db, target, pid)
+
+
 @router.patch("/{user_id}", response_model=UserOut)
 def update_user(
     user_id: str,
@@ -122,6 +171,30 @@ def update_user(
             m.role = body.role
     if body.is_active is not None:
         target.is_active = body.is_active
+    if body.permissions is not None:
+        for k in body.permissions:
+            if k not in ALL_PERMISSIONS:
+                raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, f"unknown permission {k!r}")
+        target.permissions = body.permissions
     db.commit()
     db.refresh(target)
     return _out(db, target, pid)
+
+
+@router.delete("/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_user(
+    user_id: str,
+    db: Session = Depends(get_db),
+    user: CurrentUser = Depends(get_current_user),
+) -> None:
+    pid = _require_admin(db, user)
+    target = db.get(User, user_id)
+    if target is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "user not found")
+    if target.id == user.id:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "you cannot delete your own account")
+    from vapt_persistence.models import AuthSession
+    db.execute(sa_delete(Membership).where(Membership.user_id == user_id))
+    db.execute(sa_delete(AuthSession).where(AuthSession.user_id == user_id))
+    db.delete(target)
+    db.commit()

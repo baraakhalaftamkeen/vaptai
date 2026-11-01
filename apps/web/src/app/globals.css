@@ -1,42 +1,89 @@
-@import url("https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap");
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap");
 
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
-/*
-  VAPT-AI V2 — instrument-panel theme.
-  Organizing rule: COOL = system state (live, interactive, needs you).
-                   WARM = risk (the severity ramp, and nothing else).
-  Severity colors are a validated single-direction chroma ramp (0.03 -> 0.21) and are
-  never shown without their label — color never carries severity on its own.
-*/
 :root {
-  color-scheme: dark;
+  color-scheme: light;
 
   /* surfaces */
-  --bg: #0b1016;
-  --surface: #151d26;
-  --surface-2: #1c2733;
-  --line: #263341;
-  --line-strong: #35475a;
+  --bg: #f5f6f8;
+  --surface: #ffffff;
+  --surface-2: #f0f1f4;
+  --line: #e2e5ea;
+  --line-strong: #cdd2d9;
 
   /* ink */
-  --ink: #e4ebf2;
-  --ink-2: #9fb0c2;
-  --ink-3: #6b7c8f;
+  --ink: #282828;
+  --ink-2: #5a6270;
+  --ink-3: #8b929e;
 
-  /* system state (cool) */
-  --accent: #5ad2f4;
-  --accent-deep: #2b9fc4;
-  --ok: #4cc38a;
+  /* brand — Tamkeen */
+  --primary: #C10230;
+  --primary-hover: #a00228;
+  --accent: #F6A119;
+  --accent-deep: #d98a0e;
+  --ok: #1b9e6a;
 
   /* risk ramp (warm) — info -> critical */
-  --sev-info: #798898;
-  --sev-low: #b69065;
-  --sev-medium: #e39849;
-  --sev-high: #f17547;
-  --sev-critical: #f54651;
+  --sev-info: #7b8694;
+  --sev-low: #d4a031;
+  --sev-medium: #e38c30;
+  --sev-high: #e05a2b;
+  --sev-critical: #c10230;
+
+  /* sidebar */
+  --sidebar-bg: #1a1a2e;
+  --sidebar-ink: #c8ccd4;
+  --sidebar-ink-2: #8b90a0;
+  --sidebar-line: #2a2a44;
+  --sidebar-active: rgba(193, 2, 48, 0.12);
+
+  /* input fields */
+  --input-bg: #ffffff;
+
+  /* shadows */
+  --shadow-card: 0 1px 3px rgba(0,0,0,0.06), 0 1px 2px rgba(0,0,0,0.04);
+  --shadow-card-hover: 0 4px 12px rgba(0,0,0,0.08), 0 1px 3px rgba(0,0,0,0.06);
+}
+
+/* ── Dark mode ── */
+:root[data-theme="dark"] {
+  color-scheme: dark;
+
+  --bg: #0f1117;
+  --surface: #1a1d27;
+  --surface-2: #232632;
+  --line: #2e3240;
+  --line-strong: #3d4254;
+
+  --ink: #e4e6eb;
+  --ink-2: #a0a5b2;
+  --ink-3: #6b7280;
+
+  --primary: #e0244a;
+  --primary-hover: #c91e40;
+  --accent: #f6a119;
+  --accent-deep: #d98a0e;
+  --ok: #34d399;
+
+  --sev-info: #8b929e;
+  --sev-low: #eab547;
+  --sev-medium: #f0a050;
+  --sev-high: #f06848;
+  --sev-critical: #e0244a;
+
+  --sidebar-bg: #0b0d14;
+  --sidebar-ink: #c8ccd4;
+  --sidebar-ink-2: #6b7280;
+  --sidebar-line: #1e2030;
+  --sidebar-active: rgba(224, 36, 74, 0.15);
+
+  --input-bg: #232632;
+
+  --shadow-card: 0 1px 3px rgba(0,0,0,0.3), 0 1px 2px rgba(0,0,0,0.2);
+  --shadow-card-hover: 0 4px 12px rgba(0,0,0,0.4), 0 1px 3px rgba(0,0,0,0.3);
 }
 
 html,
@@ -46,13 +93,12 @@ body {
 }
 
 body {
-  font-family: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+  font-family: "Inter", ui-sans-serif, system-ui, sans-serif;
   font-size: 14px;
   line-height: 1.5;
   -webkit-font-smoothing: antialiased;
 }
 
-/* Data is data: tabular figures wherever numbers are compared. */
 .tnum {
   font-variant-numeric: tabular-nums;
 }
@@ -62,14 +108,12 @@ body {
   font-variant-ligatures: none;
 }
 
-/* Visible keyboard focus everywhere. */
 :focus-visible {
-  outline: 2px solid var(--accent);
+  outline: 2px solid var(--primary);
   outline-offset: 2px;
   border-radius: 2px;
 }
 
-/* The one motion moment: something is waiting on a human. */
 @keyframes signal-pulse {
   0%,
   100% {
@@ -91,10 +135,9 @@ body {
   }
 }
 
-/* Thin, recessive scrollbars — this is a dense operational UI. */
 ::-webkit-scrollbar {
-  width: 10px;
-  height: 10px;
+  width: 8px;
+  height: 8px;
 }
 ::-webkit-scrollbar-track {
   background: transparent;
@@ -102,10 +145,15 @@ body {
 ::-webkit-scrollbar-thumb {
   background: var(--line-strong);
   border-radius: 99px;
-  border: 3px solid var(--bg);
+  border: 2px solid var(--bg);
 }
 
-/* Loading / notification animations (run progress banner, approval dock) */
+select,
+option {
+  background-color: var(--input-bg);
+  color: var(--ink);
+}
+
 @keyframes indeterminate {
   0%   { transform: translateX(-100%); }
   100% { transform: translateX(400%); }

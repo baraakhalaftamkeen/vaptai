@@ -15,6 +15,7 @@ export interface Engagement {
   name: string;
   testing_mode: "black_box" | "gray_box" | "white_box";
   target_type: "web" | "network" | "source";
+  target_description: string | null;
   scope_version: number;
   created_at: string;
 }
@@ -22,6 +23,8 @@ export interface Engagement {
 export interface Run {
   id: string;
   engagement_id: string;
+  engagement_name: string;
+  testing_mode: string;
   status: string;
   phase: string | null;
   retest_of: string | null;
@@ -86,6 +89,15 @@ export interface Observation {
   created_at: string;
 }
 
+export interface FindingEnrichment {
+  description: string;
+  impact: string;
+  steps_to_reproduce: string;
+  recommendations: string;
+  evidence_summary: string;
+  human_title: string;
+}
+
 export interface Finding {
   id: string;
   run_id: string;
@@ -93,9 +105,45 @@ export interface Finding {
   status: string;
   severity: string;
   description: string;
+  target_url: string;
+  resolution_status: string;
+  notes: string;
+  enrichment: FindingEnrichment | null;
+  engagement_id: string;
+  engagement_name: string;
   observations: Observation[];
   created_at: string;
 }
+
+export interface DiscoveryData {
+  subdomains: string[];
+  live_targets: string[];
+  urls: string[];
+  parameters: { url: string; param: string }[];
+  forms: Record<string, unknown>[];
+  technologies: string[];
+}
+
+export type PermissionKey =
+  | "can_create_engagement"
+  | "can_start_run"
+  | "can_approve"
+  | "can_edit_findings"
+  | "can_manage_users"
+  | "can_manage_tools"
+  | "can_export"
+  | "can_view_cves";
+
+export const PERMISSION_LABELS: Record<PermissionKey, string> = {
+  can_create_engagement: "Create engagements",
+  can_start_run: "Start runs",
+  can_approve: "Approve actions",
+  can_edit_findings: "Edit findings",
+  can_manage_users: "Manage users",
+  can_manage_tools: "Use tools",
+  can_export: "Export reports",
+  can_view_cves: "View CVE feed",
+};
 
 export interface PortalUser {
   id: string;
@@ -103,6 +151,7 @@ export interface PortalUser {
   email: string | null;
   is_active: boolean;
   role: Role | null;
+  permissions: Record<PermissionKey, boolean>;
   created_at: string;
 }
 
@@ -143,6 +192,47 @@ export interface Report {
   stats: { counts?: Record<string, number>; coverage_gaps?: string[] };
   signed_off_by: string | null;
   created_at: string;
+}
+
+export interface LLMTestResult {
+  connected: boolean;
+  provider: string;
+  model: string;
+  endpoint: string;
+  response_text: string;
+  latency_ms: number;
+  error: string;
+  profiles: string[];
+}
+
+export interface ReachabilityResult {
+  target: string;
+  reachable: boolean;
+  ping_ok: boolean;
+  ping_latency_ms: number | null;
+  http_ok: boolean;
+  http_status: number | null;
+  http_title: string;
+  http_server: string;
+  http_latency_ms: number | null;
+  dns_resolved: string;
+  error: string;
+}
+
+export interface NmapResult {
+  target: string;
+  command: string;
+  open_ports: { port: number; protocol: string; state: string; service: string }[];
+  os_guess: string;
+  raw_output: string;
+  latency_ms: number;
+  error: string;
+}
+
+export interface DNSResult {
+  target: string;
+  records: { type: string; value: string }[];
+  error: string;
 }
 
 export interface SourceBundle {
@@ -225,12 +315,20 @@ export const api = {
   listUsers: () => req<PortalUser[]>("/api/v2/users"),
   createUser: (body: { username: string; password: string; role: Role; email?: string }) =>
     req<PortalUser>("/api/v2/users", { method: "POST", body: JSON.stringify(body) }),
-  updateUser: (id: string, body: { role?: Role; is_active?: boolean }) =>
+  getUser: (id: string) => req<PortalUser>(`/api/v2/users/${id}`),
+  updateUser: (id: string, body: { role?: Role; is_active?: boolean; permissions?: Record<string, boolean> }) =>
     req<PortalUser>(`/api/v2/users/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
+  deleteUser: (id: string) =>
+    req<void>(`/api/v2/users/${id}`, { method: "DELETE" }),
   listEngagements: () => req<Engagement[]>("/api/v2/engagements"),
   getEngagement: (id: string) => req<Engagement>(`/api/v2/engagements/${id}`),
   createEngagement: (body: unknown) =>
     req<Engagement>("/api/v2/engagements", { method: "POST", body: JSON.stringify(body) }),
+  getEngagementScope: (id: string) => req<Record<string, unknown>>(`/api/v2/engagements/${id}/scope`),
+  updateEngagement: (id: string, body: Record<string, unknown>) =>
+    req<Engagement>(`/api/v2/engagements/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
+  deleteEngagement: (id: string) =>
+    req<void>(`/api/v2/engagements/${id}`, { method: "DELETE" }),
   listRuns: () => req<Run[]>("/api/v2/runs"),
   getRun: (runId: string) => req<Run>(`/api/v2/runs/${runId}`),
   createRun: (
@@ -306,6 +404,32 @@ export const api = {
     }),
   runFindings: (runId: string) => req<Finding[]>(`/api/v2/runs/${runId}/findings`),
   getFinding: (findingId: string) => req<Finding>(`/api/v2/findings/${findingId}`),
+  listFindings: (opts?: {
+    severity?: string;
+    resolution_status?: string;
+    finding_status?: string;
+    engagement_id?: string;
+    search?: string;
+  }) => {
+    const q = new URLSearchParams();
+    if (opts?.severity) q.set("severity", opts.severity);
+    if (opts?.resolution_status) q.set("resolution_status", opts.resolution_status);
+    if (opts?.finding_status) q.set("finding_status", opts.finding_status);
+    if (opts?.engagement_id) q.set("engagement_id", opts.engagement_id);
+    if (opts?.search) q.set("search", opts.search);
+    const qs = q.toString();
+    return req<Finding[]>(`/api/v2/findings${qs ? `?${qs}` : ""}`);
+  },
+  engagementFindings: (engagementId: string) =>
+    req<Finding[]>(`/api/v2/engagements/${engagementId}/findings`),
+  updateFinding: (findingId: string, body: { resolution_status?: string; notes?: string }) =>
+    req<Finding>(`/api/v2/findings/${findingId}`, { method: "PATCH", body: JSON.stringify(body) }),
+  enrichFinding: (findingId: string, force = false) =>
+    req<{ finding_id: string; enrichment: FindingEnrichment }>(`/api/v2/findings/${findingId}/enrich`, {
+      method: "POST",
+      body: JSON.stringify({ force }),
+    }),
+  runDiscovery: (runId: string) => req<DiscoveryData>(`/api/v2/runs/${runId}/discovery`),
   dashboard: () => req<Dashboard>("/api/v2/dashboard"),
   getReport: (runId: string) => req<Report>(`/api/v2/runs/${runId}/report`),
   regenerateReport: (runId: string) =>
@@ -316,10 +440,10 @@ export const api = {
     `/api/v2/runs/${runId}/report/download?format=${format}`,
   listSchedules: (engagementId: string) =>
     req<Schedule[]>(`/api/v2/engagements/${engagementId}/schedules`),
-  createSchedule: (engagementId: string, interval_minutes: number) =>
+  createSchedule: (engagementId: string, interval_minutes: number, start_at?: string) =>
     req<Schedule>(`/api/v2/engagements/${engagementId}/schedules`, {
       method: "POST",
-      body: JSON.stringify({ interval_minutes }),
+      body: JSON.stringify({ interval_minutes, ...(start_at ? { start_at } : {}) }),
     }),
   deleteSchedule: (engagementId: string, scheduleId: string) =>
     req<void>(`/api/v2/engagements/${engagementId}/schedules/${scheduleId}`, { method: "DELETE" }),
@@ -336,6 +460,19 @@ export const api = {
     return req<CveFeedItem[]>(`/api/v2/cve/feed${qs ? `?${qs}` : ""}`);
   },
   cveLookup: (cveId: string) => req<CveDetail>(`/api/v2/cve/${encodeURIComponent(cveId)}`),
+  testLLM: () => req<LLMTestResult>("/api/v2/tools/llm-test", { method: "POST" }),
+  checkReachability: (target: string) =>
+    req<ReachabilityResult>("/api/v2/tools/reachability", {
+      method: "POST", body: JSON.stringify({ target }),
+    }),
+  runNmap: (target: string, scan_type = "quick", ports = "") =>
+    req<NmapResult>("/api/v2/tools/nmap", {
+      method: "POST", body: JSON.stringify({ target, scan_type, ports }),
+    }),
+  dnsLookup: (target: string) =>
+    req<DNSResult>("/api/v2/tools/dns", {
+      method: "POST", body: JSON.stringify({ target }),
+    }),
   listSource: (engagementId: string) =>
     req<SourceBundle[]>(`/api/v2/engagements/${engagementId}/source`),
   // Multipart upload: don't set Content-Type — the browser adds the boundary.

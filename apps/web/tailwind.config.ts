@@ -1,7 +1,5 @@
 import type { Config } from "tailwindcss";
 
-// Tokens live in globals.css as CSS custom properties; Tailwind just exposes them
-// so component classes stay readable and there is one source of truth.
 const config: Config = {
   content: ["./src/**/*.{ts,tsx}"],
   theme: {
@@ -15,9 +13,17 @@ const config: Config = {
         ink: "var(--ink)",
         "ink-2": "var(--ink-2)",
         "ink-3": "var(--ink-3)",
+        primary: "var(--primary)",
+        "primary-hover": "var(--primary-hover)",
         accent: "var(--accent)",
         "accent-deep": "var(--accent-deep)",
         ok: "var(--ok)",
+        "sidebar-bg": "var(--sidebar-bg)",
+        "sidebar-ink": "var(--sidebar-ink)",
+        "sidebar-ink-2": "var(--sidebar-ink-2)",
+        "sidebar-line": "var(--sidebar-line)",
+        "sidebar-active": "var(--sidebar-active)",
+        "input-bg": "var(--input-bg)",
         sev: {
           info: "var(--sev-info)",
           low: "var(--sev-low)",
@@ -27,12 +33,11 @@ const config: Config = {
         },
       },
       fontFamily: {
-        sans: ['"IBM Plex Sans"', "ui-sans-serif", "system-ui", "sans-serif"],
+        sans: ['"Inter"', "ui-sans-serif", "system-ui", "sans-serif"],
         mono: ['"IBM Plex Mono"', "ui-monospace", "monospace"],
       },
-      borderRadius: { DEFAULT: "4px", sm: "3px", md: "4px", lg: "6px" },
+      borderRadius: { DEFAULT: "6px", sm: "4px", md: "6px", lg: "8px", xl: "12px" },
       fontSize: {
-        // Compact operational scale.
         "2xs": ["11px", "1.35"],
         xs: ["12px", "1.4"],
         sm: ["13px", "1.5"],
@@ -41,6 +46,10 @@ const config: Config = {
         xl: ["20px", "1.3"],
         "2xl": ["26px", "1.2"],
         "3xl": ["34px", "1.1"],
+      },
+      boxShadow: {
+        card: "var(--shadow-card)",
+        "card-hover": "var(--shadow-card-hover)",
       },
     },
   },

@@ -2,7 +2,8 @@
 
 A LangGraph StateGraph with one node per agent role:
 
-    START → intake → plan → recon → scan → validate → attack → remediate → report → END
+    START → intake →(reachable?)→ plan → recon → scan → validate → attack → remediate → report → END
+                     └(unreachable)→ END  [status=failed]
 
 Each node runs under its agent manifest and drives the GovernedHarness, so policy,
 scope, the ledger and approval gating apply at every tool action. The flow:
@@ -40,7 +41,7 @@ from collections.abc import Callable
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import interrupt
 from sqlalchemy.orm import Session
-from vapt_domain.enums import PolicyClass
+from vapt_domain.enums import PolicyClass, TestingMode
 from vapt_agents import phases, toolrouter, web_login
 from vapt_agents.manifests import (
     ATTACK,
@@ -110,6 +111,37 @@ def _path_in_text(txt: str) -> str:
     while path and path[-1] in ".,;:!?":
         path = path[:-1]
     return path if "/" in path and len(path) > 1 else ""
+
+
+def _probe_target_reachable(target: str, *, timeout_s: int = 15) -> tuple[bool, dict]:
+    """HTTP(S) reachability probe for the intake pre-flight.
+
+    Returns (reachable, detail_dict). Tries HTTPS first, then HTTP. Fail-safe: any
+    exception degrades to unreachable rather than crashing the graph."""
+    try:
+        import requests as _req
+        from urllib.parse import urlparse as _up
+    except Exception as exc:
+        return False, {"error": f"probe_setup_failed: {type(exc).__name__}"}
+
+    parsed = _up(target) if "://" in target else None
+    if parsed and parsed.scheme:
+        probe_urls = [target]
+    else:
+        probe_urls = [f"https://{target}", f"http://{target}"]
+
+    detail: dict = {}
+    for url in probe_urls:
+        try:
+            r = _req.get(url, timeout=timeout_s, allow_redirects=True, verify=False)
+            return True, {"url": url, "status": r.status_code}
+        except _req.ConnectionError:
+            detail = {"url": url, "error": "connection_refused"}
+        except _req.Timeout:
+            detail = {"url": url, "error": "timeout"}
+        except Exception as exc:
+            detail = {"url": url, "error": str(type(exc).__name__)}
+    return False, detail
 
 
 def recon_agent_recover_url(
@@ -314,7 +346,260 @@ def build_engagement_graph(
     # -- intake --------------------------------------------------------------
     def intake(state: EngagementState) -> dict:
         ledger.record_event(db, scope.run_id, "phase.intake", {"run_id": scope.run_id})
-        return {"phase": "planning", "log": [f"intake: run {scope.run_id} accepted"]}
+        log: list[str] = [f"intake: run {scope.run_id} accepted"]
+
+        # ---- 1. Target reachability probe ------------------------------------
+        reachable, probe_detail = _probe_target_reachable(scope.target)
+        if reachable:
+            log.append(f"intake: target reachable ({probe_detail.get('url')} → {probe_detail.get('status')})")
+
+        ledger.record_event(db, scope.run_id, "intake.reachability",
+                            {"reachable": reachable, **probe_detail})
+
+        if not reachable:
+            log.append(f"intake: target unreachable — aborting run")
+            ledger.record_event(db, scope.run_id, "run.failed",
+                                {"reason": "target_unreachable", **probe_detail})
+            return {"phase": "failed", "intake_reachable": False,
+                    "intake_auth_status": "no_credentials",
+                    "log": log}
+
+        # ---- 2. Auth credential validation (gray box only) --------------------
+        auth_status = "no_credentials"
+        login_url_used = ""
+        is_black_box = scope.testing_mode == TestingMode.BLACK_BOX
+        creds = None if is_black_box else web_credentials.get_web_credentials(scope.run_id)
+        if is_black_box:
+            ledger.record_event(db, scope.run_id, "intake.auth",
+                                {"ok": False, "reason": "black_box_mode",
+                                 "note": "black-box engagement — auth skipped"})
+            log.append("intake: black-box mode — skipping auth")
+        elif creds:
+            user, pw = creds
+            from urllib.parse import urlparse as _up2
+
+            target = scope.target
+            parsed = _up2(target) if "://" in target else None
+
+            if parsed and parsed.scheme:
+                bases = [target.rstrip("/")]
+            else:
+                bases = [f"https://{target}", f"http://{target}"]
+
+            candidate_login_urls: list[str] = []
+            for base in bases:
+                # Gap 9: expanded login URL patterns — covers OAuth callback pages,
+                # REST API auth endpoints, and SPA login routes.
+                for hint in ("/auth/login", "/account/login", "/login", "/signin",
+                             "/sign-in", "/users/sign_in", "/session/new",
+                             "/api/auth/login", "/api/v1/auth/login", "/api/v2/auth/login",
+                             "/api/login", "/api/session", "/oauth/token",
+                             "/auth/signin", "/auth/callback", "/wp-login.php",
+                             "/administrator", "/admin/login", "/user/login"):
+                    candidate_login_urls.append(base.rstrip("/") + hint)
+                candidate_login_urls.append(base.rstrip("/") + "/")
+
+            cookie = None
+            for cand_url in candidate_login_urls:
+                ck = web_login.obtain_session_cookie(cand_url, user, pw)
+                if ck:
+                    cookie = ck
+                    login_url_used = cand_url
+                    break
+
+            # Gap 9: bearer token fallback — if form-based login failed, try the
+            # credentials as an API key / bearer token for REST API targets.
+            if not cookie:
+                for base in bases:
+                    for api_path in ("/api/auth/login", "/api/v1/login", "/api/login",
+                                     "/api/v1/auth/session", "/api/v2/auth/session"):
+                        try:
+                            import requests as _rq
+                            resp = _rq.post(
+                                base.rstrip("/") + api_path,
+                                json={"username": user, "password": pw,
+                                      "email": user, "login": user},
+                                timeout=10, verify=False, allow_redirects=False,
+                            )
+                            if resp.status_code in (200, 201):
+                                body = resp.json() if resp.headers.get(
+                                    "content-type", "").startswith("application/json") else {}
+                                token = (body.get("token") or body.get("access_token")
+                                         or body.get("jwt") or body.get("session_token") or "")
+                                if token:
+                                    web_credentials.set_web_cookie(
+                                        scope.run_id,
+                                        f"Authorization=Bearer {token}")
+                                    login_url_used = base.rstrip("/") + api_path
+                                    auth_status = "ok"
+                                    cookie = f"bearer:{token}"
+                                    ledger.record_event(db, scope.run_id, "intake.auth_api",
+                                                        {"ok": True, "url": login_url_used,
+                                                         "method": "bearer_token"})
+                                    log.append(f"intake: API bearer auth OK via {login_url_used}")
+                                    break
+                                # Also check Set-Cookie in response headers
+                                if resp.cookies:
+                                    ck_str = "; ".join(
+                                        f"{c.name}={c.value}" for c in resp.cookies)
+                                    web_credentials.set_web_cookie(scope.run_id, ck_str)
+                                    login_url_used = base.rstrip("/") + api_path
+                                    auth_status = "ok"
+                                    cookie = ck_str
+                                    ledger.record_event(db, scope.run_id, "intake.auth_api",
+                                                        {"ok": True, "url": login_url_used,
+                                                         "method": "api_cookie"})
+                                    log.append(f"intake: API cookie auth OK via {login_url_used}")
+                                    break
+                        except Exception:
+                            continue
+                    if cookie:
+                        break
+
+            if cookie:
+                auth_status = "ok"
+                web_credentials.set_web_cookie(scope.run_id, cookie)
+                web_credentials.set_web_cookie_a(scope.run_id, cookie)
+                ledger.record_event(db, scope.run_id, "intake.auth",
+                                    {"ok": True, "login_url": login_url_used})
+                log.append(f"intake: auth OK via {login_url_used}")
+
+                # Also try B and C credentials if supplied
+                creds_b = web_credentials.get_web_credentials_b(scope.run_id)
+                if creds_b:
+                    ub, pb = creds_b
+                    ck_b = web_login.obtain_session_cookie(login_url_used, ub, pb)
+                    if ck_b:
+                        web_credentials.set_web_cookie_b(scope.run_id, ck_b)
+                        ledger.record_event(db, scope.run_id, "intake.auth_b",
+                                            {"ok": True})
+                        log.append("intake: auth B OK")
+                    else:
+                        ledger.record_event(db, scope.run_id, "intake.auth_b",
+                                            {"ok": False, "note": "second account login failed"})
+                        log.append("intake: auth B failed")
+
+                creds_c = web_credentials.get_web_credentials_c(scope.run_id)
+                if creds_c:
+                    uc, pc = creds_c
+                    ck_c = web_login.obtain_session_cookie(login_url_used, uc, pc)
+                    if ck_c:
+                        web_credentials.set_web_cookie_c(scope.run_id, ck_c)
+                        ledger.record_event(db, scope.run_id, "intake.auth_c",
+                                            {"ok": True})
+                        log.append("intake: auth C OK")
+                    else:
+                        ledger.record_event(db, scope.run_id, "intake.auth_c",
+                                            {"ok": False, "note": "third account login failed"})
+                        log.append("intake: auth C failed")
+            else:
+                auth_status = "failed"
+                ledger.record_event(db, scope.run_id, "intake.auth",
+                                    {"ok": False, "reason": "login_failed",
+                                     "note": "credentials supplied but login failed on all "
+                                             "candidates; continuing unauthenticated"})
+                log.append("intake: auth failed — continuing unauthenticated")
+        else:
+            # Gray box with no credentials: interrupt to ask the operator.
+            # Re-entrant: if creds were supplied on resume, they're already in Redis
+            # from the API's web-credentials endpoint — re-check before interrupting.
+            creds_after_resume = web_credentials.get_web_credentials(scope.run_id)
+            if creds_after_resume:
+                log.append("intake: credentials received after prompt — validating")
+                creds = creds_after_resume
+                # Fall through handled below (re-enter intake on resume will re-run)
+            else:
+                ledger.record_event(db, scope.run_id, "intake.auth",
+                                    {"ok": False, "reason": "awaiting_credentials",
+                                     "note": "gray-box engagement — prompting for credentials"})
+                log.append("intake: gray-box — requesting credentials from operator")
+                verdict = interrupt({
+                    "kind": "credentials_required",
+                    "reason": "Gray-box engagement requires web-login credentials",
+                    "run_id": scope.run_id,
+                    "target": scope.target,
+                })
+                # On resume: operator either supplied creds (via web-credentials endpoint)
+                # or chose to skip. Re-check Redis.
+                decision = (verdict or {}).get("decision", "skip")
+                creds_now = web_credentials.get_web_credentials(scope.run_id)
+                if decision == "skip" or not creds_now:
+                    auth_status = "no_credentials"
+                    ledger.record_event(db, scope.run_id, "intake.auth",
+                                        {"ok": False, "reason": "no_credentials_supplied",
+                                         "note": "operator skipped credentials — running unauthenticated"})
+                    log.append("intake: operator skipped credentials — running unauthenticated")
+                else:
+                    # Creds were supplied via the web-credentials endpoint; validate them.
+                    user, pw = creds_now
+                    from urllib.parse import urlparse as _up3
+
+                    _target = scope.target
+                    _parsed = _up3(_target) if "://" in _target else None
+                    if _parsed and _parsed.scheme:
+                        _bases = [_target.rstrip("/")]
+                    else:
+                        _bases = [f"https://{_target}", f"http://{_target}"]
+
+                    _cand_urls: list[str] = []
+                    for _b in _bases:
+                        for _hint in ("/auth/login", "/account/login", "/login", "/signin",
+                                      "/sign-in", "/users/sign_in", "/session/new"):
+                            _cand_urls.append(_b.rstrip("/") + _hint)
+                        _cand_urls.append(_b.rstrip("/") + "/")
+
+                    _ck = None
+                    for _cu in _cand_urls:
+                        _ck = web_login.obtain_session_cookie(_cu, user, pw)
+                        if _ck:
+                            login_url_used = _cu
+                            break
+
+                    if _ck:
+                        auth_status = "ok"
+                        web_credentials.set_web_cookie(scope.run_id, _ck)
+                        web_credentials.set_web_cookie_a(scope.run_id, _ck)
+                        ledger.record_event(db, scope.run_id, "intake.auth",
+                                            {"ok": True, "login_url": login_url_used})
+                        log.append(f"intake: auth OK via {login_url_used}")
+
+                        creds_b = web_credentials.get_web_credentials_b(scope.run_id)
+                        if creds_b:
+                            ub, pb = creds_b
+                            ck_b = web_login.obtain_session_cookie(login_url_used, ub, pb)
+                            if ck_b:
+                                web_credentials.set_web_cookie_b(scope.run_id, ck_b)
+                                ledger.record_event(db, scope.run_id, "intake.auth_b", {"ok": True})
+                                log.append("intake: auth B OK")
+                            else:
+                                ledger.record_event(db, scope.run_id, "intake.auth_b",
+                                                    {"ok": False, "note": "second account login failed"})
+                                log.append("intake: auth B failed")
+
+                        creds_c = web_credentials.get_web_credentials_c(scope.run_id)
+                        if creds_c:
+                            uc, pc = creds_c
+                            ck_c = web_login.obtain_session_cookie(login_url_used, uc, pc)
+                            if ck_c:
+                                web_credentials.set_web_cookie_c(scope.run_id, ck_c)
+                                ledger.record_event(db, scope.run_id, "intake.auth_c", {"ok": True})
+                                log.append("intake: auth C OK")
+                            else:
+                                ledger.record_event(db, scope.run_id, "intake.auth_c",
+                                                    {"ok": False, "note": "third account login failed"})
+                                log.append("intake: auth C failed")
+                    else:
+                        auth_status = "failed"
+                        ledger.record_event(db, scope.run_id, "intake.auth",
+                                            {"ok": False, "reason": "login_failed",
+                                             "note": "credentials supplied but login failed; "
+                                                     "continuing unauthenticated"})
+                        log.append("intake: auth failed — continuing unauthenticated")
+
+        return {"phase": "planning", "intake_reachable": True,
+                "intake_auth_status": auth_status,
+                "intake_login_url": login_url_used,
+                "log": log}
 
     # -- plan (LLM-driven, policy-ungated proposal) --------------------------
     def plan(state: EngagementState) -> dict:
@@ -374,11 +659,30 @@ def build_engagement_graph(
         if state.get("cancellation_requested"):
             return {"phase": "cancelled", "log": ["recon: cancellation observed"]}
         assets = phases.recon_phase(db, scope, harness)
+        log = [f"recon: {len(assets)} asset(s) reachable"]
+        discovered: list[str] = []
+
+        # Wildcard engagement: enumerate subdomains and probe liveness
+        if scope.is_wildcard and scope.wildcard_base:
+            base = scope.wildcard_base
+            log.append(f"recon: wildcard engagement — enumerating subdomains of {base}")
+            subs = phases.subdomain_discovery(db, scope, harness, base)
+            log.append(f"recon: {len(subs)} subdomain(s) discovered")
+            if subs:
+                live = phases.probe_live_hosts(db, scope, harness, subs)
+                log.append(f"recon: {len(live)} live host(s) out of {len(subs)}")
+                discovered = live
+                assets = list(set(assets + live))
+            else:
+                log.append("recon: no subdomains found — scanning base domain only")
+                discovered = [base]
+
         return {
             "phase": "scan",
             "approved_asset_refs": assets,
+            "discovered_hosts": discovered,
             "evidence_refs": [f"asset:{a}" for a in assets],
-            "log": [f"recon: {len(assets)} asset(s) reachable"],
+            "log": log,
         }
 
     # -- scan (self-looping: ONE planned action per visit) -------------------
@@ -393,11 +697,33 @@ def build_engagement_graph(
         plan_items = state.get("plan") or [
             {"tool_id": t, "args": dict(a)} for t, a in phases.scan_plan_for(scope)
         ]
+
+        # Wildcard: expand plan to cover all discovered hosts. Each plan item is
+        # replicated per host with a target override so the scan covers every live
+        # subdomain. Done once on the first visit (iters==0 means not yet expanded).
+        discovered = state.get("discovered_hosts") or []
         idx = int(state.get("scan_idx", 0))
         iters = int(state.get("scan_iters", 0)) + 1
+        if discovered and idx == 0 and iters == 1:
+            expanded: list[dict] = []
+            for host in discovered:
+                for item in plan_items:
+                    expanded.append({
+                        "tool_id": item["tool_id"],
+                        "args": {**(item.get("args") or {}), "target": host},
+                        "rationale": item.get("rationale", ""),
+                        "source": item.get("source", "wildcard_expand"),
+                    })
+            plan_items = expanded
+            # Persist expanded plan in state so subsequent loop visits use it
+            state_patch = {"plan": plan_items}
+        else:
+            state_patch = {}
 
         if idx == 0 and iters == 1:
-            ledger.record_event(db, scope.run_id, "phase.scan", {"steps": len(plan_items)})
+            ledger.record_event(db, scope.run_id, "phase.scan",
+                                {"steps": len(plan_items),
+                                 "hosts": len(discovered) if discovered else 1})
 
         # Exhausted, or the agent's iteration budget is spent -> hand off to validate.
         if idx >= len(plan_items) or iters > SCAN.max_iterations:
@@ -405,6 +731,7 @@ def build_engagement_graph(
             done_log = ["scan: plan complete"] if idx >= len(plan_items) else \
                 [f"scan: iteration budget {SCAN.max_iterations} reached"]
             return {
+                **state_patch,
                 "phase": "validate",
                 "scan_iters": iters,
                 "candidate_finding_refs": candidates,
@@ -415,7 +742,7 @@ def build_engagement_graph(
         tool_id = item["tool_id"]
         args = dict(item.get("args") or {})
         task_id = f"scan-{idx}"
-        base = {"phase": "scan", "scan_idx": idx + 1, "scan_iters": iters}
+        base = {"phase": "scan", "scan_idx": idx + 1, "scan_iters": iters, **state_patch}
 
         # Auto-fill `urls` for URL-requiring tools from discovered endpoints.
         # Tools like dom_xss_probe, idor_probe, js_endpoint_miner, web_param_probe
@@ -877,30 +1204,43 @@ def build_engagement_graph(
         cve_cands: list[str] = []
         proof_cands: list[str] = []        # cheap DB-only promotions (unbounded)
         reprobe_cands: list[str] = []      # need http_probe (consumes guard budget)
+        scanner_cands: list[str] = []      # Gap 1: scanner findings needing re-verification
         for fid in phases.candidate_ids_for_run(db, scope.run_id):
             f = db.get(phases.Finding, fid)
             if f is None or f.status != "candidate":
-                continue  # only act on undecided findings; keeps repeat passes idempotent
+                continue
             if phases.cve_ref_for(db, fid):
                 cve_cands.append(fid)
             elif phases._is_proof_finding(db, fid):
                 proof_cands.append(fid)
+            elif phases._scanner_finding_source(db, fid):
+                scanner_cands.append(fid)
             else:
                 reprobe_cands.append(fid)
 
-        # (1) Proof-source promotions FIRST, unbounded. Each is a cheap DB flush + ledger
-        # event; no network, no subprocess. Guard-free — these must never be starved by
-        # the subprocess-heavy reprobes below.
+        # (1) Proof-source promotions FIRST, unbounded.
         for fid in proof_cands:
             phases.validate_candidate(db, scope, harness, fid)
 
-        # (2) Reprobes under the guard. These actually fire an http_probe subprocess.
+        # (2) Reprobes under the guard.
         for fid in reprobe_cands:
             try:
                 guard.step()
             except ManifestError:
                 break
             phases.validate_candidate(db, scope, harness, fid)
+
+        # (2b) Gap 1: Scanner re-verification — re-run the same scanner tool on the same
+        # target. A second positive is independent confirmation. Budget-bounded.
+        _SCANNER_REVERIFY_BUDGET = 15
+        scanner_confirmed = 0
+        for fid in scanner_cands[:_SCANNER_REVERIFY_BUDGET]:
+            try:
+                guard.step()
+            except ManifestError:
+                break
+            if phases.validate_scanner_candidate(db, scope, harness, fid):
+                scanner_confirmed += 1
 
         cve_cands.sort(
             key=lambda fid: _SEV_RANK.get((db.get(phases.Finding, fid).severity or "info"), 0),
@@ -913,16 +1253,30 @@ def build_engagement_graph(
             except ManifestError:
                 break
             tiers[phases.validate_cve_candidate(db, scope, harness, fid)] += 1
+
+        tiers["scanner_reverified"] = scanner_confirmed
         return tiers
 
     def validate(state: EngagementState) -> dict:
         tiers = _run_validation()
+
+        # Gap 8: SAST-DAST correlation — cross-reference static and dynamic findings
+        correlated = 0
+        try:
+            correlated = phases.correlate_sast_dast(db, scope.run_id)
+        except Exception:
+            pass
+
         all_confirmed = phases.confirmed_ids_for_run(db, scope.run_id)
         log = [f"validate: {len(all_confirmed)} confirmed"]
-        if any(tiers.values()):
+        if tiers.get("scanner_reverified"):
+            log.append(f"validate(scanner): {tiers['scanner_reverified']} re-verified")
+        if any(v for k, v in tiers.items() if k != "scanner_reverified"):
             log.append(f"validate(cve): {tiers['confirmed']} confirmed, "
                        f"{tiers['exploit_available']} exploit-available, "
                        f"{tiers['inconclusive']} version-only")
+        if correlated:
+            log.append(f"validate(correlation): {correlated} SAST-DAST pairs confirmed")
         return {
             "phase": "webvuln",
             "validated_finding_refs": all_confirmed,
@@ -1434,11 +1788,15 @@ def build_engagement_graph(
         """
         if scope.run_id in _form_map_by_run:
             return  # already primed for this run
+        # Black-box engagements skip all authenticated discovery — no login, no
+        # cookie caching, no B/C IDOR accounts. The unauthenticated BFS + form map
+        # still runs below (cookie stays None → anon path).
+        _is_black_box = scope.testing_mode == TestingMode.BLACK_BOX
         # 1. Perform admin login (idempotent — if a cookie is already cached from a
         #    prior iteration, skip the login call and reuse).
         login_url = None  # set when A login succeeds; B/C reuse it
-        cookie = web_credentials.get_web_cookie(scope.run_id)
-        if not cookie:
+        cookie = None if _is_black_box else web_credentials.get_web_cookie(scope.run_id)
+        if not cookie and not _is_black_box:
             creds = web_credentials.get_web_credentials(scope.run_id)
             if creds:
                 _cand_urls: list[str] = []
@@ -1841,9 +2199,12 @@ def build_engagement_graph(
             _priors = _prior_findings_by_run.get(scope.run_id, []) or []
             _prior_block = (phases.summarize_prior_findings_for_llm(_priors)
                              if _priors else "")
+            _desc_block = (f"Target description (from operator):\n{scope.target_description}\n\n"
+                           if scope.target_description else "")
             user = (
                 f"Target (authorized, in scope): {scope.target}\n"
-                f"Login URL: {login_url or 'none'}\n"
+                + _desc_block
+                + f"Login URL: {login_url or 'none'}\n"
                 f"Template engine fingerprint: {tech_engine or 'unknown'}\n"
                 f"Discovered endpoints:\n" + ("\n".join(endpoints_block) or "  (none)")
                 + (f"\n\nAuthenticated form map (what the admin session actually sees):\n"
@@ -4694,6 +5055,158 @@ def build_engagement_graph(
         # hoisted up to right after IDOR on 2026-10-28 so they land within
         # SCAN.max_iterations even on apps with huge deterministic probe
         # tiers. See the hoist comment above IDOR for details.)
+
+        # ---- Gap 5: OAST for blind injections ----
+        # Inject OAST payloads into blind SSRF, blind XXE, and blind command injection
+        # probes. The OAST domain is obtained at webvuln phase start; callbacks are
+        # collected at phase end. We add web_param_probe steps with oast_mode=True so
+        # the probe embeds the OAST callback URL in payloads.
+        try:
+            from vapt_persistence import oast
+            oast_handle = oast.obtain_oast_handle(scope.run_id)
+        except Exception:
+            oast_handle = None
+        if oast_handle:
+            oast_domain = oast_handle.get("domain", "")
+            if oast_domain:
+                oast_idx = 0
+                for ep_base in bases_for_probe[:2]:
+                    for ep_url in phases.discovered_endpoint_urls(
+                            db, scope, base_url=ep_base, cap=8):
+                        if oast_idx >= 6:
+                            break
+                        for vuln_class in ("ssrf", "xxe", "cmdi"):
+                            plan.append(("web_param_probe",
+                                         {"target": scope.target, "url": ep_url,
+                                          "checks": vuln_class,
+                                          "oast_domain": oast_domain},
+                                         f"webvuln-oast-{vuln_class}-{oast_idx}"))
+                        oast_idx += 1
+
+        # ---- Gap 2: Business logic probes ----
+        # When a target_description is provided, use the LLM to identify which
+        # discovered endpoints are business-critical and what logic checks apply.
+        # Falls back to regex matching when the LLM is unavailable or no description.
+        _BIZLOGIC_CAP = 6
+        _all_discovered: list[str] = []
+        for ep_base in bases_for_probe[:2]:
+            _all_discovered.extend(
+                phases.discovered_endpoint_urls(db, scope, base_url=ep_base, cap=20))
+
+        bizlogic_idx = 0
+        _used_llm_bizlogic = False
+
+        if scope.target_description and gateway is not None and _all_discovered:
+            try:
+                _biz_system = (
+                    "You are a business logic security tester. Given the target "
+                    "description and discovered endpoints, identify which endpoints "
+                    "handle business-critical flows (payments, orders, transfers, "
+                    "subscriptions, access control, etc.) and which logic checks "
+                    "apply to each. Return JSON only."
+                )
+                _biz_user = (
+                    f"Target description:\n{scope.target_description}\n\n"
+                    f"Discovered endpoints:\n"
+                    + "\n".join(f"- {u}" for u in _all_discovered[:20])
+                    + "\n\nFor each business-critical endpoint, return:\n"
+                    "- url: the exact endpoint URL from the list above\n"
+                    "- checks: comma-separated from: race_condition, "
+                    "price_manipulation, workflow_bypass, idor_privilege, "
+                    "quantity_tampering, coupon_reuse, rate_limit_abuse\n"
+                    "- rationale: one-line reason\n\n"
+                    "Return {\"probes\": [...]} with at most 6 entries. "
+                    "Only pick endpoints that genuinely handle transactions, "
+                    "state changes, or access control — not every form."
+                )
+                _biz_schema = {
+                    "type": "object",
+                    "properties": {
+                        "probes": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "url": {"type": "string"},
+                                    "checks": {"type": "string"},
+                                    "rationale": {"type": "string"},
+                                },
+                                "required": ["url", "checks"],
+                            },
+                        },
+                    },
+                    "required": ["probes"],
+                }
+                _biz_resp = gateway.invoke(
+                    "planning",
+                    [{"role": "system", "content": _biz_system},
+                     {"role": "user", "content": _biz_user}],
+                    output_schema=_biz_schema,
+                )
+                if _biz_resp.parsed and isinstance(_biz_resp.parsed, dict):
+                    _biz_probes = _biz_resp.parsed.get("probes", [])
+                    _discovered_set = set(_all_discovered)
+                    for bp in _biz_probes:
+                        if bizlogic_idx >= _BIZLOGIC_CAP:
+                            break
+                        if not isinstance(bp, dict):
+                            continue
+                        _burl = str(bp.get("url", "")).strip()
+                        _bchecks = str(bp.get("checks", "")).strip()
+                        if _burl not in _discovered_set or not _bchecks:
+                            continue
+                        plan.append(("web_param_probe",
+                                     {"target": scope.target, "url": _burl,
+                                      "checks": _bchecks},
+                                     f"webvuln-bizlogic-{bizlogic_idx}"))
+                        bizlogic_idx += 1
+                    if bizlogic_idx > 0:
+                        _used_llm_bizlogic = True
+            except Exception:
+                pass
+
+        # Regex fallback: if LLM didn't produce probes, fall back to URL pattern matching
+        if not _used_llm_bizlogic:
+            _BIZLOGIC_SINKS = re.compile(
+                r"/(order|checkout|payment|purchase|transfer|cart|buy|withdraw|deposit|"
+                r"subscribe|upgrade|confirm|submit|process)", re.I)
+            for ep_url in _all_discovered:
+                if bizlogic_idx >= _BIZLOGIC_CAP:
+                    break
+                if _BIZLOGIC_SINKS.search(ep_url):
+                    plan.append(("web_param_probe",
+                                 {"target": scope.target, "url": ep_url,
+                                  "checks": "race_condition,price_manipulation,workflow_bypass"},
+                                 f"webvuln-bizlogic-{bizlogic_idx}"))
+                    bizlogic_idx += 1
+
+        # ---- Gap 10: DOM XSS dynamic verification ----
+        # For any dom_xss_probe finding that is still candidate (static-only), add a
+        # dalfox dynamic verification step targeting the same URL to execute payloads
+        # in a headless browser and confirm the sink is actually triggerable.
+        from vapt_persistence.models import FindingObservation as _FO
+        from sqlalchemy import select as _sel10
+        dom_xss_verify_idx = 0
+        for fid in phases.candidate_ids_for_run(db, scope.run_id):
+            if dom_xss_verify_idx >= 4:
+                break
+            f = db.get(phases.Finding, fid)
+            if f is None or f.status != "candidate":
+                continue
+            _obs = db.execute(
+                _sel10(_FO).where(_FO.finding_id == fid)
+            ).scalars().all()
+            is_dom_xss = any(o.source_tool == "dom_xss_probe" for o in _obs)
+            if not is_dom_xss:
+                continue
+            dom_url = phases._scanner_finding_url(db, fid)
+            if dom_url and dom_url not in dalfox_seen:
+                plan.append(("dalfox",
+                             {"target": scope.target, "url": dom_url},
+                             f"webvuln-domxss-verify-{dom_xss_verify_idx}"))
+                dalfox_seen.add(dom_url)
+                dom_xss_verify_idx += 1
+
         return plan
 
     def webvuln(state: EngagementState) -> dict:
@@ -4716,7 +5229,24 @@ def build_engagement_graph(
         if idx == 0 and iters == 1:
             _prime_form_map()
 
-        plan_items = _webvuln_plan()
+        # Wildcard: build a combined webvuln plan across all discovered hosts by
+        # temporarily swapping scope.target for each host. _webvuln_plan() reads
+        # scope.target via closure. For non-wildcard runs this is a no-op.
+        discovered = state.get("discovered_hosts") or []
+        if discovered and len(discovered) > 1:
+            original_target = scope.target
+            combined_plan: list[tuple[str, dict, str]] = []
+            for host in discovered:
+                scope.target = host
+                host_plan = _webvuln_plan()
+                for tool_id, args, task_id in host_plan:
+                    combined_plan.append((tool_id, args, f"{task_id}-{host}"))
+                ledger.record_event(db, scope.run_id, "webvuln.host_plan",
+                                    {"host": host, "items": len(host_plan)})
+            scope.target = original_target
+            plan_items = combined_plan
+        else:
+            plan_items = _webvuln_plan()
         if idx == 0 and iters == 1:
             ledger.record_event(db, scope.run_id, "phase.webvuln", {"targets": len(plan_items)})
             # Start a per-run OAST session (interactsh-client subprocess) if the binary is
@@ -4797,7 +5327,10 @@ def build_engagement_graph(
             """If the operator supplied creds for this run, log in once (POST to the
             discovered login_url), cache the resulting session cookie in Redis, and return
             it. Idempotent — subsequent calls return the cached value until it expires or
-            the webvuln phase ends. None → unauthenticated scan (same as today)."""
+            the webvuln phase ends. None → unauthenticated scan (same as today).
+            Black-box engagements always return None."""
+            if scope.testing_mode == TestingMode.BLACK_BOX:
+                return None
             cached = web_credentials.get_web_cookie(scope.run_id)
             if cached:
                 return cached
@@ -5181,8 +5714,13 @@ def build_engagement_graph(
     graph.add_node("remediate", remediate)
     graph.add_node("report", report)
 
+    def _intake_router(state: EngagementState) -> str:
+        if state.get("phase") == "failed":
+            return END
+        return "plan"
+
     graph.add_edge(START, "intake")
-    graph.add_edge("intake", "plan")
+    graph.add_conditional_edges("intake", _intake_router, {"plan": "plan", END: END})
     graph.add_edge("plan", "recon")
     graph.add_edge("recon", "scan")
     # Scan loops back to itself (one action per visit); when the plan is exhausted it

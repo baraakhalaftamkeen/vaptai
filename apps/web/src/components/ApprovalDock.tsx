@@ -76,8 +76,8 @@ export default function ApprovalDock() {
           <div className="flex items-center justify-between gap-2 mb-1.5">
             <div className="flex items-center gap-2 min-w-0">
               <span className="relative flex h-2 w-2 shrink-0">
-                <span className="absolute inline-flex h-full w-full rounded-full bg-accent opacity-60 animate-ping" />
-                <span className="relative inline-flex h-2 w-2 rounded-full bg-accent" />
+                <span className="absolute inline-flex h-full w-full rounded-full bg-primary opacity-60 animate-ping" />
+                <span className="relative inline-flex h-2 w-2 rounded-full bg-primary" />
               </span>
               <span className="text-sm font-medium">Approval required</span>
             </div>
@@ -95,7 +95,7 @@ export default function ApprovalDock() {
 
           <div className="text-2xs text-ink-3 mb-2">
             Run{" "}
-            <Link href={`/runs/${a.run_id}`} className="text-accent hover:underline">
+            <Link href={`/runs/${a.run_id}`} className="text-primary hover:underline">
               <ShortId id={a.run_id} />
             </Link>{" "}
             · <span className="mono">{a.action_digest.slice(0, 10)}</span>
@@ -112,7 +112,7 @@ export default function ApprovalDock() {
             {a.needs_web_credentials ? (
               <Link
                 href="/approvals"
-                className="inline-flex items-center justify-center h-7 px-3 rounded text-xs bg-accent text-[#06212b] hover:bg-[#7bdcf7] font-medium"
+                className="inline-flex items-center justify-center h-7 px-3 rounded text-xs bg-primary text-white hover:bg-primary-hover font-medium"
               >
                 Log in to approve
               </Link>

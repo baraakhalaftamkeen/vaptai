@@ -77,9 +77,68 @@ def _disabled() -> bool:
     return os.environ.get("VAPT_TARGET_THROTTLE_DISABLED", "").strip() == "1"
 
 
+def _waf_multiplier(host: str) -> float:
+    """Gap 6 — rate-adaptive: check if a WAF was detected for this host and return a
+    throttle multiplier. A WAF-protected host gets 3x the normal gap to avoid blocks."""
+    try:
+        c = _client()
+        raw = c.get("vapt:waf:" + host)
+    except Exception:
+        return 1.0
+    if raw:
+        return 3.0
+    return 1.0
+
+
+def _error_backoff(host: str) -> float:
+    """Gap 6 — rate-adaptive: check recent error rate. If the target returned many errors
+    (5xx, timeouts) recently, back off with an exponential factor."""
+    try:
+        c = _client()
+        err_count = int(c.get("vapt:errors:" + host) or 0)
+    except Exception:
+        return 1.0
+    if err_count >= 5:
+        return 4.0
+    if err_count >= 3:
+        return 2.0
+    return 1.0
+
+
+def record_waf(args: dict) -> None:
+    """Record that a WAF was detected for this host. Called by the wafw00f normalizer
+    or any tool that detects WAF-like behavior (429s, challenge pages)."""
+    if _disabled():
+        return
+    host = _extract_host(args)
+    if not host:
+        return
+    try:
+        _client().set("vapt:waf:" + host, "1", ex=_KEY_TTL_SECONDS)
+    except Exception:
+        return
+
+
+def record_error(args: dict) -> None:
+    """Record a target error (5xx, timeout, connection reset) for adaptive backoff."""
+    if _disabled():
+        return
+    host = _extract_host(args)
+    if not host:
+        return
+    try:
+        c = _client()
+        key = "vapt:errors:" + host
+        c.incr(key)
+        c.expire(key, _KEY_TTL_SECONDS)
+    except Exception:
+        return
+
+
 def wait_turn(args: dict) -> None:
-    """Block (sleep) until it's polite to launch the next tool against this host. Silent
-    no-op if the throttle is disabled, Redis is unreachable, or no host is derivable."""
+    """Block (sleep) until it's polite to launch the next tool against this host.
+    Gap 6: now rate-adaptive — WAF-protected hosts and error-prone targets get longer
+    gaps automatically. Silent no-op if disabled, Redis is unreachable, or no host."""
     if _disabled():
         return
     host = _extract_host(args)
@@ -89,7 +148,7 @@ def wait_turn(args: dict) -> None:
         c = _client()
         raw = c.get(_PREFIX + host)
     except Exception:
-        return  # Redis down → fail-open; broker's own timeout is still the safety net
+        return
     if not raw:
         return
     try:
@@ -106,10 +165,12 @@ def wait_turn(args: dict) -> None:
     if last_elapsed >= heavy_s:
         gap += cooldown_ms / 1000.0
 
+    # Gap 6: adaptive multipliers based on WAF detection and error rate
+    gap *= _waf_multiplier(host)
+    gap *= _error_backoff(host)
+
     wait = (last_end + gap) - time.time()
     if wait > 0:
-        # Capped so a stale clock or an absurd gap can't stall a run — the whole point is
-        # politeness, not a hard admission queue.
         time.sleep(min(wait, 10.0))
 
 
@@ -126,4 +187,4 @@ def record_finish(args: dict, elapsed_seconds: float) -> None:
                               "last_elapsed": float(elapsed_seconds)})
         _client().set(_PREFIX + host, payload, ex=_KEY_TTL_SECONDS)
     except Exception:
-        return  # fail-open, same as wait_turn
+        return

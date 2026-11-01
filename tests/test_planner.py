@@ -39,7 +39,10 @@ def _resp(parsed, *, error=None):
 def test_fallback_when_no_gateway():
     res = plan_scan(None, _scope())
     assert res.used_model is False
-    assert [a.tool_id for a in res.actions] == ["nmap_service_scan", "http_probe", "nuclei_safe"]
+    assert [a.tool_id for a in res.actions] == [
+        "nmap_service_scan", "http_probe", "nuclei_safe",
+        "shcheck", "whatweb", "wafw00f", "katana", "feroxbuster",
+    ]
 
 
 def test_model_plan_validated_and_filtered():
@@ -67,11 +70,17 @@ def test_fallback_when_model_output_unusable():
     gw = FakeGateway(_resp(None, error="model did not return valid JSON"))
     res = plan_scan(gw, _scope())
     assert res.used_model is False
-    assert [a.tool_id for a in res.actions] == ["nmap_service_scan", "http_probe", "nuclei_safe"]
+    assert [a.tool_id for a in res.actions] == [
+        "nmap_service_scan", "http_probe", "nuclei_safe",
+        "shcheck", "whatweb", "wafw00f", "katana", "feroxbuster",
+    ]
 
 
 def test_fallback_when_all_steps_invalid():
     gw = FakeGateway(_resp({"steps": [{"tool_id": "nuclei_intrusive"}, {"tool_id": "bogus"}]}))
     res = plan_scan(gw, _scope())
     assert res.used_model is False                           # nothing survived -> default plan
-    assert [a.tool_id for a in res.actions] == ["nmap_service_scan", "http_probe", "nuclei_safe"]
+    assert [a.tool_id for a in res.actions] == [
+        "nmap_service_scan", "http_probe", "nuclei_safe",
+        "shcheck", "whatweb", "wafw00f", "katana", "feroxbuster",
+    ]

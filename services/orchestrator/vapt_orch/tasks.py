@@ -87,7 +87,7 @@ def _build_gateway():
         return None
 
 
-def _resolve_scope(domains, ip_cidrs) -> tuple[list[str], list[str], str]:
+def _resolve_scope(domains, ip_cidrs) -> tuple[list[str], list[str], str, bool, str]:
     """Partition raw scope entries into hostnames + CIDRs for membership checks, and
     derive ONE concrete probe host. Separating the authorization boundary (what is in
     scope) from the probe target (a single host to hit) is what prevents a CIDR like
@@ -96,14 +96,27 @@ def _resolve_scope(domains, ip_cidrs) -> tuple[list[str], list[str], str]:
 
     Tolerant of a bare IP typed into the domains box (folded into the CIDR scope as a
     /32 or /128). A /32 CIDR yields its single host; a broader CIDR yields its first
-    usable host (per-host expansion across a range is not done here)."""
+    usable host (per-host expansion across a range is not done here).
+
+    Returns (hostnames, cidrs, target, is_wildcard, wildcard_base)."""
     hostnames: list[str] = []
     cidrs: list[str] = []
     target: str | None = None
+    is_wildcard = False
+    wildcard_base = ""
     for raw in [*(domains or []), *(ip_cidrs or [])]:
         v = str(raw).strip()
         if not v:
             continue
+        # Wildcard domain: *.example.com → base domain example.com
+        if v.startswith("*."):
+            base = v[2:]  # strip "*."
+            if base and "." in base:
+                is_wildcard = True
+                wildcard_base = base
+                hostnames.append(v)  # keep wildcard in scope list for scope_contains
+                target = target or base
+                continue
         try:                                   # bare IP -> single-host CIDR scope entry
             ip = ipaddress.ip_address(v)
             cidrs.append(f"{v}/{ip.max_prefixlen}")
@@ -125,12 +138,13 @@ def _resolve_scope(domains, ip_cidrs) -> tuple[list[str], list[str], str]:
             pass
         hostnames.append(v)                    # hostname
         target = target or v
-    return hostnames, cidrs, (target or "example.com")
+    return hostnames, cidrs, (target or "example.com"), is_wildcard, wildcard_base
 
 
 def _run_scope(db, run: Run, eng: Engagement) -> RunScope:
     scope = _latest_scope(db, eng.id)
-    domains, ip_cidrs, target = _resolve_scope(scope.get("domains", []), scope.get("ip_cidrs", []))
+    domains, ip_cidrs, target, is_wildcard, wildcard_base = _resolve_scope(
+        scope.get("domains", []), scope.get("ip_cidrs", []))
     allowed = [PolicyClass(c) for c in scope.get("allowed_action_classes",
                                                  ["p0_passive", "p1_low_impact"])]
     return RunScope(
@@ -148,6 +162,9 @@ def _run_scope(db, run: Run, eng: Engagement) -> RunScope:
         # VAPT_NESSUS_FILE fallback. Tenable.sc live intel needs no scope field (env-gated).
         nessus_path=(str(scope.get("nessus_path")) if scope.get("nessus_path")
                      else os.environ.get("VAPT_NESSUS_FILE") or None),
+        target_description=eng.target_description or "",
+        is_wildcard=is_wildcard,
+        wildcard_base=wildcard_base,
     )
 
 
@@ -269,6 +286,11 @@ def _finalize(db, run: Run, final_state: dict) -> dict:
         db.add(RunEvent(run_id=run.id, seq=_next_seq(db, run.id),
                         kind="run.paused", payload={"reason": "approval_required"}))
         return {"status": "awaiting_approval", "run_id": run.id}
+
+    if final_state.get("phase") == "failed":
+        run.status = "failed"
+        run.phase = "failed"
+        return {"status": "failed", "run_id": run.id}
 
     run.phase = final_state.get("phase", "report")
     run.status = "completed"

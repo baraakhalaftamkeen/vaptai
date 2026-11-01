@@ -30,5 +30,5 @@ export function middleware(req: NextRequest) {
 export const config = {
   // Run on pages only. Exclude /api/* (the backend enforces its own auth; gating
   // these here would block the login request itself) and Next internals/assets.
-  matcher: ["/((?!api|_next/static|_next/image|favicon.ico).*)"],
+  matcher: ["/((?!api|_next/static|_next/image|favicon.ico|tamkeen-logo.svg|tamkeen-logo-dark.svg|tamkeen-favicon.svg).*)"],
 };

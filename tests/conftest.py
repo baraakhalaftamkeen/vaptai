@@ -29,6 +29,15 @@ os.environ.setdefault("VAPT_DATABASE_URL", "sqlite:///./vapt_test.db")
 os.environ.setdefault("VAPT_BOOTSTRAP_ADMIN_PASSWORD", "test-admin-pw")
 
 
+@pytest.fixture(autouse=True)
+def _stub_intake_reachability(monkeypatch):
+    """All tests run with the intake reachability probe stubbed out — test targets
+    (target="h", target="example.com") don't need real HTTP connectivity."""
+    from vapt_orch.graph import engagement
+    monkeypatch.setattr(engagement, "_probe_target_reachable",
+                        lambda target, **kw: (True, {"url": f"http://{target}", "status": 200}))
+
+
 @pytest.fixture()
 def db_engine(tmp_path):
     from vapt_persistence import Base, init_engine

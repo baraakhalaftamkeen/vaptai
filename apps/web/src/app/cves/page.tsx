@@ -134,7 +134,7 @@ export default function CvesPage() {
                   <div className="flex items-center gap-2.5 mb-1">
                     <SeverityTag severity={c.severity} />
                     <button
-                      className="mono text-sm text-accent hover:underline"
+                      className="mono text-sm text-primary hover:underline"
                       onClick={() => {
                         setQuery(c.id);
                         setBusy(true);
@@ -179,7 +179,7 @@ function CveDetailCard({ detail }: { detail: CveDetail }) {
             href={`https://nvd.nist.gov/vuln/detail/${detail.cve_id}`}
             target="_blank"
             rel="noreferrer"
-            className="text-xs text-accent hover:underline ml-auto"
+            className="text-xs text-primary hover:underline ml-auto"
           >
             View on NVD
           </a>
@@ -203,7 +203,7 @@ function CveDetailCard({ detail }: { detail: CveDetail }) {
                     href={r}
                     target="_blank"
                     rel="noreferrer"
-                    className="text-xs text-accent hover:underline break-all"
+                    className="text-xs text-primary hover:underline break-all"
                   >
                     {r}
                   </a>
