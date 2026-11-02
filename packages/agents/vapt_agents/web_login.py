@@ -207,8 +207,11 @@ def obtain_session_cookie(login_url: str, username: str, password: str,
         parts: list[str] = []
         for c in sess.cookies:
             # Only use host-scoped cookies (skip cross-site / unrelated ones).
+            # The requests library may resolve "localhost" to "localhost.local",
+            # so also accept domains that start with the target host.
             if c.domain and c.domain not in (host_before, f".{host_before}"):
-                continue
+                if not (host_before and c.domain.startswith(host_before)):
+                    continue
             if c.name and c.value is not None:
                 parts.append(f"{c.name}={c.value}")
         return "; ".join(parts) if parts else None
