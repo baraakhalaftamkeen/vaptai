@@ -47,7 +47,8 @@ def _detect_form_fields(html: str) -> tuple[str, str]:
     pass_field = ""
     for m in _INPUT_RE.finditer(html or ""):
         # The regex has two alternatives; one branch populates groups (1,2), the other (3,4).
-        name = (m.group(1) or m.group(4) or "").lower()
+        # Preserve the original field name (servers may be case-sensitive, e.g. "userName").
+        name = (m.group(1) or m.group(4) or "")
         itype = (m.group(2) or m.group(3) or "").lower()
         if itype == "password" and not pass_field:
             pass_field = name
