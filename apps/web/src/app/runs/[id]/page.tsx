@@ -52,6 +52,36 @@ function compareFindings(a: Finding, b: Finding): number {
   return a.title.localeCompare(b.title);
 }
 
+function groupKey(title: string): string {
+  let key = title;
+  key = key.replace(/\s+at\s+https?:\/\/.*$/i, "");
+  key = key.replace(/\s+at\s+\/\S.*$/i, "");
+  key = key.replace(/\s+on\s+parameter\s+'[^']*'/i, "");
+  key = key.replace(/\s*\([^)]*\)\s*$/, "");
+  return key.trim() || title;
+}
+
+function groupFindings(findings: Finding[]): { key: string; severity: string; items: Finding[] }[] {
+  const sorted = [...findings].sort(compareFindings);
+  const map = new Map<string, Finding[]>();
+  const order: string[] = [];
+  for (const f of sorted) {
+    const k = groupKey(f.title);
+    if (!map.has(k)) {
+      map.set(k, []);
+      order.push(k);
+    }
+    map.get(k)!.push(f);
+  }
+  return order.map((k) => {
+    const items = map.get(k)!;
+    const best = items.reduce((a, b) =>
+      (SEVERITY_RANK[b.severity] ?? 0) > (SEVERITY_RANK[a.severity] ?? 0) ? b : a
+    );
+    return { key: k, severity: best.severity, items };
+  });
+}
+
 const PHASE_LABEL: Record<string, string> = {
   intake: "Accepting the engagement",
   planning: "Planning the scan",
@@ -364,6 +394,91 @@ function FindingCard({ finding }: { finding: Finding }) {
   );
 }
 
+const SEV_COLOR: Record<string, string> = {
+  critical: "var(--sev-critical)",
+  high: "var(--sev-high)",
+  medium: "var(--sev-medium)",
+  low: "var(--sev-low)",
+  info: "var(--sev-info)",
+};
+
+function FindingGroup({ group }: { group: { key: string; severity: string; items: Finding[] } }) {
+  const [open, setOpen] = useState(false);
+  const count = group.items.length;
+
+  if (count === 1) {
+    return <FindingCard finding={group.items[0]} />;
+  }
+
+  const accentColor = SEV_COLOR[group.severity] ?? SEV_COLOR.info;
+  const confirmedCount = group.items.filter((f) => f.status === "confirmed").length;
+  const urls = new Set(group.items.map((f) => f.target_url).filter(Boolean));
+
+  return (
+    <div className="border-b border-line last:border-0">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="w-full text-left px-4 py-3.5 flex items-center gap-3 hover:bg-surface-hover/50 transition-colors focus:outline-none"
+        style={{ borderLeft: `3px solid ${accentColor}` }}
+      >
+        <SeverityTag severity={group.severity} />
+        <div className="min-w-0 flex-1">
+          <div className="text-sm font-semibold truncate">{group.key}</div>
+          <div className="flex items-center gap-2 mt-0.5 text-2xs text-ink-3">
+            {confirmedCount > 0 && (
+              <span>{confirmedCount} confirmed</span>
+            )}
+            {confirmedCount > 0 && confirmedCount < count && (
+              <span className="text-ink-3/50">&middot;</span>
+            )}
+            {confirmedCount < count && (
+              <span>{count - confirmedCount} candidate{count - confirmedCount === 1 ? "" : "s"}</span>
+            )}
+            {urls.size > 0 && (
+              <>
+                <span className="text-ink-3/50">&middot;</span>
+                <span>{urls.size} endpoint{urls.size === 1 ? "" : "s"}</span>
+              </>
+            )}
+          </div>
+        </div>
+        <span className="flex items-center gap-2.5 shrink-0">
+          <span
+            className="text-xs font-semibold px-2.5 py-1 rounded-md tnum"
+            style={{ background: `color-mix(in srgb, ${accentColor} 12%, transparent)`, color: accentColor }}
+          >
+            {count}
+          </span>
+          <svg
+            width="14"
+            height="14"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2.5"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            className={`text-ink-3 transition-transform duration-200 ${open ? "rotate-180" : ""}`}
+          >
+            <polyline points="6 9 12 15 18 9" />
+          </svg>
+        </span>
+      </button>
+      {open && (
+        <div
+          className="ml-4 border-l-2 bg-surface-2/30"
+          style={{ borderColor: `color-mix(in srgb, ${accentColor} 30%, transparent)` }}
+        >
+          {group.items.map((f) => (
+            <FindingCard key={f.id} finding={f} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function ResolutionBadge({ status }: { status: string }) {
   const styles: Record<string, string> = {
     open: "text-primary bg-primary/10 border-primary/30",
@@ -581,91 +696,188 @@ function LedgerTab({ events, now }: { events: RunEvent[]; now: number }) {
 /*  Agent graph tab                                                            */
 /* -------------------------------------------------------------------------- */
 
+interface PhaseBlock {
+  phase: string;
+  startedAt: string;
+  endedAt: string | null;
+  tools: { tool: string; elapsed: number | null; status: "done" | "running" }[];
+}
+
+function buildPhaseBlocks(events: RunEvent[]): PhaseBlock[] {
+  const blocks: PhaseBlock[] = [];
+  let cur: PhaseBlock | null = null;
+
+  const executingTools = new Map<string, { tool: string; started: number }>();
+  const doneDigests = new Set<string>();
+
+  for (const e of events) {
+    if (e.kind.startsWith("phase.") || e.kind === "plan.proposed"
+        || e.kind === "remediation.drafted" || e.kind === "report.generated") {
+      let phaseName: string;
+      if (e.kind.startsWith("phase.")) phaseName = e.kind.slice("phase.".length);
+      else if (e.kind === "plan.proposed") phaseName = "planning";
+      else if (e.kind === "remediation.drafted") phaseName = "remediate";
+      else phaseName = "report";
+
+      if (cur && cur.phase !== phaseName) {
+        cur.endedAt = e.created_at;
+      }
+      if (!cur || cur.phase !== phaseName) {
+        cur = { phase: phaseName, startedAt: e.created_at, endedAt: null, tools: [] };
+        blocks.push(cur);
+      }
+    }
+
+    if (e.kind === "action.executing" && e.payload?.digest && cur) {
+      const digest = String(e.payload.digest);
+      const tool = String(e.payload.tool || "unknown");
+      executingTools.set(digest, { tool, started: Date.parse(e.created_at) });
+    }
+    if (e.kind === "action.executed" && e.payload?.digest && cur) {
+      const digest = String(e.payload.digest);
+      doneDigests.add(digest);
+      const started = executingTools.get(digest);
+      const elapsed = e.payload.elapsed_seconds != null
+        ? Number(e.payload.elapsed_seconds)
+        : started ? (Date.parse(e.created_at) - started.started) / 1000 : null;
+      const tool = started?.tool || String(e.payload.tool || "unknown");
+      cur.tools.push({ tool, elapsed, status: "done" });
+      executingTools.delete(digest);
+    }
+
+    if (e.kind.startsWith("run.")) {
+      if (cur && (e.kind === "run.completed" || e.kind === "run.paused" || e.kind === "run.cancelling")) {
+        cur.endedAt = e.created_at;
+      }
+    }
+  }
+
+  for (const [, v] of executingTools) {
+    if (cur) cur.tools.push({ tool: v.tool, elapsed: null, status: "running" });
+  }
+
+  return blocks;
+}
+
+function PhaseRow({ block, isActive, isTerminal }: {
+  block: PhaseBlock; isActive: boolean; isTerminal: boolean;
+}) {
+  const [open, setOpen] = useState(false);
+  const phaseDone = !!block.endedAt;
+  const duration = block.endedAt
+    ? Math.round((Date.parse(block.endedAt) - Date.parse(block.startedAt)) / 1000)
+    : null;
+  const toolCount = block.tools.length;
+  const runningCount = block.tools.filter((t) => t.status === "running").length;
+
+  return (
+    <div className="border-b border-line last:border-0">
+      <button
+        type="button"
+        onClick={() => toolCount > 0 && setOpen((v) => !v)}
+        className={`w-full text-left px-4 py-2 flex items-center gap-3 transition-colors ${toolCount > 0 ? "hover:bg-surface-hover/50 cursor-pointer" : "cursor-default"}`}
+      >
+        <div className={`w-5 h-5 rounded-full flex items-center justify-center text-2xs font-semibold shrink-0 ${
+          isActive ? "bg-primary text-white" : phaseDone ? "bg-ok/20 text-ok" : "bg-surface-2 text-ink-3"
+        }`}>
+          {phaseDone && !isActive ? "✓" : PHASE_ICONS[block.phase]?.[0] || "?"}
+        </div>
+        <span className="text-xs font-semibold capitalize w-20 shrink-0">{block.phase}</span>
+        {isActive && <span className="text-2xs px-1.5 py-0.5 rounded bg-primary/10 text-primary font-medium shrink-0">Active</span>}
+        <span className="text-2xs tnum text-ink-3 w-20 shrink-0">{new Date(block.startedAt).toLocaleTimeString()}</span>
+        {duration !== null && (
+          <span className="text-2xs tnum text-ink-2 w-14 shrink-0">{fmtElapsed(duration)}</span>
+        )}
+        {isActive && runningCount > 0 && (
+          <span className="flex items-center gap-1 text-2xs text-primary shrink-0">
+            <Spinner className="w-2.5 h-2.5" /> {runningCount} running
+          </span>
+        )}
+        <span className="flex-1" />
+        {toolCount > 0 && (
+          <span className="text-2xs tnum text-ink-3 shrink-0">{toolCount} tool{toolCount === 1 ? "" : "s"}</span>
+        )}
+        {toolCount > 0 && (
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"
+            className={`text-ink-3 transition-transform duration-150 shrink-0 ${open ? "rotate-180" : ""}`}
+          ><polyline points="6 9 12 15 18 9" /></svg>
+        )}
+      </button>
+      {open && toolCount > 0 && (
+        <div className="px-4 pb-2 pl-12">
+          <div className="flex flex-wrap gap-1.5">
+            {block.tools.map((t, ti) => (
+              <span
+                key={ti}
+                className={`inline-flex items-center gap-1.5 mono text-2xs px-2 py-1 rounded border ${
+                  t.status === "running"
+                    ? "bg-primary/5 border-primary/30 text-primary"
+                    : "bg-surface-2 border-line text-ink-2"
+                }`}
+              >
+                {t.status === "running" ? <Spinner className="w-2.5 h-2.5" /> : <span className="w-1.5 h-1.5 rounded-full bg-ok shrink-0" />}
+                {t.tool}
+                {t.elapsed !== null && <span className="tnum text-ink-3">{fmtElapsed(t.elapsed)}</span>}
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function GraphTab({ events, currentPhase, status }: {
   events: RunEvent[];
   currentPhase: string | null;
   status: string;
 }) {
+  const isTerminal = TERMINAL.has(status);
+  const blocks = useMemo(() => buildPhaseBlocks(events), [events]);
+
   const completedPhases = useMemo(() => {
     const seen = new Set<string>();
-    for (const e of events) {
-      if (e.kind.startsWith("phase.")) {
-        seen.add(e.kind.slice("phase.".length));
-      }
-    }
+    for (const b of blocks) if (b.endedAt) seen.add(b.phase);
     return seen;
-  }, [events]);
+  }, [blocks]);
 
-  const isTerminal = TERMINAL.has(status);
   const phaseIndex = currentPhase ? GRAPH_PHASES.indexOf(currentPhase) : -1;
 
-  const activeAgents = useMemo(() => {
-    const agents: Record<string, { tool: string; started: string }> = {};
-    const done = new Set<string>();
-    for (const e of events) {
-      if (e.kind === "action.executing" && e.payload?.digest) {
-        agents[String(e.payload.digest)] = {
-          tool: String(e.payload.tool || "unknown"),
-          started: String(e.payload.started_at || e.created_at),
-        };
-      }
-      if (e.kind === "action.executed" && e.payload?.digest) {
-        done.add(String(e.payload.digest));
-      }
-    }
-    return Object.entries(agents)
-      .filter(([d]) => !done.has(d))
-      .map(([, v]) => v);
-  }, [events]);
+  const totalTools = blocks.reduce((s, b) => s + b.tools.length, 0);
+  const runningTools = blocks.reduce((s, b) => s + b.tools.filter((t) => t.status === "running").length, 0);
+  const totalDuration = blocks.reduce((s, b) => {
+    if (!b.endedAt) return s;
+    return s + (Date.parse(b.endedAt) - Date.parse(b.startedAt)) / 1000;
+  }, 0);
 
   return (
-    <div className="space-y-6">
-      {/* Phase pipeline visualization */}
+    <div className="space-y-4">
+      {/* Phase pipeline */}
       <Panel title="Phase pipeline">
-        <div className="px-4 py-5">
-          <div className="flex items-center gap-1 overflow-x-auto pb-2">
+        <div className="px-4 py-4">
+          <div className="flex items-center gap-1 overflow-x-auto pb-1">
             {GRAPH_PHASES.map((phase, i) => {
               const completed = completedPhases.has(phase);
               const active = phase === currentPhase && !isTerminal;
-              const upcoming = !completed && !active;
-
               return (
                 <div key={phase} className="flex items-center gap-1 shrink-0">
                   <div
-                    className={`flex flex-col items-center gap-1.5 px-3 py-2.5 rounded border transition-all ${
+                    className={`flex flex-col items-center gap-1 px-2.5 py-2 rounded border transition-all ${
                       active
                         ? "border-primary bg-primary/10 shadow-[0_0_12px_rgba(193,2,48,0.1)]"
-                        : completed
-                          ? "border-ok/40 bg-ok/5"
-                          : "border-line bg-surface-2"
+                        : completed ? "border-ok/40 bg-ok/5" : "border-line bg-surface-2"
                     }`}
                   >
-                    <div
-                      className={`w-8 h-8 rounded-full flex items-center justify-center text-xs font-medium ${
-                        active
-                          ? "bg-primary text-white"
-                          : completed
-                            ? "bg-ok/20 text-ok"
-                            : "bg-surface text-ink-3"
-                      }`}
-                    >
+                    <div className={`w-7 h-7 rounded-full flex items-center justify-center text-2xs font-medium ${
+                      active ? "bg-primary text-white" : completed ? "bg-ok/20 text-ok" : "bg-surface text-ink-3"
+                    }`}>
                       {completed && !active ? "✓" : PHASE_ICONS[phase]}
                     </div>
-                    <span className={`text-2xs ${active ? "text-ink font-medium" : completed ? "text-ok" : "text-ink-3"}`}>
-                      {phase}
-                    </span>
-                    {active && (
-                      <span className="w-1.5 h-1.5 rounded-full bg-primary animate-[signal-pulse_2.4s_ease-in-out_infinite]" />
-                    )}
+                    <span className={`text-2xs ${active ? "text-ink font-medium" : completed ? "text-ok" : "text-ink-3"}`}>{phase}</span>
+                    {active && <span className="w-1.5 h-1.5 rounded-full bg-primary animate-[signal-pulse_2.4s_ease-in-out_infinite]" />}
                   </div>
                   {i < GRAPH_PHASES.length - 1 && (
-                    <div
-                      className={`w-6 h-0.5 shrink-0 ${
-                        completed && (i < phaseIndex || isTerminal)
-                          ? "bg-ok/40"
-                          : "bg-line"
-                      }`}
-                    />
+                    <div className={`w-5 h-0.5 shrink-0 ${completed && (i < phaseIndex || isTerminal) ? "bg-ok/40" : "bg-line"}`} />
                   )}
                 </div>
               );
@@ -674,43 +886,18 @@ function GraphTab({ events, currentPhase, status }: {
         </div>
       </Panel>
 
-      {/* Active agents */}
-      <Panel title="Active agents" meta={activeAgents.length > 0 ? `${activeAgents.length} running` : undefined}>
-        {activeAgents.length === 0 ? (
-          <Empty>{isTerminal ? "Run completed — no active agents." : "No agents running right now."}</Empty>
+      {/* Compact phase breakdown */}
+      <Panel
+        title="Execution timeline"
+        meta={`${totalTools} tool${totalTools === 1 ? "" : "s"}${runningTools > 0 ? ` · ${runningTools} running` : ""} · ${fmtElapsed(totalDuration)}`}
+      >
+        {blocks.length === 0 ? (
+          <Empty>No phase events yet.</Empty>
         ) : (
-          <div className="px-4 py-3 space-y-2">
-            {activeAgents.map((a, i) => (
-              <div key={i} className="flex items-center gap-3 bg-surface-2 border border-line rounded px-3 py-2">
-                <Spinner className="w-3 h-3" />
-                <span className="mono text-xs text-ink">{a.tool}</span>
-                <span className="text-2xs text-ink-3">
-                  started {new Date(a.started).toLocaleTimeString()}
-                </span>
-              </div>
-            ))}
-          </div>
+          blocks.map((block, bi) => (
+            <PhaseRow key={bi} block={block} isActive={block.phase === currentPhase && !isTerminal} isTerminal={isTerminal} />
+          ))
         )}
-      </Panel>
-
-      {/* Phase event timeline */}
-      <Panel title="Phase transitions" meta={`${events.filter((e) => PHASE_EVENTS.has(e.kind)).length}`}>
-        <div className="px-4 py-3 space-y-1.5">
-          {events
-            .filter((e) => PHASE_EVENTS.has(e.kind))
-            .map((e) => (
-              <div key={e.seq} className="flex items-center gap-3 text-xs">
-                <span className="w-2 h-2 rounded-full bg-accent shrink-0" />
-                <span className="text-ink font-medium">
-                  {e.kind.replace("phase.", "").replace("run.", "").replace(".", " ")}
-                </span>
-                <span className="text-ink-3 tnum">{new Date(e.created_at).toLocaleTimeString()}</span>
-              </div>
-            ))}
-          {events.filter((e) => PHASE_EVENTS.has(e.kind)).length === 0 && (
-            <Empty>No phase events yet.</Empty>
-          )}
-        </div>
       </Panel>
     </div>
   );
@@ -752,7 +939,7 @@ function DiscoveryTab({ runId }: { runId: string }) {
   return (
     <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
       {data.subdomains.length > 0 && (
-        <DiscoveryPanel title="Subdomains" count={data.subdomains.length}>
+        <DiscoveryPanel title="Subdomains" count={data.subdomains.length} slug="subdomains" data={data.subdomains}>
           {data.subdomains.map((s) => (
             <div key={s} className="mono text-xs text-ink-2 py-1 border-b border-line last:border-0 px-3">{s}</div>
           ))}
@@ -760,7 +947,7 @@ function DiscoveryTab({ runId }: { runId: string }) {
       )}
 
       {data.live_targets.length > 0 && (
-        <DiscoveryPanel title="Live targets" count={data.live_targets.length}>
+        <DiscoveryPanel title="Live targets" count={data.live_targets.length} slug="live-targets" data={data.live_targets}>
           {data.live_targets.map((t) => (
             <div key={t} className="mono text-xs text-ink-2 py-1 border-b border-line last:border-0 px-3">{t}</div>
           ))}
@@ -768,7 +955,7 @@ function DiscoveryTab({ runId }: { runId: string }) {
       )}
 
       {data.urls.length > 0 && (
-        <DiscoveryPanel title="URLs & endpoints" count={data.urls.length}>
+        <DiscoveryPanel title="URLs & endpoints" count={data.urls.length} slug="urls" data={data.urls}>
           <div className="max-h-96 overflow-auto">
             {data.urls.map((u) => (
               <div key={u} className="mono text-2xs text-ink-2 py-1 border-b border-line last:border-0 px-3 break-all">{u}</div>
@@ -778,7 +965,7 @@ function DiscoveryTab({ runId }: { runId: string }) {
       )}
 
       {data.parameters.length > 0 && (
-        <DiscoveryPanel title="Parameters" count={data.parameters.length}>
+        <DiscoveryPanel title="Parameters" count={data.parameters.length} slug="parameters" data={data.parameters}>
           <div className="max-h-96 overflow-auto">
             <div className="grid grid-cols-[1fr_auto] text-2xs text-ink-3 uppercase tracking-wider px-3 py-1 border-b border-line">
               <span>URL</span><span>Parameter</span>
@@ -794,7 +981,7 @@ function DiscoveryTab({ runId }: { runId: string }) {
       )}
 
       {data.technologies.length > 0 && (
-        <DiscoveryPanel title="Technologies" count={data.technologies.length}>
+        <DiscoveryPanel title="Technologies" count={data.technologies.length} slug="technologies" data={data.technologies}>
           <div className="flex flex-wrap gap-1.5 px-3 py-2">
             {data.technologies.map((t) => (
               <span key={t} className="text-xs px-2 py-0.5 rounded bg-surface-2 border border-line text-ink-2">{t}</span>
@@ -804,7 +991,7 @@ function DiscoveryTab({ runId }: { runId: string }) {
       )}
 
       {data.forms.length > 0 && (
-        <DiscoveryPanel title="Forms" count={data.forms.length}>
+        <DiscoveryPanel title="Forms" count={data.forms.length} slug="forms" data={data.forms}>
           <div className="max-h-96 overflow-auto">
             {data.forms.map((f, i) => (
               <div key={i} className="py-2 px-3 border-b border-line last:border-0">
@@ -823,11 +1010,63 @@ function DiscoveryTab({ runId }: { runId: string }) {
   );
 }
 
-function DiscoveryPanel({ title, count, children }: {
-  title: string; count: number; children: React.ReactNode;
+function downloadFile(filename: string, content: string, mime: string) {
+  const blob = new Blob([content], { type: mime });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+function toCSV(data: unknown[]): string {
+  if (data.length === 0) return "";
+  if (typeof data[0] === "string") return data.join("\n");
+  const keys = Object.keys(data[0] as Record<string, unknown>);
+  const header = keys.join(",");
+  const rows = data.map((row) => {
+    const r = row as Record<string, unknown>;
+    return keys.map((k) => {
+      const v = String(r[k] ?? "");
+      return v.includes(",") || v.includes('"') || v.includes("\n")
+        ? `"${v.replace(/"/g, '""')}"`
+        : v;
+    }).join(",");
+  });
+  return [header, ...rows].join("\n");
+}
+
+function ExportButtons({ slug, data }: { slug: string; data: unknown[] }) {
+  return (
+    <span className="flex gap-1 shrink-0">
+      <button
+        type="button"
+        onClick={() => downloadFile(`${slug}.json`, JSON.stringify(data, null, 2), "application/json")}
+        className="text-2xs px-1.5 py-0.5 rounded bg-surface-2 border border-line text-ink-3 hover:text-ink hover:border-primary/40 transition-colors"
+      >
+        JSON
+      </button>
+      <button
+        type="button"
+        onClick={() => downloadFile(`${slug}.csv`, toCSV(data), "text/csv")}
+        className="text-2xs px-1.5 py-0.5 rounded bg-surface-2 border border-line text-ink-3 hover:text-ink hover:border-primary/40 transition-colors"
+      >
+        CSV
+      </button>
+    </span>
+  );
+}
+
+function DiscoveryPanel({ title, count, slug, data, children }: {
+  title: string; count: number; slug: string; data: unknown[]; children: React.ReactNode;
 }) {
   return (
-    <Panel title={title} meta={`${count}`}>
+    <Panel
+      title={title}
+      meta={`${count}`}
+      action={<ExportButtons slug={slug} data={data} />}
+    >
       {children}
     </Panel>
   );
@@ -837,7 +1076,9 @@ function DiscoveryPanel({ title, count, children }: {
 /*  Report panel                                                               */
 /* -------------------------------------------------------------------------- */
 
-function ReportPanel({ runId, active = false }: { runId: string; active?: boolean }) {
+function ReportPanel({ runId, active = false, runStatus = "", findingCount = 0 }: {
+  runId: string; active?: boolean; runStatus?: string; findingCount?: number;
+}) {
   const [report, setReport] = useState<Report | null>(null);
   const [absent, setAbsent] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
@@ -893,27 +1134,28 @@ function ReportPanel({ runId, active = false }: { runId: string; active?: boolea
             <Spinner className="w-3.5 h-3.5" />
             The report is generated automatically when the run reaches reporting.
           </div>
+        ) : !active && findingCount > 0 && (runStatus === "cancelled" || runStatus === "failed") ? (
+          <div className="px-4 py-3">
+            <p className="text-xs text-ink-2 mb-2">
+              Run {runStatus} before reaching the report phase. {findingCount} finding{findingCount === 1 ? "" : "s"} collected.
+            </p>
+            <Button
+              onClick={() => act("regenerate")}
+              disabled={busy !== null}
+              variant="primary"
+            >
+              {busy === "regenerate" ? "Generating…" : "Generate Report from Findings"}
+            </Button>
+          </div>
         ) : (
           <Empty>No report yet. One is generated automatically when the run reaches reporting.</Empty>
         )
       ) : !report ? (
         <Empty>Loading…</Empty>
       ) : (
-        <div className="px-4 py-4 space-y-3">
-          {error && <p className="text-xs text-sev-high">{error}</p>}
-          <div>
-            <div className="text-xs text-ink-3 mb-1">Executive summary</div>
-            <p className="text-sm">
-              {report.summary || <span className="text-ink-3">No summary (model offline).</span>}
-            </p>
-          </div>
-          <div>
-            <div className="text-xs text-ink-3 mb-1">Remediation</div>
-            <p className="text-sm">
-              {report.remediation || <span className="text-ink-3">No remediation guidance (model offline).</span>}
-            </p>
-          </div>
-          <div className="flex flex-wrap items-center gap-2 pt-1">
+        <div className="px-4 py-3">
+          {error && <p className="text-xs text-sev-high mb-2">{error}</p>}
+          <div className="flex flex-wrap items-center gap-2">
             <StatusTag status={report.status} />
             <Button onClick={() => act("regenerate")} disabled={busy !== null}>
               {busy === "regenerate" ? "Regenerating…" : "Regenerate"}
@@ -1028,11 +1270,12 @@ export default function RunPage({ params }: { params: Promise<{ id: string }> })
   }, [poll]);
 
   const latestPhase = (() => {
+    if (run?.phase) return run.phase;
     for (let i = events.length - 1; i >= 0; i--) {
       const k = events[i].kind;
       if (k.startsWith("phase.")) return k.slice("phase.".length);
     }
-    return run?.phase ?? null;
+    return null;
   })();
 
   const runActive = !!run && !TERMINAL.has(run.status ?? "");
@@ -1135,7 +1378,7 @@ export default function RunPage({ params }: { params: Promise<{ id: string }> })
 
       {tab === "overview" && (
         <div className="space-y-4">
-          <ReportPanel runId={id} active={active} />
+          <ReportPanel runId={id} active={active} runStatus={status} findingCount={findings.length} />
 
           <Panel title="Findings" meta={findings.length ? `${findings.length}` : undefined}>
             {findings.length === 0 ? (
@@ -1150,8 +1393,8 @@ export default function RunPage({ params }: { params: Promise<{ id: string }> })
                 </Empty>
               )
             ) : (
-              [...findings].sort(compareFindings).map((f) => (
-                <FindingCard key={f.id} finding={f} />
+              groupFindings(findings).map((g) => (
+                <FindingGroup key={g.key} group={g} />
               ))
             )}
           </Panel>

@@ -132,6 +132,8 @@ def normalize(tool_id: str, result_observations: list[dict]) -> list[Observation
         return _xxe_probe(text)
     if tool_id == "dom_xss_probe":
         return _dom_xss_probe(text)
+    if tool_id in ("nosqli_probe", "session_probe", "csrf_probe", "pii_probe", "ssjs_probe"):
+        return _json_findings_probe(text, tool_id)
     if tool_id == "wafw00f":
         return _wafw00f_scan(text)
     if tool_id == "smbmap":
@@ -1044,6 +1046,46 @@ _WEB_PROBE_SEV_FALLBACK = {
     "sensitive_content": "high", "xxe": "high",
     "cmd_injection": "critical", "crlf": "medium",
 }
+
+
+def _json_findings_probe(text: str, tool_id: str) -> list[Observation]:
+    """Generic normalizer for probes that emit {findings: [...], trace: [...]}.
+    Used by nosqli_probe, session_probe, csrf_probe, pii_probe."""
+    data = _first_json(text or "")
+    if not isinstance(data, dict):
+        return []
+    out: list[Observation] = []
+    findings = data.get("findings") if isinstance(data.get("findings"), list) else []
+    trace = data.get("trace") if isinstance(data.get("trace"), list) else []
+    for f in findings:
+        if not isinstance(f, dict):
+            continue
+        confirmed = bool(f.get("confirmed"))
+        ftype = str(f.get("type", tool_id))
+        sev = str(f.get("severity", "high")).strip().lower()
+        if sev not in ("info", "low", "medium", "high", "critical"):
+            sev = "high" if confirmed else "info"
+        url = str(f.get("url", ""))[:300]
+        param = str(f.get("param", ""))[:64]
+        evidence = str(f.get("evidence", ""))[:500]
+        title = f"{tool_id}: {ftype} at {url} (param {param})" if confirmed \
+            else f"{tool_id}: no issue detected at {url}"
+        out.append(Observation(tool_id, title[:300], sev, {
+            "class": ftype,
+            "url": url,
+            "param": param,
+            "evidence": evidence,
+            "confirmed": confirmed,
+            "trace": trace[:10],
+        }))
+    if not findings:
+        out.append(Observation(
+            tool_id,
+            f"{tool_id}: no issues detected",
+            "info",
+            {"trace": trace[:10], "stdout_tail": (text or "")[-400:]},
+        ))
+    return out
 
 
 def _stored_xss_probe(text: str) -> list[Observation]:

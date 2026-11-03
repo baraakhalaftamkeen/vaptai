@@ -23,6 +23,7 @@ from .routers import (
     runs,
     schedules,
     source,
+    tenable,
     tools,
     users,
 )
@@ -67,6 +68,7 @@ def create_app() -> FastAPI:
     app.include_router(reports.router)
     app.include_router(dashboard.router)
     app.include_router(cve.router)
+    app.include_router(tenable.router)
     app.include_router(tools.router)
     return app
 

@@ -46,6 +46,11 @@ export default function NewEngagementPage() {
   const [playbooks, setPlaybooks] = useState<Playbook[]>([]);
   const [description, setDescription] = useState("");
 
+  // Credentials (gray/white box)
+  const [adminUser, setAdminUser] = useState("");
+  const [adminPass, setAdminPass] = useState("");
+  const [userCreds, setUserCreds] = useState<{ username: string; password: string }[]>([]);
+
   useEffect(() => {
     api.listPlaybooks().then(setPlaybooks).catch(() => setPlaybooks([]));
   }, []);
@@ -70,6 +75,18 @@ export default function NewEngagementPage() {
           allowed_action_classes: classes,
           allow_exploitation: exploit,
           poc_playbook: playbook,
+          ...(mode !== "black_box"
+            ? {
+                web_credentials: {
+                  admin: adminUser.trim()
+                    ? { username: adminUser.trim(), password: adminPass }
+                    : null,
+                  users: userCreds
+                    .filter((c) => c.username.trim())
+                    .map((c) => ({ username: c.username.trim(), password: c.password })),
+                },
+              }
+            : {}),
         },
       });
       router.push("/engagements?success=created");
@@ -167,6 +184,105 @@ export default function NewEngagementPage() {
               White-box still gates intrusive (P2+) actions for human approval — a signed
               scope never bypasses that.
             </p>
+          )}
+
+          {mode !== "black_box" && (
+            <div className="border border-line rounded-lg overflow-hidden">
+              <div className="px-4 py-3 bg-surface-2/50 border-b border-line">
+                <h3 className="text-sm font-medium text-ink">Web credentials</h3>
+                <p className="text-2xs text-ink-3 mt-0.5">
+                  Stored in the engagement scope. Passed to the scanner at run start — never logged.
+                </p>
+              </div>
+              <div className="px-4 py-4 space-y-4">
+                <div>
+                  <span className="block text-xs text-ink-2 font-medium mb-2">Admin account</span>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <input
+                      className={inputCls}
+                      value={adminUser}
+                      onChange={(e) => setAdminUser(e.target.value)}
+                      placeholder="Username or email"
+                      autoComplete="off"
+                    />
+                    <input
+                      className={inputCls}
+                      type="password"
+                      value={adminPass}
+                      onChange={(e) => setAdminPass(e.target.value)}
+                      placeholder="Password"
+                      autoComplete="new-password"
+                    />
+                  </div>
+                  <p className="text-2xs text-ink-3 mt-1.5">
+                    Recommended: an administrator account that unlocks /admin/* for authenticated scanning.
+                  </p>
+                </div>
+                <div className="border-t border-line pt-4">
+                  <div className="flex items-center justify-between mb-2">
+                    <span className="block text-xs text-ink-2 font-medium">
+                      User accounts <span className="text-ink-3 font-normal">(for IDOR probe)</span>
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => setUserCreds((prev) => [...prev, { username: "", password: "" }])}
+                      className="h-7 px-2.5 rounded text-xs border border-line text-ink-2 hover:text-ink hover:border-primary transition-colors"
+                    >
+                      + Add user
+                    </button>
+                  </div>
+                  {userCreds.length === 0 ? (
+                    <p className="text-2xs text-ink-3">
+                      No user accounts added. Add at least two regular users to enable cross-tenant IDOR testing.
+                    </p>
+                  ) : (
+                    <div className="space-y-2">
+                      {userCreds.map((cred, i) => (
+                        <div key={i} className="flex items-center gap-2">
+                          <span className="text-2xs text-ink-3 w-5 shrink-0 text-right">{i + 1}.</span>
+                          <input
+                            className={inputCls + " flex-1"}
+                            value={cred.username}
+                            onChange={(e) => {
+                              const next = [...userCreds];
+                              next[i] = { ...next[i], username: e.target.value };
+                              setUserCreds(next);
+                            }}
+                            placeholder="Username or email"
+                            autoComplete="off"
+                          />
+                          <input
+                            className={inputCls + " flex-1"}
+                            type="password"
+                            value={cred.password}
+                            onChange={(e) => {
+                              const next = [...userCreds];
+                              next[i] = { ...next[i], password: e.target.value };
+                              setUserCreds(next);
+                            }}
+                            placeholder="Password"
+                            autoComplete="new-password"
+                          />
+                          <button
+                            type="button"
+                            onClick={() => setUserCreds((prev) => prev.filter((_, j) => j !== i))}
+                            className="text-ink-3 hover:text-sev-high text-sm px-1 shrink-0"
+                            title="Remove"
+                          >
+                            ✕
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  {userCreds.length === 1 && (
+                    <p className="text-2xs text-ink-3 mt-1.5">
+                      Add a second user to enable the recommended two-user IDOR model (B vs C) instead of admin-vs-user comparison.
+                    </p>
+                  )}
+                </div>
+              </div>
+            </div>
           )}
 
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">

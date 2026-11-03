@@ -1579,6 +1579,9 @@ def build_engagement_graph(
         sess.headers["User-Agent"] = (
             "Mozilla/5.0 (compatible; VAPT-AI/2.0 recon-bfs)"
         )
+        _LOGOUT_PATH_RE = re.compile(
+            r"/(?:auth/)?(?:logout|signout|sign[_-]?out|log[_-]?out)\b",
+            re.IGNORECASE)
         discovered: list[str] = []
         seen: set[str] = set()
         queue: list[tuple[str, int]] = []
@@ -1591,6 +1594,10 @@ def build_engagement_graph(
             if u_clean in seen or d > depth:
                 continue
             seen.add(u_clean)
+            _path = urlparse(u_clean).path or ""
+            if _LOGOUT_PATH_RE.search(_path):
+                discovered.append(u_clean)
+                continue
             try:
                 r = sess.get(u_clean, timeout=5, allow_redirects=True,
                              stream=False)
@@ -2055,12 +2062,18 @@ def build_engagement_graph(
                 r"\.(?:css|js|mjs|map|png|jpg|jpeg|gif|svg|webp|ico|"
                 r"woff2?|ttf|eot|otf|mp4|webm|mp3|wav|pdf|zip|tgz)"
                 r"(?:\?|$)", re.IGNORECASE)
+            _FM_LOGOUT_RE = re.compile(
+                r"/(?:auth/)?(?:logout|signout|sign[_-]?out|log[_-]?out)\b",
+                re.IGNORECASE)
+            from urllib.parse import urlparse as _up_fm
             _primary: list[str] = []
             _static_tail: list[str] = []
             for u in authed_urls:
                 if u in seen:
                     continue
                 seen.add(u)
+                if _FM_LOGOUT_RE.search(_up_fm(u).path or ""):
+                    continue
                 (_static_tail if _STATIC_EXT_RE.search(u) else _primary).append(u)
             for _base in bases[:3]:
                 for _ep in phases.discovered_endpoint_urls(
@@ -2068,6 +2081,8 @@ def build_engagement_graph(
                     if _ep in seen:
                         continue
                     seen.add(_ep)
+                    if _FM_LOGOUT_RE.search(_up_fm(_ep).path or ""):
+                        continue
                     (_static_tail if _STATIC_EXT_RE.search(_ep) else _primary).append(_ep)
             urls = _primary + _static_tail
             # Cap bumped 80 → 120 (2026-10-28). Admin-rich apps (CMS,
@@ -3729,7 +3744,9 @@ def build_engagement_graph(
         # (2026-10-25 run: 0 XSS findings on 8 dalfox POSTs). dalfox tests
         # each parameter separately, so submitting all 5 at once covers
         # whichever one the backend actually stores.
-        _XSS_SINK_PARAMS = ("name", "content", "message", "comment", "text", "body", "review")
+        _XSS_SINK_PARAMS = ("name", "firstName", "lastName", "content", "message",
+                             "comment", "text", "body", "review", "bio", "description",
+                             "about", "title", "email", "address")
         dalfox_idx = 0
         _dalfox_seen: set[str] = set()
 
@@ -4581,67 +4598,183 @@ def build_engagement_graph(
                 except Exception:
                     pass
 
-        # (C') stored_xss_probe on form endpoints — closes dalfox's POST-only blind
-        # spot. For each is_post_sink_route endpoint, we need a VIEW URL that renders
-        # the stored content. Updated heuristic (DineHub 2026-10-25 run showed 7
-        # probes all returning "canary not reflected" because view_url defaulted to
-        # the SAME path as post_url, but many apps redirect reviews back to the
-        # parent `/restaurant/N` where the content actually renders):
-        #   /restaurant/N/reviews  → GET /restaurant/N          (PARENT — reviews
-        #                                                        usually render on
-        #                                                        the restaurant page)
-        #   /restaurant/N/review   → GET /restaurant/N          (same)
-        #   /feedback              → GET /feedback/all
-        #   /comment               → GET parent
-        #   /profile (self-render) → GET /profile
-        #   anything else          → GET same URL (apps that redirect back)
-        # Bounded at 6 probes.
+        # (C') stored_xss_probe — iterate form_map FIRST (real field names like
+        # firstName/lastName), then fall back to discovered endpoints. The old
+        # approach used only discovered_endpoint_urls + arjun, which missed
+        # NodeGoat's profile XSS because arjun didn't find firstName/lastName
+        # and the hardcoded _XSS_SINK_PARAMS only had generic names.
         _stored_xss_idx = 0
         _stored_xss_seen: set[str] = set()
+
+        def _derive_view_url(post_url: str) -> str:
+            if post_url.endswith(("/reviews", "/review")):
+                return post_url.rsplit("/", 1)[0] or post_url
+            if post_url.endswith("/feedback"):
+                return post_url + "/all"
+            if post_url.endswith("/comment"):
+                return post_url[: -len("/comment")] or post_url
+            return post_url
+
+        def _dispatch_stored_xss(post_url: str, view_url: str,
+                                 field_names: list[str]) -> bool:
+            nonlocal _stored_xss_idx
+            if _stored_xss_idx >= 8 or post_url in _stored_xss_seen:
+                return False
+            _stored_xss_seen.add(post_url)
+            _ap = phases.arjun_params_for_url(db, scope.run_id, post_url)
+            _candidates = list(dict.fromkeys(
+                field_names + _ap + list(_XSS_SINK_PARAMS)))
+            _pinned = _candidates[0] if _candidates else "name"
+            _extras = "&".join(f"{p}=x" for p in _candidates[:6] if p != _pinned)
+            _args: dict = {"target": scope.target, "post_url": post_url,
+                           "view_url": view_url, "param": _pinned}
+            if _extras:
+                _args["data"] = _extras
+            plan.append((
+                "stored_xss_probe", _args,
+                f"webvuln-storedxss-{_stored_xss_idx}",
+            ))
+            _stored_xss_idx += 1
+            return True
+
+        # Pass 1 — form_map: real field names from authenticated crawl.
+        # Skip forms with a password field — those are login/registration
+        # forms (often the nav-bar login widget), not content submission forms.
+        _fm_sxss = _form_map_by_run.get(scope.run_id, []) or []
+        for _em in _fm_sxss:
+            if _stored_xss_idx >= 8:
+                break
+            for _form in _em.forms:
+                if _stored_xss_idx >= 8:
+                    break
+                if _form.method.lower() != "post":
+                    continue
+                _has_pw = any(f.type == "password" for f in _form.fields)
+                if _has_pw:
+                    continue
+                _text_fields = [f.name for f in _form.fields
+                                if f.type in ("text", "textarea", "search",
+                                              "email", "tel", "url")
+                                and f.name]
+                if not _text_fields:
+                    continue
+                _action = _form.action or _em.url
+                _view = _derive_view_url(_action)
+                if _action == _view and _em.url:
+                    _view = _em.url
+                _dispatch_stored_xss(_action, _view, _text_fields)
+
+        # Pass 2 — discovered endpoints with is_post_sink_route (captures forms
+        # the form_map didn't surface, e.g. public or unauthenticated forms).
         for _base in _auth_bases[:3]:
-            if _stored_xss_idx >= 6:
+            if _stored_xss_idx >= 8:
                 break
             for _ep in phases.discovered_endpoint_urls(db, scope, base_url=_base, cap=40):
-                if _stored_xss_idx >= 6:
+                if _stored_xss_idx >= 8:
                     break
-                if _ep in _stored_xss_seen:
-                    continue
                 if not phases.is_post_sink_route(_ep):
                     continue
-                _stored_xss_seen.add(_ep)
-                # Derive view URL from the POST endpoint shape. The reviews-parent
-                # pattern is the single biggest coverage win.
-                _view = _ep
-                if _ep.endswith(("/reviews", "/review")):
-                    _view = _ep.rsplit("/", 1)[0] or _ep
-                elif _ep.endswith("/feedback"):
-                    _view = _ep + "/all"
-                elif _ep.endswith("/comment"):
-                    _view = _ep[: -len("/comment")] or _ep
-                # Params: arjun-discovered FIRST, then common XSS-sink names. The
-                # probe will try each one in turn via the extra `data=` fields;
-                # whichever the backend stores wins. The pinned `param` is the one
-                # the shim injects the canary payload into.
-                _ap = phases.arjun_params_for_url(db, scope.run_id, _ep)
-                _candidates = list(dict.fromkeys(_ap + list(_XSS_SINK_PARAMS)))
-                _pinned = _candidates[0] if _candidates else "name"
-                _extras = "&".join(f"{p}=x" for p in _candidates[:5] if p != _pinned)
-                _args = {"target": scope.target, "post_url": _ep, "view_url": _view,
-                         "param": _pinned}
-                if _extras:
-                    _args["data"] = _extras
-                plan.append((
-                    "stored_xss_probe",
-                    _args,
-                    f"webvuln-storedxss-{_stored_xss_idx}",
-                ))
-                _stored_xss_idx += 1
+                _view = _derive_view_url(_ep)
+                _dispatch_stored_xss(_ep, _view, [])
 
         # (Known submission-endpoint tier formerly here — hardcoded
         # /feedback/submit, /review/submit etc. with DineHub-specific required
         # fields. Deleted — the LLM planner now reads the authenticated form_map
         # and emits stored_xss_probe dispatches with the right post_url + aux
         # body derived from each form's parsed action+fields.)
+
+        # (C'') Form-map-aware SSRF dispatch — targets forms whose fields
+        # match SSRF-prone names (url, uri, target, host, callback, etc.).
+        # The generic TIER 2 dispatches web_param_probe on discovered endpoints
+        # from katana/feroxbuster, but form-map-only endpoints (like NodeGoat's
+        # /research with its hidden "url" field) are missed because they weren't
+        # discovered by the unauthenticated crawler. This tier iterates the
+        # authenticated form_map and fires a targeted SSRF probe with --param
+        # pinned to the actual field name.
+        _SSRF_FIELD_NAMES = frozenset((
+            "url", "uri", "target", "host", "callback", "feed", "fetch",
+            "to", "endpoint", "proxy", "redirect_uri", "image", "src",
+            "href", "link", "redirect", "return", "return_url", "next",
+        ))
+        _ssrf_fm_idx = 0
+        _ssrf_fm_seen: set[str] = set()
+        _fm_ssrf = _form_map_by_run.get(scope.run_id, []) or []
+        for _em in _fm_ssrf:
+            if _ssrf_fm_idx >= 6:
+                break
+            for _form in _em.forms:
+                if _ssrf_fm_idx >= 6:
+                    break
+                _ssrf_fields = [f.name for f in _form.fields
+                                if f.name and f.name.lower() in _SSRF_FIELD_NAMES]
+                if not _ssrf_fields:
+                    continue
+                _action = _form.action or _em.url
+                if _action in _ssrf_fm_seen:
+                    continue
+                _ssrf_fm_seen.add(_action)
+                _other_fields = [f for f in _form.fields
+                                 if f.name and f.name.lower() not in _SSRF_FIELD_NAMES]
+                _bg = "&".join(
+                    f"{f.name}={f.value or 'test'}" for f in _other_fields[:5]
+                )
+                _probe_url = _action
+                if _bg:
+                    _probe_url += ("&" if "?" in _action else "?") + _bg
+                for _sf in _ssrf_fields[:2]:
+                    plan.append((
+                        "web_param_probe",
+                        {"target": scope.target, "url": _probe_url,
+                         "param": _sf,
+                         "classes": "ssrf_localhost",
+                         "method": _form.method.lower()},
+                        f"webvuln-ssrf-fm-{_ssrf_fm_idx}",
+                    ))
+                    _ssrf_fm_idx += 1
+
+        # (C''') SSJS probe — server-side JavaScript injection via eval()/
+        # Function(). Iterates form_map for POST forms with numeric or text
+        # fields that could flow into eval() (e.g. NodeGoat's /contributions
+        # with preTax/roth/afterTax). Sends arithmetic payloads and checks
+        # for computed results in the response.
+        _ssjs_idx = 0
+        _ssjs_seen: set[str] = set()
+        _SSJS_FIELD_TYPES = ("text", "number", "tel", "hidden")
+        _fm_ssjs = _form_map_by_run.get(scope.run_id, []) or []
+        for _em in _fm_ssjs:
+            if _ssjs_idx >= 6:
+                break
+            for _form in _em.forms:
+                if _ssjs_idx >= 6:
+                    break
+                if _form.method.lower() not in ("post", "get"):
+                    continue
+                _has_pw = any(f.type == "password" for f in _form.fields)
+                if _has_pw:
+                    continue
+                _candidate_fields = [
+                    f for f in _form.fields
+                    if f.type in _SSJS_FIELD_TYPES and f.name
+                    and f.name.lower() not in ("csrf", "token", "_csrf",
+                                                "csrftoken", "_token")
+                ]
+                if not _candidate_fields:
+                    continue
+                _action = _form.action or _em.url
+                if _action in _ssjs_seen:
+                    continue
+                _ssjs_seen.add(_action)
+                _fields_spec = ",".join(
+                    f"{f.name}:{f.value or '1'}" for f in _candidate_fields[:6]
+                )
+                plan.append((
+                    "ssjs_probe",
+                    {"target": scope.target, "url": _action,
+                     "method": _form.method.lower(),
+                     "fields": _fields_spec},
+                    f"webvuln-ssjs-{_ssjs_idx}",
+                ))
+                _ssjs_idx += 1
 
         # (C) IDOR probe — hoisted EARLY in the plan so it fires within the SCAN wall-clock
         # budget. Previously lived at the bottom of _webvuln_plan AFTER the ~50-item
@@ -4670,28 +4803,34 @@ def build_engagement_graph(
             #       old numeric-only regex dropped entirely;
             #   (3) numeric object urls for the legacy enumeration fallback.
             # Token = long hex (>=16) OR uuid OR 1-10 digits.
+            # Dynamic: any /<word>/<token> path is an IDOR candidate (the probe's
+            # _PUBLIC_DATA_RE excludes catalogs). No hardcoded noun list.
             _tok = r"(?:[0-9a-f]{16,}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|\d{1,10})"
             _idor_obj_re = re.compile(
-                r"/(?:order|orders|invoice|invoices|receipt|receipts|booking|bookings|"
-                r"ticket|tickets|reservation|reservations|payment|payments|transaction|"
-                r"transactions|document|documents|report|reports|message|messages)"
+                r"/[a-zA-Z][a-zA-Z0-9_-]{1,30}"
                 r"(?:/track)?/" + _tok + r"(?:[/?]|$)"
-                r"|[?&](?:id|oid|uid|pid|order|order_id|orderid|invoice|invoice_id"
-                r"|receipt|receipt_id|booking|booking_id|ticket|ticket_id|user|user_id"
-                r"|userid|account|account_id|item|item_id|object|object_id|ref|num"
-                r"|token|uuid|guid)=" + _tok + r"(?:&|$)",
+                r"|[?&](?:[a-zA-Z_]*(?:_id|Id|ID)|id|oid|uid|pid|ref|num|token|uuid|guid)="
+                + _tok + r"(?:&|$)",
                 re.IGNORECASE,
             )
-            # Listing endpoints that establish per-user ownership when harvested.
+            # Any path that looks like a collection listing (no trailing id segment).
             _idor_listing_re = re.compile(
-                r"/(?:orders|order/history|account/orders|my-orders|invoices|receipts|"
-                r"bookings|tickets|reservations|account|dashboard|history|transactions)/?$",
+                r"/[a-zA-Z][a-zA-Z0-9_-]{1,30}/?$",
                 re.IGNORECASE,
             )
-            # Exclude public catalog pages (restaurant/product menus etc.).
+            # Exclude public catalog AND non-resource paths. Without this, the
+            # broad _idor_listing_re accepts /tutorial, /login, /vendor etc. and
+            # floods the 100-URL cap with noise.
             _idor_public_re = re.compile(
                 r"/(?:restaurant|restaurants|product|products|category|categories|"
-                r"catalog|menu|item|items|post|posts|article|articles|review|reviews)s?"
+                r"catalog|menu|item|items|post|posts|article|articles|review|reviews"
+                r"|login|logout|signup|sign-up|register|forgot|reset|auth|oauth"
+                r"|css|js|images|img|fonts|vendor|static|assets|public|dist|bundle"
+                r"|about|contact|help|faq|terms|privacy|legal|tos"
+                r"|tutorial|learn|guide|docs|documentation|readme|changelog"
+                r"|api|graphql|webhook|websocket|socket"
+                r"|error|404|500|health|ping|status|version|favicon"
+                r"|node_modules|bower_components|__webpack)s?"
                 r"(?:/\d+)?(?:/[^?]*)?$",
                 re.IGNORECASE,
             )
@@ -4706,34 +4845,33 @@ def build_engagement_graph(
                 if (_idor_obj_re.search(u) or _idor_listing_re.search(path)):
                     idor_urls.append(u)
 
+            # Extract resource nouns dynamically from discovered URLs.
+            _noun_re = re.compile(
+                r"/([a-zA-Z][a-zA-Z0-9_-]{1,30})"
+                r"(?:/track)?/(?:[0-9a-f]{8,}|[0-9a-f-]{32,}|\d{1,10})(?:[/?]|$)",
+                re.IGNORECASE,
+            )
             for ep_base in _idor_bases:
-                # Always seed a listing anchor so the probe can harvest ownership
-                # even when discovery didn't surface /orders explicitly.
-                anchor = ep_base.rstrip("/") + "/orders"
-                if anchor not in idor_urls:
-                    idor_urls.append(anchor)
                 for ep_url in phases.discovered_endpoint_urls(
                         db, scope, base_url=ep_base, cap=40):
                     _consider_idor(ep_url)
                 for ep_url in phases.webvuln_seed_urls(
                         db, scope, base_url=ep_base):
                     _consider_idor(ep_url)
-                # Numeric-ID fallback (2026-10-28): on apps that use hex/UUID
-                # tokens in post-login URLs, discovery may surface ZERO
-                # numeric object paths — leaving the probe with only listing
-                # anchors + token URLs and nothing for its legacy enumeration
-                # path. The DineHub 2026-10-27 run confirmed only 1 IDOR
-                # (hex-token) vs 7 on earlier builds that exposed /order/N.
-                # Inject a small fixed set of numeric paths per common
-                # object noun so cross-tenant probes still happen when the
-                # app has either numeric OR token IDs. 404s are cheap; the
-                # probe skips a path it can't fetch for user A.
-                _IDOR_NUMERIC_NOUNS = (
-                    "order", "invoice", "receipt", "booking", "ticket",
-                    "reservation", "payment", "transaction", "document",
-                    "report", "message",
-                )
-                for noun in _IDOR_NUMERIC_NOUNS:
+
+            # Derive collection nouns from accepted URLs and inject numeric
+            # fallback paths (404s are cheap; the probe skips unfetchable ones).
+            from urllib.parse import urlparse as _up_noun
+            _seen_nouns: set[str] = set()
+            for _u in list(idor_urls):
+                _nm = _noun_re.search(_up_noun(_u).path or "")
+                if _nm:
+                    _seen_nouns.add(_nm.group(1).lower())
+            for ep_base in _idor_bases:
+                for noun in _seen_nouns:
+                    _anchor = ep_base.rstrip("/") + "/" + noun
+                    if _anchor not in idor_urls:
+                        idor_urls.append(_anchor)
                     for _n in (1, 2, 3):
                         _u = f"{ep_base.rstrip('/')}/{noun}/{_n}"
                         if _u not in idor_urls:
@@ -4756,6 +4894,89 @@ def build_engagement_graph(
                               "urls": ",".join(idor_urls[:100]),
                               "mode": "delete"},
                              "webvuln-idor-delete-0"))
+
+        # (D) NoSQL injection probe — tests login endpoints for MongoDB $gt/$ne
+        # operator injection. Highest-impact on MEAN-stack apps (NodeGoat, etc).
+        _nosqli_dispatched = False
+        for _base in _auth_bases[:3]:
+            if _nosqli_dispatched:
+                break
+            _lu = phases.detect_login_url(db, scope, base_url=_base)
+            if not _lu:
+                continue
+            _nosqli_args: dict = {"target": scope.target, "login_url": _lu}
+            _fm = _form_map_by_run.get(scope.run_id, []) or []
+            for _em in _fm:
+                if _lu in (_em.url or ""):
+                    for _form in _em.forms:
+                        if _form.method.lower() == "post":
+                            _pw = [f.name for f in _form.fields if f.type == "password"]
+                            _usr = [f.name for f in _form.fields
+                                    if f.type in ("text", "email")]
+                            if _pw:
+                                _nosqli_args["pass_field"] = _pw[0]
+                            if _usr:
+                                _nosqli_args["user_field"] = _usr[0]
+                            break
+                    break
+            plan.append(("nosqli_probe", _nosqli_args, "webvuln-nosqli-0"))
+            _nosqli_dispatched = True
+
+        # (E) Session fixation probe — checks cookie regeneration after login.
+        _session_dispatched = False
+        for _base in _auth_bases[:3]:
+            if _session_dispatched:
+                break
+            _lu = phases.detect_login_url(db, scope, base_url=_base)
+            if not _lu:
+                continue
+            plan.append(("session_probe",
+                         {"target": scope.target, "login_url": _lu},
+                         "webvuln-session-0"))
+            _session_dispatched = True
+
+        # (F) CSRF validation probe — tests POST forms for missing/unenforced tokens.
+        _csrf_urls: list[str] = []
+        _fm_csrf = _form_map_by_run.get(scope.run_id, []) or []
+        for _em in _fm_csrf:
+            for _form in _em.forms:
+                if _form.method.lower() == "post":
+                    _action = _form.action or _em.url
+                    if _action and _action not in _csrf_urls:
+                        _csrf_urls.append(_action)
+            if len(_csrf_urls) >= 8:
+                break
+        if not _csrf_urls:
+            for _base in _auth_bases[:3]:
+                for _ep in phases.discovered_endpoint_urls(db, scope, base_url=_base, cap=20):
+                    if phases.is_post_sink_route(_ep) and _ep not in _csrf_urls:
+                        _csrf_urls.append(_ep)
+                    if len(_csrf_urls) >= 8:
+                        break
+        if _csrf_urls:
+            plan.append(("csrf_probe",
+                         {"target": scope.target, "urls": ",".join(_csrf_urls[:8])},
+                         "webvuln-csrf-0"))
+
+        # (G) Sensitive data exposure (PII) probe — scans authenticated pages for
+        # SSN, credit cards, password hashes, API keys, etc.
+        _pii_urls: list[str] = []
+        for _base in _auth_bases[:3]:
+            for _ep in phases.discovered_endpoint_urls(db, scope, base_url=_base, cap=30):
+                if _ep not in _pii_urls:
+                    _pii_urls.append(_ep)
+                if len(_pii_urls) >= 15:
+                    break
+        for _base in _auth_bases[:3]:
+            for _path in ("/profile", "/account", "/dashboard", "/admin",
+                          "/settings", "/user"):
+                _u = _base.rstrip("/") + _path
+                if _u not in _pii_urls:
+                    _pii_urls.append(_u)
+        if _pii_urls:
+            plan.append(("pii_probe",
+                         {"target": scope.target, "urls": ",".join(_pii_urls[:15])},
+                         "webvuln-pii-0"))
 
         # LLM-driven proposals — HOISTED here (2026-10-28) so they land within
         # SCAN.max_iterations even on apps whose deterministic plan is very

@@ -351,6 +351,9 @@ def _build_wapiti(args: dict) -> list[str]:
         if urlparse(s).hostname != target:
             continue
         argv += ["--start", s]
+    # Exclude logout/signout URLs so wapiti's own crawler doesn't follow a /logout link
+    # and destroy the authenticated session cookie mid-scan.
+    argv += ["--exclude", r"https?://[^/]*/(?:auth/)?(?:logout|signout|sign[_-]?out|log[_-]?out)\b"]
     # Hard runtime caps. Prior fully-authenticated runs on DineHub hit the 10-minute
     # subprocess timeout AT port=5000 even with --max-scan-time 300 set — the auth-crawl
     # had surfaced 34 endpoints, each module (17 of them) attacks every endpoint, and
@@ -873,6 +876,138 @@ _SHIPPED_XXE_PROBE_BIN = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))),
     "workers", "bin", "vapt-xxe-probe",
 )
+_SHIPPED_NOSQLI_PROBE_BIN = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))),
+    "workers", "bin", "vapt-nosqli-probe",
+)
+_SHIPPED_SESSION_PROBE_BIN = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))),
+    "workers", "bin", "vapt-session-probe",
+)
+_SHIPPED_CSRF_PROBE_BIN = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))),
+    "workers", "bin", "vapt-csrf-probe",
+)
+_SHIPPED_PII_PROBE_BIN = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))),
+    "workers", "bin", "vapt-pii-probe",
+)
+_SHIPPED_SSJS_PROBE_BIN = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))),
+    "workers", "bin", "vapt-ssjs-probe",
+)
+
+
+def _build_nosqli_probe(args: dict) -> list[str]:
+    binary = os.environ.get("VAPT_NOSQLI_PROBE_BIN", _SHIPPED_NOSQLI_PROBE_BIN)
+    target = _valid_host(str(args["target"]))
+    cmd = [binary, "--target", target]
+    login_url = str(args.get("login_url", "")).strip()
+    if login_url:
+        if not login_url.lower().startswith(("http://", "https://")):
+            raise ValueError(f"nosqli_probe needs full http(s) login_url: {login_url!r}")
+        if urlparse(login_url).hostname != target:
+            raise ValueError(f"nosqli_probe login_url off-scope: {login_url!r}")
+        cmd += ["--login-url", login_url]
+    user_field = str(args.get("user_field", "")).strip()
+    if user_field and re.fullmatch(r"[A-Za-z0-9_.\-\[\]]{1,60}", user_field):
+        cmd += ["--user-field", user_field]
+    pass_field = str(args.get("pass_field", "")).strip()
+    if pass_field and re.fullmatch(r"[A-Za-z0-9_.\-\[\]]{1,60}", pass_field):
+        cmd += ["--pass-field", pass_field]
+    urls = str(args.get("urls", "")).strip()
+    if urls:
+        _reject_option_like(urls)
+        kept = []
+        for u in urls.split(","):
+            u = u.strip()
+            if u.lower().startswith(("http://", "https://")) and urlparse(u).hostname == target:
+                kept.append(u)
+        if kept:
+            cmd += ["--urls", ",".join(kept[:10])]
+    params = str(args.get("params", "")).strip()
+    if params and re.fullmatch(r"[A-Za-z0-9_,.\-]{1,200}", params):
+        cmd += ["--params", params]
+    return cmd
+
+
+def _build_session_probe(args: dict) -> list[str]:
+    binary = os.environ.get("VAPT_SESSION_PROBE_BIN", _SHIPPED_SESSION_PROBE_BIN)
+    target = _valid_host(str(args["target"]))
+    login_url = str(args.get("login_url", "")).strip()
+    if not login_url.lower().startswith(("http://", "https://")):
+        raise ValueError(f"session_probe needs full http(s) login_url: {login_url!r}")
+    if urlparse(login_url).hostname != target:
+        raise ValueError(f"session_probe login_url off-scope: {login_url!r}")
+    cmd = [binary, "--target", target, "--login-url", login_url]
+    username = str(args.get("username", "")).strip()
+    password = str(args.get("password", "")).strip()
+    if username:
+        cmd += ["--username", username]
+    if password:
+        cmd += ["--password", password]
+    return cmd
+
+
+def _build_csrf_probe(args: dict) -> list[str]:
+    binary = os.environ.get("VAPT_CSRF_PROBE_BIN", _SHIPPED_CSRF_PROBE_BIN)
+    target = _valid_host(str(args["target"]))
+    urls_raw = str(args.get("urls", "")).strip()
+    if not urls_raw:
+        raise ValueError("csrf_probe needs comma-separated urls")
+    _reject_option_like(urls_raw)
+    kept = []
+    for u in urls_raw.split(","):
+        u = u.strip()
+        if u.lower().startswith(("http://", "https://")) and urlparse(u).hostname == target:
+            kept.append(u)
+        if len(kept) >= 10:
+            break
+    if not kept:
+        raise ValueError("csrf_probe: no in-scope urls to test")
+    return [binary, "--target", target, "--urls", ",".join(kept)]
+
+
+def _build_pii_probe(args: dict) -> list[str]:
+    binary = os.environ.get("VAPT_PII_PROBE_BIN", _SHIPPED_PII_PROBE_BIN)
+    target = _valid_host(str(args["target"]))
+    urls_raw = str(args.get("urls", "")).strip()
+    if not urls_raw:
+        raise ValueError("pii_probe needs comma-separated urls")
+    _reject_option_like(urls_raw)
+    kept = []
+    for u in urls_raw.split(","):
+        u = u.strip()
+        if u.lower().startswith(("http://", "https://")) and urlparse(u).hostname == target:
+            kept.append(u)
+        if len(kept) >= 20:
+            break
+    if not kept:
+        raise ValueError("pii_probe: no in-scope urls to scan")
+    return [binary, "--target", target, "--urls", ",".join(kept)]
+
+
+def _build_ssjs_probe(args: dict) -> list[str]:
+    binary = os.environ.get("VAPT_SSJS_PROBE_BIN", _SHIPPED_SSJS_PROBE_BIN)
+    target = _valid_host(str(args["target"]))
+    url = str(args.get("url", "")).strip()
+    if not url.lower().startswith(("http://", "https://")):
+        raise ValueError(f"ssjs_probe needs full http(s) url: {url!r}")
+    _reject_option_like(url)
+    if urlparse(url).hostname != target:
+        raise ValueError(f"ssjs_probe url off-scope: {url!r}")
+    cmd = [binary, "--target", target, "--url", url]
+    method = str(args.get("method", "post")).strip().lower()
+    if method in ("get", "post"):
+        cmd += ["--method", method]
+    fields = str(args.get("fields", "")).strip()
+    if not fields:
+        raise ValueError("ssjs_probe needs --fields (e.g. 'preTax:100,roth:100')")
+    _reject_option_like(fields)
+    if not re.fullmatch(r"[A-Za-z0-9_:.,\-]{1,500}", fields):
+        raise ValueError(f"ssjs_probe: invalid fields spec: {fields!r}")
+    cmd += ["--fields", fields]
+    return cmd
 
 
 def _build_csp_check(args: dict) -> list[str]:
@@ -1225,24 +1360,20 @@ def _build_idor_probe(args: dict) -> list[str]:
     #   - numeric URLs for the enumeration fallback
     # Token = long hex (>=16) OR uuid OR 1-10 digits. We keep a validation gate so
     # a bad LLM proposal can't feed arbitrary off-pattern URLs, but it is broad.
+    # Dynamic: any /<word>/<token> or ?<param_id>=<token> is accepted. No hardcoded nouns.
     _tok = (r"(?:[0-9a-f]{16,}"
             r"|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
             r"|\d{1,10})")
     _obj_re = re.compile(
-        r"/(?:order|orders|invoice|invoices|receipt|receipts|booking|bookings|"
-        r"ticket|tickets|reservation|reservations|payment|payments|transaction|"
-        r"transactions|document|documents|report|reports|message|messages)"
+        r"/[a-zA-Z][a-zA-Z0-9_-]{1,30}"
         r"(?:/track)?/" + _tok + r"(?:[/?]|$)"
-        r"|[?&](?:id|oid|uid|pid|order|order_id|orderid|invoice|invoice_id"
-        r"|receipt|receipt_id|booking|booking_id|ticket|ticket_id|user|user_id"
-        r"|userid|account|account_id|item|item_id|object|object_id|ref|num"
-        r"|token|uuid|guid)=" + _tok + r"(?:&|$)"
-        r"|/\d{1,10}(?:/|\?|$)",   # bare numeric path id (e.g. /user/7/pw) — legacy
+        r"|[?&](?:[a-zA-Z_]*(?:_id|Id|ID)|id|oid|uid|pid|ref|num|token|uuid|guid)="
+        + _tok + r"(?:&|$)"
+        r"|/\d{1,10}(?:/|\?|$)",
         re.IGNORECASE,
     )
     _listing_re = re.compile(
-        r"/(?:orders|order/history|account/orders|my-orders|invoices|receipts|"
-        r"bookings|tickets|reservations|account|dashboard|history|transactions)/?$",
+        r"/[a-zA-Z][a-zA-Z0-9_-]{1,30}/?$",
         re.IGNORECASE,
     )
     kept: list[str] = []
@@ -1257,7 +1388,7 @@ def _build_idor_probe(args: dict) -> list[str]:
             continue
         if u not in kept:
             kept.append(u)
-        if len(kept) >= 40:  # per-invocation cap
+        if len(kept) >= 100:  # per-invocation cap
             break
     if not kept:
         raise ValueError("idor_probe: no in-scope object/listing urls to probe")
@@ -2022,5 +2153,71 @@ REGISTRY.register(
         build_argv=_build_poc_screenshot,
         timeout_s=120,
         description="Capture one screenshot of a confirmed issue as PoC evidence (approved only).",
+    )
+)
+REGISTRY.register(
+    ToolSpec(
+        id="nosqli_probe",
+        version="1.0",
+        policy_class=PolicyClass.P2_INTRUSIVE,
+        allowed_agents=[AgentRole.SCAN, AgentRole.VALIDATE],
+        supported_modes=["black_box", "gray_box", "white_box"],
+        build_argv=_build_nosqli_probe,
+        timeout_s=60,
+        description="NoSQL injection probe — tests login and query endpoints for MongoDB "
+                    "operator injection ($gt/$ne/$regex bypass). Requires approval.",
+    )
+)
+REGISTRY.register(
+    ToolSpec(
+        id="session_probe",
+        version="1.0",
+        policy_class=PolicyClass.P1_LOW_IMPACT,
+        allowed_agents=[AgentRole.SCAN, AgentRole.VALIDATE],
+        supported_modes=["black_box", "gray_box", "white_box"],
+        build_argv=_build_session_probe,
+        timeout_s=30,
+        description="Session security probe — tests for session fixation (cookie not regenerated "
+                    "after login) and insecure cookie attributes (missing HttpOnly/Secure/SameSite).",
+    )
+)
+REGISTRY.register(
+    ToolSpec(
+        id="csrf_probe",
+        version="1.0",
+        policy_class=PolicyClass.P1_LOW_IMPACT,
+        allowed_agents=[AgentRole.SCAN, AgentRole.VALIDATE],
+        supported_modes=["black_box", "gray_box", "white_box"],
+        build_argv=_build_csrf_probe,
+        timeout_s=60,
+        description="CSRF validation probe — tests whether state-changing POST endpoints "
+                    "actually enforce CSRF token validation (omit/tamper token attacks).",
+    )
+)
+REGISTRY.register(
+    ToolSpec(
+        id="pii_probe",
+        version="1.0",
+        policy_class=PolicyClass.P0_PASSIVE,
+        allowed_agents=[AgentRole.SCAN, AgentRole.VALIDATE],
+        supported_modes=["black_box", "gray_box", "white_box"],
+        build_argv=_build_pii_probe,
+        timeout_s=60,
+        description="Sensitive data exposure probe — scans authenticated page responses for "
+                    "PII patterns (SSN, credit cards, password hashes, API keys, private keys).",
+    )
+)
+REGISTRY.register(
+    ToolSpec(
+        id="ssjs_probe",
+        version="1.0",
+        policy_class=PolicyClass.P1_LOW_IMPACT,
+        allowed_agents=[AgentRole.SCAN, AgentRole.VALIDATE],
+        supported_modes=["black_box", "gray_box", "white_box"],
+        build_argv=_build_ssjs_probe,
+        timeout_s=30,
+        description="Server-side JavaScript injection probe — detects eval()/Function() injection "
+                    "by sending arithmetic and string-concat payloads into form fields and checking "
+                    "whether the server evaluates them.",
     )
 )

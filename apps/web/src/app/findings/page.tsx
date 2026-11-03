@@ -4,7 +4,8 @@ import { useEffect, useMemo, useState } from "react";
 import { api, type Engagement, type Finding, type FindingEnrichment } from "@/lib/api";
 import { Button, Empty, Panel, SeverityTag, ShortId, StatusTag } from "@/components/ui";
 
-const PAGE_SIZE = 20;
+const ENG_PAGE_SIZE = 10;
+const FINDING_PAGE_SIZE = 20;
 
 const SEVERITY_OPTIONS = ["critical", "high", "medium", "low", "info"] as const;
 
@@ -126,23 +127,23 @@ export default function FindingsPage() {
     return list;
   }, [unique, search, severityFilter, resolutionFilter, statusFilter, engagementFilter]);
 
-  const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
-  const safePage = Math.min(page, totalPages);
-  const paged = filtered.slice((safePage - 1) * PAGE_SIZE, safePage * PAGE_SIZE);
-
   useEffect(() => {
     setPage(1);
   }, [search, severityFilter, resolutionFilter, statusFilter, engagementFilter]);
 
   const grouped = useMemo(() => {
     const map = new Map<string, UniqueFinding[]>();
-    for (const uf of paged) {
+    for (const uf of filtered) {
       const key = uf.representative.engagement_name || uf.representative.engagement_id || "Unknown";
       if (!map.has(key)) map.set(key, []);
       map.get(key)!.push(uf);
     }
     return Array.from(map.entries());
-  }, [paged]);
+  }, [filtered]);
+
+  const totalEngPages = Math.max(1, Math.ceil(grouped.length / ENG_PAGE_SIZE));
+  const safePage = Math.min(page, totalEngPages);
+  const pagedGroups = grouped.slice((safePage - 1) * ENG_PAGE_SIZE, safePage * ENG_PAGE_SIZE);
 
   const selectCls =
     "h-8 rounded bg-surface-2 border border-line text-xs text-ink px-2 pr-6 appearance-none " +
@@ -216,7 +217,7 @@ export default function FindingsPage() {
           <span className="inline-block rounded-full border-2 border-line-strong border-t-accent animate-spin w-4 h-4" />
           Loading findings…
         </div>
-      ) : grouped.length === 0 ? (
+      ) : pagedGroups.length === 0 ? (
         <Panel title="Findings" meta="0">
           <Empty>
             {findings.length === 0
@@ -225,22 +226,18 @@ export default function FindingsPage() {
           </Empty>
         </Panel>
       ) : (
-        <div className="space-y-4">
-          {grouped.map(([engName, group]) => (
-            <Panel key={engName} title={engName} meta={`${group.length} unique`}>
-              {group.map((uf) => (
-                <FindingRow key={uf.key} uf={uf} />
-              ))}
-            </Panel>
+        <div className="space-y-3">
+          {pagedGroups.map(([engName, group]) => (
+            <EngagementGroup key={engName} name={engName} findings={group} />
           ))}
         </div>
       )}
 
-      {/* Pagination */}
-      {totalPages > 1 && (
+      {/* Engagement pagination */}
+      {totalEngPages > 1 && (
         <div className="flex items-center justify-between mt-3 px-1">
           <span className="text-xs text-ink-3 tnum">
-            Page {safePage} of {totalPages} · {filtered.length} unique of {findings.length} total
+            Page {safePage} of {totalEngPages} · {grouped.length} engagement{grouped.length === 1 ? "" : "s"} · {filtered.length} findings
           </span>
           <div className="flex items-center gap-1.5">
             <button
@@ -250,8 +247,8 @@ export default function FindingsPage() {
             >
               Previous
             </button>
-            {Array.from({ length: totalPages }, (_, i) => i + 1)
-              .filter((p) => p === 1 || p === totalPages || Math.abs(p - safePage) <= 1)
+            {Array.from({ length: totalEngPages }, (_, i) => i + 1)
+              .filter((p) => p === 1 || p === totalEngPages || Math.abs(p - safePage) <= 1)
               .reduce<(number | "…")[]>((acc, p) => {
                 const last = acc[acc.length - 1];
                 if (typeof last === "number" && p - last > 1) acc.push("…");
@@ -276,13 +273,153 @@ export default function FindingsPage() {
                 ),
               )}
             <button
-              disabled={safePage >= totalPages}
-              onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+              disabled={safePage >= totalEngPages}
+              onClick={() => setPage((p) => Math.min(totalEngPages, p + 1))}
               className="h-7 px-2.5 rounded text-xs bg-surface-2 border border-line text-ink hover:border-primary disabled:opacity-30 disabled:cursor-not-allowed"
             >
               Next
             </button>
           </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Engagement group — collapsible section                                     */
+/* -------------------------------------------------------------------------- */
+
+const SEV_COLOR: Record<string, string> = {
+  critical: "var(--sev-critical)",
+  high: "var(--sev-high)",
+  medium: "var(--sev-medium)",
+  low: "var(--sev-low)",
+  info: "var(--sev-info)",
+};
+
+function EngagementGroup({ name, findings }: { name: string; findings: UniqueFinding[] }) {
+  const [open, setOpen] = useState(false);
+  const [fPage, setFPage] = useState(1);
+
+  const sevCounts: Record<string, number> = {};
+  for (const uf of findings) {
+    const s = uf.representative.severity;
+    sevCounts[s] = (sevCounts[s] ?? 0) + 1;
+  }
+  const confirmedCount = findings.filter((uf) => uf.representative.status === "confirmed").length;
+  const highestSev = (["critical", "high", "medium", "low", "info"] as const).find((s) => sevCounts[s]) ?? "info";
+  const accentColor = SEV_COLOR[highestSev] ?? SEV_COLOR.info;
+
+  const totalFPages = Math.max(1, Math.ceil(findings.length / FINDING_PAGE_SIZE));
+  const safeFPage = Math.min(fPage, totalFPages);
+  const pagedFindings = findings.slice((safeFPage - 1) * FINDING_PAGE_SIZE, safeFPage * FINDING_PAGE_SIZE);
+
+  return (
+    <div className="bg-surface border border-line rounded-lg shadow-card overflow-hidden">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="w-full text-left px-4 py-3 flex items-center gap-3 hover:bg-surface-hover/50 transition-colors focus:outline-none"
+        style={{ borderLeft: `3px solid ${accentColor}` }}
+      >
+        <div className="min-w-0 flex-1">
+          <div className="text-sm font-semibold truncate">{name}</div>
+          <div className="flex items-center gap-2 mt-0.5 text-2xs text-ink-3">
+            <span>{findings.length} finding{findings.length === 1 ? "" : "s"}</span>
+            {confirmedCount > 0 && (
+              <>
+                <span className="text-ink-3/50">&middot;</span>
+                <span>{confirmedCount} confirmed</span>
+              </>
+            )}
+          </div>
+        </div>
+        <div className="flex items-center gap-1.5 shrink-0">
+          {(["critical", "high", "medium", "low", "info"] as const).map((s) => {
+            const n = sevCounts[s];
+            if (!n) return null;
+            return (
+              <span
+                key={s}
+                className="text-2xs font-medium tnum px-1.5 py-0.5 rounded"
+                style={{
+                  background: `color-mix(in srgb, ${SEV_COLOR[s]} 12%, transparent)`,
+                  color: SEV_COLOR[s],
+                }}
+              >
+                {n} {s}
+              </span>
+            );
+          })}
+        </div>
+        <svg
+          width="14"
+          height="14"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="2.5"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          className={`text-ink-3 transition-transform duration-200 shrink-0 ${open ? "rotate-180" : ""}`}
+        >
+          <polyline points="6 9 12 15 18 9" />
+        </svg>
+      </button>
+      {open && (
+        <div className="border-t border-line">
+          {pagedFindings.map((uf) => (
+            <FindingRow key={uf.key} uf={uf} />
+          ))}
+          {totalFPages > 1 && (
+            <div className="flex items-center justify-between px-4 py-2 border-t border-line bg-surface-2/30">
+              <span className="text-2xs text-ink-3 tnum">
+                {(safeFPage - 1) * FINDING_PAGE_SIZE + 1}–{Math.min(safeFPage * FINDING_PAGE_SIZE, findings.length)} of {findings.length}
+              </span>
+              <div className="flex items-center gap-1">
+                <button
+                  disabled={safeFPage <= 1}
+                  onClick={(e) => { e.stopPropagation(); setFPage((p) => Math.max(1, p - 1)); }}
+                  className="h-6 px-2 rounded text-2xs bg-surface border border-line text-ink hover:border-primary disabled:opacity-30 disabled:cursor-not-allowed"
+                >
+                  Prev
+                </button>
+                {Array.from({ length: totalFPages }, (_, i) => i + 1)
+                  .filter((p) => p === 1 || p === totalFPages || Math.abs(p - safeFPage) <= 1)
+                  .reduce<(number | "…")[]>((acc, p) => {
+                    const last = acc[acc.length - 1];
+                    if (typeof last === "number" && p - last > 1) acc.push("…");
+                    acc.push(p);
+                    return acc;
+                  }, [])
+                  .map((item, i) =>
+                    item === "…" ? (
+                      <span key={`e${i}`} className="text-2xs text-ink-3 px-0.5">&hellip;</span>
+                    ) : (
+                      <button
+                        key={item}
+                        onClick={(e) => { e.stopPropagation(); setFPage(item); }}
+                        className={`h-6 min-w-[24px] px-1 rounded text-2xs border tnum ${
+                          item === safeFPage
+                            ? "bg-primary text-white border-primary font-medium"
+                            : "bg-surface border-line text-ink hover:border-primary"
+                        }`}
+                      >
+                        {item}
+                      </button>
+                    ),
+                  )}
+                <button
+                  disabled={safeFPage >= totalFPages}
+                  onClick={(e) => { e.stopPropagation(); setFPage((p) => Math.min(totalFPages, p + 1)); }}
+                  className="h-6 px-2 rounded text-2xs bg-surface border border-line text-ink hover:border-primary disabled:opacity-30 disabled:cursor-not-allowed"
+                >
+                  Next
+                </button>
+              </div>
+            </div>
+          )}
         </div>
       )}
     </div>

@@ -55,6 +55,7 @@ class ScopeInput(BaseModel):
     # every PoC action is forced through human approval (BAR-30).
     allow_exploitation: bool = False
     poc_playbook: str = "http_evidence"
+    web_credentials: dict | None = None
 
     @field_validator("allowed_ports", mode="before")
     @classmethod

@@ -248,6 +248,10 @@ def open_ports_from_findings(db: Session, run_id: str) -> list[str]:
     return out
 
 
+_SEED_LOGOUT_RE = re.compile(
+    r"/(?:auth/)?(?:logout|signout|sign[_-]?out|log[_-]?out)\b", re.IGNORECASE)
+
+
 def webvuln_seed_urls(db: Session, scope: RunScope, *, base_url: str, cap: int = 80) -> list[str]:
     """Extra entry-point URLs to seed an active web scan for one base (scheme://host[:port]).
 
@@ -261,7 +265,8 @@ def webvuln_seed_urls(db: Session, scope: RunScope, *, base_url: str, cap: int =
          what the crawler could reach from '/'. This is what makes seeding automatic.
       2. an optional operator path/URL list via the VAPT_WEBVULN_SEED_PATHS env var
          (comma / whitespace / newline separated) — an override, no longer required.
-    De-duped and bounded to `cap`."""
+    De-duped and bounded to `cap`. Logout/signout URLs are excluded so authenticated
+    scanners (wapiti, nuclei_dast) don't destroy the session cookie by visiting them."""
     from urllib.parse import urljoin, urlparse
 
     base = base_url.rstrip("/") + "/"
@@ -287,8 +292,11 @@ def webvuln_seed_urls(db: Session, scope: RunScope, *, base_url: str, cap: int =
             continue
         url = item if item.lower().startswith(("http://", "https://")) \
             else urljoin(base, item.lstrip("/"))
-        if urlparse(url).hostname != base_host:
+        parsed = urlparse(url)
+        if parsed.hostname != base_host:
             continue                       # keep seeds on the in-scope host
+        if _SEED_LOGOUT_RE.search(parsed.path or ""):
+            continue                       # don't let scanners destroy the session
         if url not in seen:
             seen.add(url)
             seeds.append(url)
@@ -1899,6 +1907,7 @@ _PROOF_SOURCE_TOOLS = {"sstimap", "web_param_probe", "dalfox", "idor_probe",
                        "yaml_deserialization_probe", "dom_xss_probe",
                        "weak_cred_probe",
                        "xxe_probe",
+                       "nosqli_probe", "session_probe", "csrf_probe", "pii_probe",
                        "recon_agent.body_scanner"}
 
 # ---------------------------------------------------------------------------

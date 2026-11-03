@@ -14,7 +14,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 from vapt_domain.enums import Role, RunStatus, TestingMode
 from vapt_domain.schemas import RunCreate, RunOut
-from vapt_persistence.models import Approval, Engagement, Outbox, Run, RunEvent
+from vapt_persistence.models import Approval, Engagement, Outbox, Run, RunEvent, ScopeVersion
 
 from ..deps import CurrentUser, get_current_user, get_db, require_project_role
 
@@ -63,27 +63,48 @@ def create_run(
     creds_b_stashed = False
     creds_c_stashed = False
     is_black_box = eng.testing_mode == TestingMode.BLACK_BOX.value
-    if not is_black_box and body.web_username and body.web_password:
+
+    web_username = body.web_username
+    web_password = body.web_password
+    web_username_b = body.web_username_b
+    web_password_b = body.web_password_b
+    web_username_c = body.web_username_c
+    web_password_c = body.web_password_c
+
+    if not is_black_box and not (web_username and web_password):
+        sv = db.execute(
+            select(ScopeVersion)
+            .where(ScopeVersion.engagement_id == eng.id,
+                   ScopeVersion.version == eng.scope_version)
+        ).scalar_one_or_none()
+        if sv and sv.scope:
+            wc = sv.scope.get("web_credentials") or {}
+            admin = wc.get("admin") or {}
+            if admin.get("username") and admin.get("password"):
+                web_username = admin["username"]
+                web_password = admin["password"]
+            users = wc.get("users") or []
+            if len(users) >= 1 and users[0].get("username"):
+                web_username_b = users[0]["username"]
+                web_password_b = users[0].get("password", "")
+            if len(users) >= 2 and users[1].get("username"):
+                web_username_c = users[1]["username"]
+                web_password_c = users[1].get("password", "")
+
+    if not is_black_box and web_username and web_password:
         try:
-            from vapt_persistence import web_credentials
-            web_credentials.set_web_credentials(
-                run.id, body.web_username.strip(), body.web_password)
+            from vapt_persistence import web_credentials as wc_store
+            wc_store.set_web_credentials(
+                run.id, web_username.strip(), web_password)
             creds_stashed = True
-            # Second account for IDOR — only accepted when the primary set is present
-            # (same login_url is used for both, so A must succeed first).
-            if body.web_username_b and body.web_password_b:
-                web_credentials.set_web_credentials_b(
-                    run.id, body.web_username_b.strip(), body.web_password_b)
+            if web_username_b and web_password_b:
+                wc_store.set_web_credentials_b(
+                    run.id, web_username_b.strip(), web_password_b)
                 creds_b_stashed = True
-            # Third account enables the admin + 2-user IDOR model: the probe
-            # pairs B+C (two normal users) rather than A+B (admin+user), which
-            # avoids false "legitimate access" positives on admin-only pages
-            # the normal user is simply not allowed to see. B must be present
-            # too — a bare A+C makes no sense.
-            if (body.web_username_c and body.web_password_c
+            if (web_username_c and web_password_c
                     and creds_b_stashed):
-                web_credentials.set_web_credentials_c(
-                    run.id, body.web_username_c.strip(), body.web_password_c)
+                wc_store.set_web_credentials_c(
+                    run.id, web_username_c.strip(), web_password_c)
                 creds_c_stashed = True
         except Exception:
             creds_stashed = False  # degrade to unauthenticated, don't fail the run

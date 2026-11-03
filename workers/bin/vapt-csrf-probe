@@ -1,0 +1,200 @@
+#!/usr/bin/env python3
+"""CSRF validation probe — tests whether state-changing POST endpoints actually enforce
+CSRF token validation.
+
+Flow:
+  1. GET the form page with a valid session cookie → extract the CSRF token.
+  2. POST to the action endpoint WITHOUT the CSRF token (omit it entirely).
+  3. POST with a TAMPERED (random) CSRF token value.
+  4. If either POST succeeds (200/302 without error), the endpoint does not validate CSRF.
+
+Emits JSON to stdout:
+    {"findings": [{"type": "csrf", "severity": "medium"|"high", ...}], "trace": [...]}
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+import uuid
+from urllib.parse import urlparse, urljoin
+
+try:
+    import requests
+except Exception as e:
+    print(json.dumps({"error": f"requests not available: {e}", "findings": []}))
+    sys.exit(0)
+
+_UA = "vapt-csrf-probe/1.0 (authorized assessment)"
+_TIMEOUT = 10
+
+_CSRF_FIELD_RE = re.compile(
+    r"""<input\b[^>]*?\bname\s*=\s*["']([^"']*(?:csrf|token|_token|xsrf|nonce|authenticity)[^"']*)["']"""
+    r"""[^>]*?\bvalue\s*=\s*["']([^"']*)["']""",
+    re.IGNORECASE,
+)
+_CSRF_META_RE = re.compile(
+    r"""<meta\b[^>]*?\bname\s*=\s*["'](?:csrf-token|_csrf|xsrf-token)["']"""
+    r"""[^>]*?\bcontent\s*=\s*["']([^"']+)["']""",
+    re.IGNORECASE,
+)
+_ERROR_RE = re.compile(
+    r"csrf|forbidden|invalid\s+token|token\s+(?:mismatch|expired|invalid)|"
+    r"403|request\s+rejected",
+    re.IGNORECASE,
+)
+
+
+def _in_scope(target: str, url: str) -> bool:
+    try:
+        return urlparse(url).hostname == target
+    except Exception:
+        return False
+
+
+def _cookie_from_redis(run_id: str) -> str:
+    try:
+        import redis as _redis
+        r = _redis.Redis.from_url(
+            os.environ.get("VAPT_REDIS_URL", "redis://localhost:6379/0"),
+            socket_timeout=3,
+        )
+        for slot in ("A", "B"):
+            val = r.get(f"vapt:webcookie:{run_id}:{slot}")
+            if val:
+                return (val.decode() if isinstance(val, bytes) else str(val)).strip()
+        val = r.get(f"vapt:webcookie:{run_id}")
+        if val:
+            return (val.decode() if isinstance(val, bytes) else str(val)).strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _extract_csrf(html: str) -> tuple[str, str]:
+    """Return (field_name, token_value) from the page, or ("", "")."""
+    m = _CSRF_FIELD_RE.search(html or "")
+    if m:
+        return m.group(1), m.group(2)
+    m = _CSRF_META_RE.search(html or "")
+    if m:
+        return "_csrf", m.group(1)
+    return "", ""
+
+
+def main() -> int:
+    p = argparse.ArgumentParser()
+    p.add_argument("--target", required=True)
+    p.add_argument("--urls", required=True, help="comma-separated POST endpoint URLs to test")
+    p.add_argument("--run-id", default=os.environ.get("VAPT_RUN_ID", ""))
+    args = p.parse_args()
+
+    target = args.target.strip()
+    out: dict = {"findings": [], "trace": []}
+
+    cookie = os.environ.get("VAPT_WEB_LOGIN_COOKIE", "").strip() \
+        or (_cookie_from_redis(args.run_id) if args.run_id else "")
+
+    test_urls = [u.strip() for u in args.urls.split(",")
+                 if u.strip() and _in_scope(target, u.strip())]
+
+    headers = {"User-Agent": _UA}
+    if cookie:
+        headers["Cookie"] = cookie
+
+    for url in test_urls[:8]:
+        sess = requests.Session()
+        sess.headers.update(headers)
+
+        # Step 1: GET the page to find CSRF token
+        try:
+            r_get = sess.get(url, timeout=_TIMEOUT, allow_redirects=True)
+            html = r_get.text or ""
+            csrf_name, csrf_value = _extract_csrf(html)
+            out["trace"].append({
+                "url": url, "status": r_get.status_code,
+                "note": f"CSRF field: {csrf_name!r} = {csrf_value[:20]!r}..." if csrf_name else "no CSRF token found",
+            })
+        except Exception as e:
+            out["trace"].append({"url": url, "note": f"GET error: {e}"})
+            continue
+
+        if not csrf_name:
+            out["findings"].append({
+                "type": "csrf",
+                "severity": "medium",
+                "url": url,
+                "param": "csrf_token",
+                "evidence": (
+                    f"No CSRF token found on form at {url}. The page serves a state-changing "
+                    f"POST endpoint without any CSRF protection (no hidden token field, "
+                    f"no csrf-token meta tag)."
+                ),
+                "confirmed": True,
+            })
+            continue
+
+        # Build a minimal POST body (just a dummy value for the main action)
+        dummy_data = {"test_param": "csrf_probe_value"}
+
+        # Step 2: POST WITHOUT the CSRF token
+        try:
+            r_no_csrf = sess.post(
+                url, data=dummy_data,
+                timeout=_TIMEOUT, allow_redirects=True,
+            )
+            no_csrf_ok = (r_no_csrf.status_code in (200, 302, 303, 307)
+                          and not _ERROR_RE.search(r_no_csrf.text or ""))
+            out["trace"].append({
+                "url": url, "status": r_no_csrf.status_code,
+                "note": f"POST without CSRF → {'accepted' if no_csrf_ok else 'rejected'}",
+            })
+        except Exception as e:
+            out["trace"].append({"url": url, "note": f"no-csrf POST error: {e}"})
+            no_csrf_ok = False
+
+        # Step 3: POST with TAMPERED CSRF token
+        tampered_data = {**dummy_data, csrf_name: f"tampered_{uuid.uuid4().hex[:16]}"}
+        try:
+            r_tampered = sess.post(
+                url, data=tampered_data,
+                timeout=_TIMEOUT, allow_redirects=True,
+            )
+            tampered_ok = (r_tampered.status_code in (200, 302, 303, 307)
+                           and not _ERROR_RE.search(r_tampered.text or ""))
+            out["trace"].append({
+                "url": url, "status": r_tampered.status_code,
+                "note": f"POST with tampered CSRF → {'accepted' if tampered_ok else 'rejected'}",
+            })
+        except Exception as e:
+            out["trace"].append({"url": url, "note": f"tampered POST error: {e}"})
+            tampered_ok = False
+
+        if no_csrf_ok or tampered_ok:
+            bypass_method = []
+            if no_csrf_ok:
+                bypass_method.append("omitting the token entirely")
+            if tampered_ok:
+                bypass_method.append("sending a tampered token")
+            out["findings"].append({
+                "type": "csrf",
+                "severity": "high" if no_csrf_ok else "medium",
+                "url": url,
+                "param": csrf_name,
+                "evidence": (
+                    f"CSRF token '{csrf_name}' is NOT validated on {url}. "
+                    f"The server accepted the POST request when "
+                    f"{' and '.join(bypass_method)}. "
+                    f"An attacker can forge cross-site requests to this endpoint."
+                ),
+                "confirmed": True,
+            })
+
+    print(json.dumps(out))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

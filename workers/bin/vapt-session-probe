@@ -1,0 +1,252 @@
+#!/usr/bin/env python3
+"""Session security probe — tests for session fixation and related session management issues.
+
+Session fixation: if the session cookie does NOT change after authentication, an attacker
+who knows (or sets) the pre-auth session ID can hijack the post-auth session.
+
+Flow:
+  1. GET the login page — record the session cookie value.
+  2. POST valid credentials — record the session cookie value after login.
+  3. If pre-auth cookie == post-auth cookie → session fixation confirmed.
+  4. Also checks: HttpOnly flag, Secure flag, SameSite attribute.
+
+Emits JSON to stdout:
+    {"findings": [{"type": "session_fixation"|"insecure_cookie", ...}], "trace": [...]}
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+from urllib.parse import urlparse
+
+try:
+    import requests
+except Exception as e:
+    print(json.dumps({"error": f"requests not available: {e}", "findings": []}))
+    sys.exit(0)
+
+_UA = "vapt-session-probe/1.0 (authorized assessment)"
+_TIMEOUT = 10
+
+_INPUT_RE = re.compile(
+    r"""<input\b[^>]*?\bname\s*=\s*["']([^"']+)["'][^>]*?\btype\s*=\s*["']([^"']+)["']"""
+    r"""|<input\b[^>]*?\btype\s*=\s*["']([^"']+)["'][^>]*?\bname\s*=\s*["']([^"']+)["']""",
+    re.IGNORECASE,
+)
+_LOGOUT_RE = re.compile(
+    r"""href\s*=\s*["'][^"']*/(?:auth/)?(?:logout|signout|sign[_-]?out|log[_-]?out)\b"""
+    r"""|>\s*(?:logout|log\s*out|sign\s*out)\s*<""",
+    re.IGNORECASE,
+)
+
+
+def _in_scope(target: str, url: str) -> bool:
+    try:
+        return urlparse(url).hostname == target
+    except Exception:
+        return False
+
+
+def _detect_form_fields(html: str) -> tuple[str, str]:
+    user_field = ""
+    pass_field = ""
+    for m in _INPUT_RE.finditer(html or ""):
+        name = (m.group(1) or m.group(4) or "")
+        itype = (m.group(2) or m.group(3) or "").lower()
+        if itype == "password" and not pass_field:
+            pass_field = name
+        elif itype in ("text", "email") and not user_field:
+            user_field = name
+    return user_field or "userName", pass_field or "password"
+
+
+def _session_cookie_value(resp_cookies) -> dict[str, str]:
+    """Extract session-like cookies (name contains 'sess' or 'sid' or 'connect')."""
+    result: dict[str, str] = {}
+    for c in resp_cookies:
+        nl = (c.name or "").lower()
+        if any(k in nl for k in ("sess", "sid", "connect", "token", "auth", "jsessionid")):
+            result[c.name] = c.value or ""
+    if not result and resp_cookies:
+        for c in resp_cookies:
+            result[c.name] = c.value or ""
+            break
+    return result
+
+
+def _get_credentials(run_id: str) -> tuple[str, str]:
+    try:
+        import redis as _redis
+        r = _redis.Redis.from_url(
+            os.environ.get("VAPT_REDIS_URL", "redis://localhost:6379/0"),
+            socket_timeout=3,
+        )
+        user = r.get(f"vapt:webcreds:{run_id}:username")
+        pw = r.get(f"vapt:webcreds:{run_id}:password")
+        if user and pw:
+            return (user.decode() if isinstance(user, bytes) else str(user),
+                    pw.decode() if isinstance(pw, bytes) else str(pw))
+    except Exception:
+        pass
+    return "", ""
+
+
+def main() -> int:
+    p = argparse.ArgumentParser()
+    p.add_argument("--target", required=True)
+    p.add_argument("--login-url", required=True)
+    p.add_argument("--username", default="")
+    p.add_argument("--password", default="")
+    p.add_argument("--run-id", default=os.environ.get("VAPT_RUN_ID", ""))
+    args = p.parse_args()
+
+    target = args.target.strip()
+    login_url = args.login_url.strip()
+    out: dict = {"findings": [], "trace": []}
+
+    if not _in_scope(target, login_url):
+        out["trace"].append({"url": login_url, "note": "off-scope"})
+        print(json.dumps(out)); return 0
+
+    username = args.username or ""
+    password = args.password or ""
+    if not (username and password) and args.run_id:
+        username, password = _get_credentials(args.run_id)
+    if not (username and password):
+        out["trace"].append({"note": "no credentials available, skipping session fixation test"})
+        print(json.dumps(out)); return 0
+
+    # Step 1: GET login page with a FRESH session (empty cookie jar) to capture
+    # the pre-auth session cookie value. We must NOT reuse this session for the
+    # POST — requests.Session mutates its cookie jar in-place, so the jar would
+    # hold the same object across both requests and pre/post comparison would
+    # always see the same value.  Instead we record the raw Set-Cookie values
+    # from the response headers directly.
+    sess = requests.Session()
+    sess.headers.update({"User-Agent": _UA})
+    pre_set_cookie_headers: list[str] = []
+    try:
+        r1 = sess.get(login_url, timeout=_TIMEOUT, allow_redirects=True)
+        if hasattr(r1.raw.headers, "getlist"):
+            pre_set_cookie_headers = r1.raw.headers.getlist("Set-Cookie")
+        else:
+            sc = r1.headers.get("Set-Cookie", "")
+            if sc:
+                pre_set_cookie_headers = [sc]
+        pre_auth_cookies = _session_cookie_value(sess.cookies)
+        # Snapshot the pre-auth values from the JAR (before the POST mutates it).
+        pre_auth_values: dict[str, str] = {k: v for k, v in pre_auth_cookies.items()}
+        out["trace"].append({
+            "url": login_url, "status": r1.status_code,
+            "note": f"pre-auth cookies: {list(pre_auth_cookies.keys())} "
+                    f"vals=[{', '.join(v[:16] + '...' for v in pre_auth_values.values())}]",
+        })
+    except Exception as e:
+        out["trace"].append({"url": login_url, "note": f"GET error: {e}"})
+        print(json.dumps(out)); return 0
+
+    if not pre_auth_values:
+        out["trace"].append({"note": "no session cookie set pre-auth, cannot test fixation"})
+        print(json.dumps(out)); return 0
+
+    # Step 2: POST credentials (same session so the pre-auth cookie is sent along —
+    # this is exactly how session fixation works: the attacker-set cookie persists).
+    html = r1.text if r1.ok else ""
+    user_field, pass_field = _detect_form_fields(html)
+    post_set_cookie_headers: list[str] = []
+    try:
+        r2 = sess.post(
+            login_url,
+            data={user_field: username, pass_field: password},
+            timeout=_TIMEOUT, allow_redirects=True,
+        )
+        if hasattr(r2.raw.headers, "getlist"):
+            post_set_cookie_headers = r2.raw.headers.getlist("Set-Cookie")
+        else:
+            sc2 = r2.headers.get("Set-Cookie", "")
+            if sc2:
+                post_set_cookie_headers = [sc2]
+        post_auth_cookies = _session_cookie_value(sess.cookies)
+        body = r2.text or ""
+        out["trace"].append({
+            "url": login_url, "status": r2.status_code,
+            "note": f"post-auth cookies: {list(post_auth_cookies.keys())}, "
+                    f"authenticated={bool(_LOGOUT_RE.search(body))}",
+        })
+    except Exception as e:
+        out["trace"].append({"url": login_url, "note": f"POST error: {e}"})
+        print(json.dumps(out)); return 0
+
+    if not _LOGOUT_RE.search(body):
+        out["trace"].append({"note": "login did not produce authenticated session"})
+        print(json.dumps(out)); return 0
+
+    # Step 3: Compare pre-auth vs post-auth session cookies.
+    # The real test: did the server issue a NEW Set-Cookie with a DIFFERENT value
+    # for the session cookie after authentication?  If the cookie value is the same
+    # as before login, the session was NOT regenerated → fixation.
+    for cookie_name, pre_val in pre_auth_values.items():
+        post_val = post_auth_cookies.get(cookie_name, "")
+        if not pre_val or not post_val:
+            continue
+        if pre_val == post_val:
+            out["findings"].append({
+                "type": "session_fixation",
+                "severity": "high",
+                "url": login_url,
+                "param": cookie_name,
+                "evidence": (
+                    f"Session fixation: cookie '{cookie_name}' was NOT regenerated "
+                    f"after successful authentication. Pre-auth value == post-auth value "
+                    f"({pre_val[:16]}...). An attacker who sets this cookie before the "
+                    f"victim logs in can hijack the authenticated session."
+                ),
+                "confirmed": True,
+            })
+
+    # Step 4: Check cookie security attributes from the Set-Cookie headers.
+    all_set_cookie = pre_set_cookie_headers + post_set_cookie_headers
+    for c in sess.cookies:
+        issues: list[str] = []
+        nl = (c.name or "").lower()
+        is_session = any(k in nl for k in ("sess", "sid", "connect", "token", "auth"))
+        if not is_session:
+            continue
+
+        raw_header = ""
+        for hdr in all_set_cookie:
+            if c.name in hdr:
+                raw_header = hdr
+                break
+
+        if not c.has_nonstandard_attr("HttpOnly") and "httponly" not in raw_header.lower():
+            issues.append("missing HttpOnly flag")
+        if not c.secure and "secure" not in raw_header.lower():
+            parsed = urlparse(login_url)
+            if parsed.scheme == "https":
+                issues.append("missing Secure flag on HTTPS site")
+        if "samesite" not in raw_header.lower():
+            issues.append("missing SameSite attribute")
+
+        if issues:
+            out["findings"].append({
+                "type": "insecure_cookie",
+                "severity": "medium",
+                "url": login_url,
+                "param": c.name,
+                "evidence": (
+                    f"Session cookie '{c.name}' has security issues: "
+                    f"{'; '.join(issues)}."
+                ),
+                "confirmed": True,
+            })
+
+    print(json.dumps(out))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

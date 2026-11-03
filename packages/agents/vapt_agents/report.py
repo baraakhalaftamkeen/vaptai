@@ -188,8 +188,93 @@ def _evidence_line(obs: dict) -> str:
     return f'<span class="tool">{_e(obs.get("source_tool", "tool"))}</span>{(" " + extra) if extra else ""}'
 
 
+_LOGO_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 180 33" width="140" height="26">'
+    '<path d="M 48.69 23.84 L 54.17 29.39 L 67.73 29.39 C 67.73 29.39 62.11 23.49 55.68 16.93 Z '
+    'M 39.39 13.91 L 46.11 7.27 L 45.91 7.07 C 36.92 -1.49 30.46 -0.63 23.83 5.93 L 0.04 29.45 '
+    'L 14.61 29.45 L 34.88 9.44 L 39.39 13.9 Z" fill="#C10230"/>'
+    '<path d="M 55.15 0.8 L 34.88 20.7 L 30.37 16.24 L 23.65 22.88 C 23.72 22.94 23.79 23.01 '
+    '23.85 23.08 C 32.88 32.01 39.3 30.78 45.93 24.22 L 69.71 0.8 L 55.14 0.8 Z M 21.06 6.31 '
+    'L 15.58 0.76 L 2.02 0.76 C 2.02 0.76 7.64 6.66 14.07 13.22 Z" fill="#F99D1C"/>'
+    '<text x="76" y="13" font-family="Arial,Helvetica,sans-serif" font-size="12" '
+    'font-weight="700" fill="#0f172a">Tamkeen</text>'
+    '<text x="76" y="27" font-family="Arial,Helvetica,sans-serif" font-size="12" '
+    'font-weight="700" fill="#0f172a">Technologies</text></svg>'
+)
+
+import re as _re
+
+def _group_key(title: str) -> str:
+    key = title
+    key = _re.sub(r"\s+at\s+https?://.*$", "", key, flags=_re.IGNORECASE)
+    key = _re.sub(r"\s+at\s+/\S.*$", "", key, flags=_re.IGNORECASE)
+    key = _re.sub(r"\s+on\s+parameter\s+'[^']*'", "", key, flags=_re.IGNORECASE)
+    key = _re.sub(r"\s*\([^)]*\)\s*$", "", key)
+    return key.strip() or title
+
+
+def _parse_remediation(raw: str) -> str:
+    if not raw or not raw.strip():
+        return "<p class='muted'>No remediation guidance was generated.</p>"
+
+    table_rows: list[dict[str, str]] = []
+    for m in _re.finditer(
+        r"\*{0,2}(critical|high|medium|low|info)\*{0,2}"
+        r"\s*\|\s*(.*?)\s*\|\s*(.*?)\s*\|\s*(.*?)\s*(?:\||$)",
+        raw, _re.IGNORECASE,
+    ):
+        table_rows.append({
+            "severity": m.group(1).strip().lower(),
+            "finding": _re.sub(r"\*{1,2}", "", m.group(2)).strip(),
+            "fix": _re.sub(r"\*{1,2}", "", m.group(3)).strip(),
+            "detail": _re.sub(r"\*{1,2}", "", m.group(4)).strip().rstrip("|").strip(),
+        })
+
+    summary_m = _re.search(r"\*{0,2}Summary\*{0,2}\s*(.+?)$", raw, _re.IGNORECASE)
+    summary_text = _re.sub(r"\*{1,2}", "", summary_m.group(1)).strip() if summary_m else ""
+
+    steps: list[str] = []
+    for m in _re.finditer(r"(?:^|\|)\s*\d+\.\s*([^|]+)", raw):
+        step = _re.sub(r"\*{1,2}", "", m.group(1)).strip()
+        if step and len(step) > 10:
+            steps.append(step)
+
+    if not table_rows and not steps:
+        return f"<p>{_e(raw)}</p>"
+
+    parts: list[str] = []
+    if table_rows:
+        parts.append(
+            '<table class="rem-table"><thead><tr>'
+            '<th>Severity</th><th>Finding</th><th>Immediate Fix</th><th>Long-Term</th>'
+            '</tr></thead><tbody>'
+        )
+        for r in table_rows:
+            sev = r["severity"]
+            color = _SEV_COLOR.get(sev, "#475569")
+            parts.append(
+                f'<tr><td><span class="badge" style="background:{color}">{_e(sev)}</span></td>'
+                f'<td>{_e(r["finding"])}</td>'
+                f'<td>{_e(r["fix"])}</td>'
+                f'<td>{_e(r["detail"])}</td></tr>'
+            )
+        parts.append("</tbody></table>")
+
+    if steps:
+        parts.append('<div class="rem-steps"><h3>Recommended Actions</h3><ol>')
+        for s in steps:
+            parts.append(f'<li>{_e(s)}</li>')
+        parts.append("</ol></div>")
+
+    if summary_text:
+        parts.append(f'<div class="rem-summary"><p>{_e(summary_text)}</p></div>')
+
+    return "".join(parts) if parts else f"<p>{_e(raw)}</p>"
+
+
 def render_html(data: ReportData, *, summary: str = "", remediation: str = "",
-                title: str = "Assessment report") -> str:
+                title: str = "Assessment report",
+                report_status: str = "draft") -> str:
     c = data.counts
     sev_cards = "".join(
         f'<div class="sev"><span class="dot" style="background:{_SEV_COLOR[s]}"></span>'
@@ -197,49 +282,55 @@ def render_html(data: ReportData, *, summary: str = "", remediation: str = "",
         for s in SEVERITY_ORDER
     )
 
-    sections = []
+    all_findings: list[dict] = []
     for s in SEVERITY_ORDER:
-        items = data.findings_by_sev.get(s, [])
-        if not items:
-            continue
-        rows = []
-        for f in items:
-            ev = "".join(f'<li>{_evidence_line(o)}</li>' for o in f["observations"]) or \
-                "<li class='muted'>no linked evidence</li>"
-            # Framework-tag chips — rendered inline below the title when the skill
-            # library mapped any MITRE/CWE/OWASP tags via `_framework_refs_for_tools`.
-            # Each tag is tool-sourced data (frontmatter YAML the loader validated),
-            # not model output, so it's safe to render without escaping the slug
-            # formatter — but we html-escape anyway (defense in depth).
-            refs = f.get("framework_refs") or {}
-            chips = []
-            for tag in refs.get("mitre_attack", [])[:6]:
-                chips.append(f'<span class="chip chip-mitre">MITRE {_e(tag)}</span>')
-            for tag in refs.get("cwe", [])[:6]:
-                chips.append(f'<span class="chip chip-cwe">{_e(tag)}</span>')
-            for tag in refs.get("owasp", [])[:4]:
-                chips.append(f'<span class="chip chip-owasp">OWASP {_e(tag)}</span>')
-            chips_html = f'<div class="chips">{"".join(chips)}</div>' if chips else ""
-            rows.append(
-                f'<div class="finding">'
-                f'<div class="fhead"><span class="badge" style="background:{_SEV_COLOR[s]}">{_e(s)}</span>'
-                f'<span class="status">{_e(f["status"])}</span>'
-                f'<span class="ftitle">{_e(f["title"])}</span></div>'
-                f'{chips_html}'
-                f'{("<p class=fdesc>" + _e(f["description"]) + "</p>") if f["description"] else ""}'
-                f'<ul class="evidence">{ev}</ul></div>'
-            )
-        sections.append(f'<h2>{_e(s.title())} ({len(items)})</h2>' + "".join(rows))
-    findings_html = "".join(sections) or "<p class='muted'>No findings recorded.</p>"
+        for f in data.findings_by_sev.get(s, []):
+            all_findings.append(f)
 
-    gaps_html = (
-        "<ul class='gaps'>" + "".join(f"<li>{_e(g)}</li>" for g in data.coverage_gaps) + "</ul>"
-        if data.coverage_gaps else "<p class='muted'>No coverage gaps recorded.</p>"
-    )
+    groups: list[tuple[str, str, list[dict]]] = []
+    group_map: dict[str, list[dict]] = {}
+    group_order: list[str] = []
+    for f in all_findings:
+        k = _group_key(f["title"])
+        if k not in group_map:
+            group_map[k] = []
+            group_order.append(k)
+        group_map[k].append(f)
+    for k in group_order:
+        items = group_map[k]
+        best_sev = "info"
+        for f in items:
+            if SEVERITY_ORDER.index(f["severity"]) < SEVERITY_ORDER.index(best_sev):
+                best_sev = f["severity"]
+        groups.append((k, best_sev, items))
+
+    findings_html_parts: list[str] = []
+    for gkey, gsev, gitems in groups:
+        color = _SEV_COLOR.get(gsev, "#475569")
+        count = len(gitems)
+        if count == 1:
+            f = gitems[0]
+            findings_html_parts.append(_render_finding(f))
+        else:
+            findings_html_parts.append(
+                f'<div class="finding-group">'
+                f'<div class="group-header">'
+                f'<span class="group-accent" style="background:{color}"></span>'
+                f'<span class="badge" style="background:{color}">{_e(gsev)}</span>'
+                f'<span class="group-title">{_e(gkey)}</span>'
+                f'<span class="group-count">{count} finding{"s" if count > 1 else ""}</span>'
+                f'</div>'
+                f'<div class="group-items">'
+            )
+            for f in gitems:
+                findings_html_parts.append(_render_finding(f, nested=True))
+            findings_html_parts.append("</div></div>")
+
+    findings_html = "".join(findings_html_parts) or "<p class='muted'>No findings recorded.</p>"
+
     summary_html = f"<p>{_e(summary)}</p>" if summary else \
         "<p class='muted'>No executive summary was generated (model offline).</p>"
-    remediation_html = f"<p>{_e(remediation)}</p>" if remediation else \
-        "<p class='muted'>No remediation guidance was generated (model offline).</p>"
+    remediation_html = _parse_remediation(remediation)
 
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
@@ -247,73 +338,180 @@ def render_html(data: ReportData, *, summary: str = "", remediation: str = "",
 <title>{_e(title)} — {_e(data.engagement_name)}</title>
 <style>
   :root {{ color-scheme: light; }}
-  * {{ box-sizing: border-box; }}
-  body {{ font: 14px/1.6 -apple-system, "Segoe UI", Roboto, sans-serif; color:#0f172a;
-         background:#fff; margin:0; padding:40px; max-width:900px; margin:0 auto; }}
-  header {{ border-bottom:2px solid #0f172a; padding-bottom:16px; margin-bottom:24px; }}
-  h1 {{ font-size:22px; margin:0 0 4px; }}
-  h2 {{ font-size:15px; margin:28px 0 10px; padding-bottom:4px; border-bottom:1px solid #e2e8f0; }}
-  .meta {{ color:#475569; font-size:12px; }}
-  .mono {{ font-family: ui-monospace, "SFMono-Regular", Menlo, monospace; }}
-  .sevrow {{ display:flex; gap:18px; flex-wrap:wrap; margin:18px 0; }}
-  .sev {{ display:flex; align-items:center; gap:6px; }}
-  .sev .dot {{ width:10px; height:10px; border-radius:50%; display:inline-block; }}
-  .sev .n {{ font-weight:700; font-size:16px; }}
-  .sev .lbl {{ color:#475569; font-size:12px; text-transform:uppercase; letter-spacing:.04em; }}
-  .finding {{ border:1px solid #e2e8f0; border-radius:8px; padding:12px 14px; margin:8px 0; }}
-  .fhead {{ display:flex; align-items:center; gap:10px; flex-wrap:wrap; }}
-  .badge {{ color:#fff; font-size:10px; text-transform:uppercase; letter-spacing:.05em;
-            padding:2px 7px; border-radius:4px; }}
-  .status {{ font-size:11px; color:#475569; text-transform:uppercase; letter-spacing:.04em; }}
-  .ftitle {{ font-weight:600; }}
-  .fdesc {{ color:#334155; margin:8px 0 6px; }}
-  .evidence {{ margin:6px 0 0; padding-left:18px; font-size:12.5px; }}
-  .evidence .tool {{ font-family: ui-monospace, monospace; background:#f1f5f9;
-                     padding:1px 5px; border-radius:3px; }}
+  * {{ box-sizing: border-box; margin:0; padding:0; }}
+  body {{ font: 13px/1.55 -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+         color:#0f172a; background:#fff; }}
+  p {{ margin:0 0 6px; }}
+
+  .container {{ max-width:820px; margin:0 auto; padding:24px 32px; }}
+  .report-header {{ background:#0f172a; color:#fff; padding:18px 0;
+                    print-color-adjust:exact; -webkit-print-color-adjust:exact; }}
+  .report-header .container {{ display:flex; align-items:center; justify-content:space-between;
+         padding-top:0; padding-bottom:0; }}
+  .report-header .hdr-left {{ display:flex; align-items:center; gap:16px; }}
+  .report-header .hdr-logo {{ flex-shrink:0; }}
+  .report-header h1 {{ font-size:16px; margin:0; font-weight:700; color:#fff; line-height:1.3; }}
+  .report-header .hdr-meta {{ font-size:10px; color:#94a3b8; margin-top:1px; line-height:1.4; }}
+  .hdr-badge {{ font-size:9px; text-transform:uppercase; letter-spacing:.06em; font-weight:700;
+         padding:4px 10px; border-radius:3px; white-space:nowrap;
+         print-color-adjust:exact; -webkit-print-color-adjust:exact; }}
+  .hdr-badge-draft {{ background:rgba(255,255,255,.12); color:#e2e8f0; border:1px solid rgba(255,255,255,.2); }}
+  .hdr-badge-final {{ background:#047857; color:#fff; }}
+
+  h2 {{ font-size:12px; font-weight:700; margin:20px 0 8px; padding-bottom:4px;
+       border-bottom:1.5px solid #cbd5e1; text-transform:uppercase;
+       letter-spacing:.05em; color:#334155; }}
+  h3 {{ font-size:12px; font-weight:600; margin:10px 0 4px; color:#475569; }}
+  .meta {{ color:#64748b; font-size:11px; }}
+  .mono {{ font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace; font-size:0.92em; }}
+
+  /* Severity row */
+  .sevrow {{ display:flex; gap:16px; flex-wrap:wrap; margin:14px 0 6px; padding:10px 16px;
+            background:#f8fafc; border-radius:6px; border:1px solid #e2e8f0;
+            print-color-adjust:exact; -webkit-print-color-adjust:exact; }}
+  .sev {{ display:flex; align-items:center; gap:5px; }}
+  .sev .dot {{ width:8px; height:8px; border-radius:50%; display:inline-block;
+              print-color-adjust:exact; -webkit-print-color-adjust:exact; }}
+  .sev .n {{ font-weight:700; font-size:15px; }}
+  .sev .lbl {{ color:#64748b; font-size:10px; text-transform:uppercase; letter-spacing:.04em; }}
+
+  /* Summary box */
+  .summary-box {{ background:#f8fafc; border:1px solid #e2e8f0; border-radius:6px;
+                  padding:12px 16px; margin:6px 0; }}
+  .summary-box p {{ margin:0; font-size:13px; line-height:1.55; }}
+
+  /* Findings */
+  .finding {{ border:1px solid #e2e8f0; border-radius:6px; padding:8px 12px; margin:5px 0;
+             page-break-inside:avoid; }}
+  .fhead {{ display:flex; align-items:center; gap:8px; flex-wrap:wrap; }}
+  .badge {{ color:#fff; font-size:9px; text-transform:uppercase; letter-spacing:.05em;
+            padding:1px 6px; border-radius:3px; font-weight:700;
+            print-color-adjust:exact; -webkit-print-color-adjust:exact; }}
+  .status {{ font-size:10px; color:#64748b; text-transform:uppercase; letter-spacing:.04em; }}
+  .ftitle {{ font-weight:600; font-size:12px; }}
+  .fdesc {{ color:#334155; margin:4px 0; font-size:12px; }}
+  .evidence {{ margin:4px 0 0; padding-left:16px; font-size:11px; }}
+  .evidence li {{ margin:1px 0; }}
+  .evidence .tool {{ font-family: ui-monospace, Consolas, monospace; background:#f1f5f9;
+                     padding:0 4px; border-radius:2px; font-size:10px; }}
   .muted {{ color:#94a3b8; }}
-  .gaps li {{ color:#334155; }}
-  .chips {{ margin:6px 0 4px; display:flex; gap:5px; flex-wrap:wrap; }}
-  .chip {{ display:inline-block; font-size:10.5px; font-family: ui-monospace, monospace;
-           padding:1px 7px; border-radius:10px; border:1px solid transparent;
-           letter-spacing:.02em; }}
+  .chips {{ margin:4px 0 2px; display:flex; gap:4px; flex-wrap:wrap; }}
+  .chip {{ display:inline-block; font-size:9px; font-family: ui-monospace, monospace;
+           padding:0 6px; border-radius:8px; border:1px solid transparent; }}
   .chip-mitre {{ background:#eef2ff; color:#3730a3; border-color:#c7d2fe; }}
   .chip-cwe   {{ background:#fef3c7; color:#92400e; border-color:#fde68a; }}
   .chip-owasp {{ background:#fce7f3; color:#9d174d; border-color:#fbcfe8; }}
-  .cols {{ display:grid; grid-template-columns:1fr 1fr; gap:24px; }}
-  footer {{ margin-top:40px; padding-top:14px; border-top:1px solid #e2e8f0;
-            color:#94a3b8; font-size:11px; }}
-  @media print {{ body {{ padding:0; }} .finding {{ break-inside:avoid; }} }}
+
+  /* Finding groups */
+  .finding-group {{ border:1px solid #e2e8f0; border-radius:6px; margin:6px 0;
+                    overflow:hidden; page-break-inside:avoid; }}
+  .group-header {{ display:flex; align-items:center; gap:8px; padding:8px 12px;
+                   background:#f8fafc; border-bottom:1px solid #e2e8f0; position:relative;
+                   print-color-adjust:exact; -webkit-print-color-adjust:exact; }}
+  .group-accent {{ position:absolute; left:0; top:0; bottom:0; width:3px;
+                  print-color-adjust:exact; -webkit-print-color-adjust:exact; }}
+  .group-title {{ font-weight:600; font-size:12px; flex:1; }}
+  .group-count {{ font-size:10px; color:#475569; background:#e2e8f0; padding:1px 8px;
+                  border-radius:10px; font-weight:600; white-space:nowrap;
+                  print-color-adjust:exact; -webkit-print-color-adjust:exact; }}
+  .group-items {{ padding-left:10px; border-left:2px solid #e2e8f0; margin-left:10px; }}
+  .group-items .finding {{ border-radius:4px; margin:4px 6px 4px 0; }}
+
+  /* Remediation table */
+  .rem-table {{ width:100%; border-collapse:collapse;
+               border:1px solid #e2e8f0; border-radius:6px; overflow:hidden;
+               margin:8px 0; font-size:11px; page-break-inside:auto; }}
+  .rem-table th {{ background:#f1f5f9; text-align:left; padding:6px 10px; font-size:10px;
+                  text-transform:uppercase; letter-spacing:.04em; color:#475569;
+                  border-bottom:1.5px solid #cbd5e1; font-weight:700;
+                  print-color-adjust:exact; -webkit-print-color-adjust:exact; }}
+  .rem-table td {{ padding:7px 10px; border-bottom:1px solid #f1f5f9; vertical-align:top; }}
+  .rem-table tr:last-child td {{ border-bottom:none; }}
+  .rem-table tr {{ page-break-inside:avoid; }}
+  .rem-steps {{ margin:10px 0; }}
+  .rem-steps ol {{ padding-left:18px; margin:4px 0; }}
+  .rem-steps li {{ margin:3px 0; color:#334155; font-size:12px; }}
+  .rem-summary {{ background:#fffbeb; border:1px solid #fde68a; border-radius:6px;
+                  padding:8px 14px; margin:10px 0;
+                  print-color-adjust:exact; -webkit-print-color-adjust:exact; }}
+  .rem-summary p {{ margin:0; color:#92400e; font-size:12px; }}
+
+  footer {{ margin-top:24px; padding:10px 0; border-top:1.5px solid #cbd5e1;
+            color:#94a3b8; font-size:10px; display:flex; align-items:center;
+            justify-content:space-between; }}
+  @media print {{
+    body {{ font-size:11px; }}
+    .container {{ padding:16px 24px; }}
+    .report-header {{ padding:14px 0; }}
+    h2 {{ margin:14px 0 6px; }}
+  }}
+  @page {{ size:A4; margin:12mm 10mm; }}
 </style></head>
 <body>
-  <header>
-    <h1>{_e(title)}</h1>
-    <div class="meta">
-      {_e(data.engagement_name)} · {_e(data.project_name)} ·
-      {_e(data.testing_mode)} / {_e(data.target_type)} ·
-      run <span class="mono">{_e(data.run_id[:8])}</span> · generated {_e(data.generated_at)}
+  <div class="report-header">
+    <div class="container">
+      <div class="hdr-left">
+        <div class="hdr-logo">{_LOGO_SVG}</div>
+        <div>
+          <h1>{_e(title)}</h1>
+          <div class="hdr-meta">
+            {_e(data.engagement_name)} &middot; {_e(data.project_name)} &middot;
+            {_e(data.testing_mode)} / {_e(data.target_type)} &middot;
+            run <span class="mono">{_e(data.run_id[:8])}</span>
+          </div>
+        </div>
+      </div>
+      <div class="hdr-badge {'hdr-badge-final' if report_status == 'final' else 'hdr-badge-draft'}">{'FINAL' if report_status == 'final' else 'DRAFT'} &middot; {_e(data.generated_at)}</div>
     </div>
-  </header>
-
-  <div class="sevrow">{sev_cards}</div>
-  <div class="meta">
-    {c.get("total", 0)} findings · {c.get("confirmed", 0)} confirmed ·
-    {c.get("candidate", 0)} candidate · {c.get("inconclusive", 0)} inconclusive
   </div>
 
-  <h2>Executive summary</h2>{summary_html}
+  <div class="container">
+    <div class="sevrow">{sev_cards}</div>
+    <div class="meta">
+      {c.get("total", 0)} findings &middot; {c.get("confirmed", 0)} confirmed &middot;
+      {c.get("candidate", 0)} candidate &middot; {c.get("inconclusive", 0)} inconclusive
+    </div>
 
-  <div class="cols">
-    <div><h2>Remediation</h2>{remediation_html}</div>
-    <div><h2>Coverage gaps</h2>{gaps_html}</div>
+    <h2>Executive Summary</h2>
+    <div class="summary-box">{summary_html}</div>
+
+    <h2>Remediation Guidance</h2>
+    {remediation_html}
+
+    <h2>Findings</h2>
+    {findings_html}
+
+    <footer>
+      <span>{'Signed-off report.' if report_status == 'final' else 'Draft &mdash; review before release.'}
+        Generated by VAPT-AI.</span>
+      <span>{_LOGO_SVG}</span>
+    </footer>
   </div>
-
-  <h2>Findings</h2>{findings_html}
-
-  <footer>
-    Draft report. Findings are evidence-linked; a candidate becomes confirmed only after
-    independent validation. Generated by the VAPT-AI reporting agent — review before release.
-  </footer>
 </body></html>"""
+
+
+def _render_finding(f: dict, nested: bool = False) -> str:
+    s = f["severity"]
+    ev = "".join(f'<li>{_evidence_line(o)}</li>' for o in f["observations"]) or \
+        "<li class='muted'>no linked evidence</li>"
+    refs = f.get("framework_refs") or {}
+    chips = []
+    for tag in refs.get("mitre_attack", [])[:6]:
+        chips.append(f'<span class="chip chip-mitre">MITRE {_e(tag)}</span>')
+    for tag in refs.get("cwe", [])[:6]:
+        chips.append(f'<span class="chip chip-cwe">{_e(tag)}</span>')
+    for tag in refs.get("owasp", [])[:4]:
+        chips.append(f'<span class="chip chip-owasp">OWASP {_e(tag)}</span>')
+    chips_html = f'<div class="chips">{"".join(chips)}</div>' if chips else ""
+    return (
+        f'<div class="finding">'
+        f'<div class="fhead"><span class="badge" style="background:{_SEV_COLOR[s]}">{_e(s)}</span>'
+        f'<span class="status">{_e(f["status"])}</span>'
+        f'<span class="ftitle">{_e(f["title"])}</span></div>'
+        f'{chips_html}'
+        f'{("<p class=fdesc>" + _e(f["description"]) + "</p>") if f["description"] else ""}'
+        f'<ul class="evidence">{ev}</ul></div>'
+    )
 
 
 def build_and_store(db: Session, run_id: str, *, summary: str = "", remediation: str = "",

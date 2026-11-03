@@ -1,0 +1,208 @@
+#!/usr/bin/env python3
+"""Sensitive data exposure probe — scans authenticated pages for PII patterns.
+
+Checks response bodies for: SSN, credit card numbers, private keys, API keys,
+password hashes, email addresses in bulk, and other sensitive data that should
+not be exposed in HTML responses.
+
+Flow:
+  1. Fetch each URL with an authenticated session cookie.
+  2. Pattern-match the response body for PII/sensitive data.
+  3. Report findings with evidence (redacted match).
+
+Emits JSON to stdout:
+    {"findings": [{"type": "pii_exposure", "severity": "high"|"critical", ...}], "trace": [...]}
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+from urllib.parse import urlparse
+
+try:
+    import requests
+except Exception as e:
+    print(json.dumps({"error": f"requests not available: {e}", "findings": []}))
+    sys.exit(0)
+
+_UA = "vapt-pii-probe/1.0 (authorized assessment)"
+_TIMEOUT = 10
+_MAX_BODY = 2_097_152  # 2 MB
+
+_PII_PATTERNS: list[tuple[str, str, re.Pattern, str]] = [
+    ("ssn", "Social Security Number",
+     re.compile(r"\b\d{3}-\d{2}-\d{4}\b"), "critical"),
+    ("credit_card", "Credit Card Number",
+     re.compile(r"\b(?:4\d{3}|5[1-5]\d{2}|3[47]\d{2}|6011)[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4}\b"),
+     "critical"),
+    ("password_hash", "Password Hash (bcrypt/md5/sha)",
+     re.compile(r"\$2[aby]?\$\d{2}\$[./A-Za-z0-9]{53}|\b[0-9a-f]{32}\b(?=.*(?:hash|password|pwd))|\b[0-9a-f]{40}\b(?=.*(?:hash|password|pwd))"),
+     "high"),
+    ("private_key", "Private Key Material",
+     re.compile(r"-----BEGIN\s+(?:RSA\s+)?PRIVATE\s+KEY-----"), "critical"),
+    ("aws_key", "AWS Access Key",
+     re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "critical"),
+    ("generic_secret", "API Key / Secret Token",
+     re.compile(r"""(?:api[_-]?key|secret[_-]?key|access[_-]?token|private[_-]?key)\s*[=:]\s*["']?[A-Za-z0-9+/=_-]{20,}""", re.IGNORECASE),
+     "high"),
+]
+
+# Context-sensitive patterns (need to appear in HTML, not in script/CSS)
+_PASSWORD_FIELD_VALUE_RE = re.compile(
+    r"""(?:password|passwd|pwd)\s*["']?\s*[:=]\s*["']([^"']{4,})["']""",
+    re.IGNORECASE,
+)
+
+
+def _in_scope(target: str, url: str) -> bool:
+    try:
+        return urlparse(url).hostname == target
+    except Exception:
+        return False
+
+
+def _read_bounded(r: "requests.Response") -> str:
+    chunks: list[bytes] = []
+    total = 0
+    for chunk in r.iter_content(chunk_size=16_384):
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+        if total >= _MAX_BODY:
+            break
+    try:
+        return b"".join(chunks).decode("utf-8", errors="replace")
+    except Exception:
+        return ""
+
+
+def _cookie_from_redis(run_id: str) -> str:
+    try:
+        import redis as _redis
+        r = _redis.Redis.from_url(
+            os.environ.get("VAPT_REDIS_URL", "redis://localhost:6379/0"),
+            socket_timeout=3,
+        )
+        for slot in ("A", "B"):
+            val = r.get(f"vapt:webcookie:{run_id}:{slot}")
+            if val:
+                return (val.decode() if isinstance(val, bytes) else str(val)).strip()
+        val = r.get(f"vapt:webcookie:{run_id}")
+        if val:
+            return (val.decode() if isinstance(val, bytes) else str(val)).strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _redact(match_text: str) -> str:
+    if len(match_text) <= 8:
+        return match_text[:2] + "***"
+    return match_text[:4] + "..." + match_text[-4:]
+
+
+def _is_in_script_or_comment(body: str, match_start: int) -> bool:
+    """Rough check: is the match inside <script> or <!-- comment -->?"""
+    pre = body[max(0, match_start - 500):match_start].lower()
+    in_script = "<script" in pre and "</script" not in pre
+    in_comment = "<!--" in pre and "-->" not in pre
+    return in_script or in_comment
+
+
+def main() -> int:
+    p = argparse.ArgumentParser()
+    p.add_argument("--target", required=True)
+    p.add_argument("--urls", required=True, help="comma-separated URLs to scan")
+    p.add_argument("--run-id", default=os.environ.get("VAPT_RUN_ID", ""))
+    args = p.parse_args()
+
+    target = args.target.strip()
+    out: dict = {"findings": [], "trace": []}
+
+    cookie = os.environ.get("VAPT_WEB_LOGIN_COOKIE", "").strip() \
+        or (_cookie_from_redis(args.run_id) if args.run_id else "")
+
+    test_urls = [u.strip() for u in args.urls.split(",")
+                 if u.strip() and _in_scope(target, u.strip())]
+
+    headers = {"User-Agent": _UA, "Accept": "text/html,*/*"}
+    if cookie:
+        headers["Cookie"] = cookie
+
+    found_types: set[str] = set()
+
+    for url in test_urls[:15]:
+        try:
+            r = requests.get(url, headers=headers, timeout=_TIMEOUT,
+                             allow_redirects=True, stream=True)
+            body = _read_bounded(r)
+            out["trace"].append({"url": url, "status": r.status_code,
+                                 "note": f"{len(body)} bytes"})
+        except Exception as e:
+            out["trace"].append({"url": url, "note": f"error: {e}"})
+            continue
+
+        if r.status_code != 200 or len(body) < 100:
+            continue
+
+        for pattern_id, pattern_name, pattern_re, severity in _PII_PATTERNS:
+            matches = list(pattern_re.finditer(body))
+            if not matches:
+                continue
+            # Deduplicate: only report first match per pattern per URL
+            m = matches[0]
+            if _is_in_script_or_comment(body, m.start()):
+                continue
+            dedup_key = f"{pattern_id}:{url}"
+            if dedup_key in found_types:
+                continue
+            found_types.add(dedup_key)
+            out["findings"].append({
+                "type": "pii_exposure",
+                "severity": severity,
+                "url": url,
+                "param": pattern_id,
+                "evidence": (
+                    f"{pattern_name} found in response body at {url}: "
+                    f"'{_redact(m.group())}' "
+                    f"({len(matches)} occurrence(s)). "
+                    f"Sensitive data should not be exposed in HTML responses."
+                ),
+                "confirmed": True,
+            })
+
+        # Check for password/hash values in page content
+        pw_matches = list(_PASSWORD_FIELD_VALUE_RE.finditer(body))
+        for m in pw_matches[:1]:
+            if _is_in_script_or_comment(body, m.start()):
+                continue
+            val = m.group(1)
+            if len(val) < 4 or val in ("true", "false", "null", "undefined", "none"):
+                continue
+            dedup_key = f"password_value:{url}"
+            if dedup_key in found_types:
+                continue
+            found_types.add(dedup_key)
+            out["findings"].append({
+                "type": "pii_exposure",
+                "severity": "high",
+                "url": url,
+                "param": "password_hash",
+                "evidence": (
+                    f"Password/hash value exposed in response at {url}: "
+                    f"'{_redact(val)}'. Passwords or their hashes should never "
+                    f"appear in HTML responses."
+                ),
+                "confirmed": True,
+            })
+
+    print(json.dumps(out))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

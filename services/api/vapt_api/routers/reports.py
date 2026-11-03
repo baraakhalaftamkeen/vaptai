@@ -9,7 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Response, status
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.orm import Session
-from vapt_agents.report import build_and_store, try_pdf
+from vapt_agents.report import build_and_store, gather, render_html, try_pdf
 from vapt_domain.enums import Role
 from vapt_persistence.models import Engagement, Report, Run
 
@@ -140,6 +140,11 @@ def signoff_report(
         raise HTTPException(status.HTTP_409_CONFLICT, "report already signed off")
     report.status = "final"
     report.signed_off_by = user.id
+    data = gather(db, run_id)
+    report.content = render_html(
+        data, summary=report.summary or "", remediation=report.remediation or "",
+        title=report.title or "Assessment report", report_status="final",
+    )
     db.commit()
     db.refresh(report)
     return _out(report)

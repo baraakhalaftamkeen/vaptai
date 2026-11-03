@@ -181,6 +181,36 @@ export interface CveDetail {
   exploit_basis: string;
 }
 
+export interface TenableVuln {
+  ip: string;
+  port: string;
+  protocol: string;
+  plugin: string;
+  severity: string;
+  cve: string;
+  cvss: number | null;
+  exploit: boolean;
+  frameworks: string;
+  synopsis: string;
+  solution: string;
+  os: string;
+  first_seen: string;
+  last_seen: string;
+}
+
+export interface TenablePage {
+  items: TenableVuln[];
+  total: number;
+  page: number;
+  page_size: number;
+  pages: number;
+}
+
+export interface TenableStatus {
+  configured: boolean;
+  url: string;
+}
+
 export interface Report {
   id: string;
   run_id: string;
@@ -460,6 +490,17 @@ export const api = {
     return req<CveFeedItem[]>(`/api/v2/cve/feed${qs ? `?${qs}` : ""}`);
   },
   cveLookup: (cveId: string) => req<CveDetail>(`/api/v2/cve/${encodeURIComponent(cveId)}`),
+  tenableStatus: () => req<TenableStatus>("/api/v2/tenable/status"),
+  tenableVulns: (opts?: { ip?: string; severity?: string; search?: string; page?: number; pageSize?: number }) => {
+    const q = new URLSearchParams();
+    if (opts?.ip) q.set("ip", opts.ip);
+    if (opts?.severity) q.set("severity", opts.severity);
+    if (opts?.search) q.set("search", opts.search);
+    if (opts?.page) q.set("page", String(opts.page));
+    if (opts?.pageSize) q.set("page_size", String(opts.pageSize));
+    const qs = q.toString();
+    return req<TenablePage>(`/api/v2/tenable/vulnerabilities${qs ? `?${qs}` : ""}`);
+  },
   testLLM: () => req<LLMTestResult>("/api/v2/tools/llm-test", { method: "POST" }),
   checkReachability: (target: string) =>
     req<ReachabilityResult>("/api/v2/tools/reachability", {

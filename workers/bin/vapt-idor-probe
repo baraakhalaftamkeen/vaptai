@@ -84,28 +84,46 @@ _TOKEN_RE = re.compile(
 
 # Query-param names that typically carry an object id/token.
 _ID_PARAM_NAMES = frozenset({
-    "id", "oid", "uid", "pid", "order", "order_id", "orderid",
-    "invoice", "invoice_id", "receipt", "receipt_id", "booking", "booking_id",
-    "ticket", "ticket_id", "user", "user_id", "userid", "account", "account_id",
-    "item", "item_id", "object", "object_id", "ref", "num", "token", "uuid", "guid",
+    "id", "oid", "uid", "pid", "ref", "num", "token", "uuid", "guid",
+    "object", "object_id",
 })
+_ID_PARAM_SUFFIX_RE = re.compile(r"(?:_id|Id|ID)$")
 
-# Path prefixes that denote a per-user object (not public catalog data).
+# Dynamic: any /<word>/<token-or-id> is an object URL unless it matches a known
+# public-catalog prefix. No hardcoded noun list — works for any app.
 _OBJECT_PATH_RE = re.compile(
-    r"/(?:order|orders|invoice|invoices|receipt|receipts|booking|bookings|"
-    r"ticket|tickets|reservation|reservations|payment|payments|transaction|"
-    r"transactions|document|documents|report|reports|message|messages)"
+    r"/([a-zA-Z][a-zA-Z0-9_-]{1,30})"
     r"(?:/track)?/(?:[0-9a-f]{8,}|[0-9a-f-]{32,}|\d{1,10})(?:[/?]|$)",
     re.IGNORECASE,
 )
 
-# Listing pages to visit per user to harvest their own object URLs. Relative to
-# each in-scope base. Bounded, generic across typical apps.
-_LISTING_PATHS = (
-    "/orders", "/order/history", "/account/orders", "/my-orders",
-    "/invoices", "/receipts", "/bookings", "/tickets", "/reservations",
-    "/account", "/dashboard", "/profile", "/history", "/transactions",
+# Fallback listing paths when seed URLs don't provide enough collection prefixes.
+_FALLBACK_LISTING_PATHS = (
+    "/account", "/dashboard", "/profile", "/history",
 )
+
+def _listing_paths_from_seeds(seed_urls: list[str]) -> tuple[str, ...]:
+    """Derive listing (collection) paths from discovered seed URLs dynamically.
+    E.g. /allocations/2 → /allocations, /order/track/abc → /order."""
+    collections: list[str] = []
+    seen: set[str] = set()
+    for u in seed_urls:
+        try:
+            path = urlparse(u).path or ""
+        except Exception:
+            continue
+        m = _OBJECT_PATH_RE.search(path)
+        if m:
+            prefix = "/" + m.group(1)
+            low = prefix.lower()
+            if low not in seen:
+                seen.add(low)
+                collections.append(prefix)
+    for p in _FALLBACK_LISTING_PATHS:
+        if p.lower() not in seen:
+            seen.add(p.lower())
+            collections.append(p)
+    return tuple(collections)
 
 # PUBLIC per-resource pages — never IDOR candidates (every user sees the same).
 _PUBLIC_DATA_RE = re.compile(
@@ -152,9 +170,11 @@ def _looks_like_object_url(url: str) -> bool:
         parsed = urlparse(url)
     except Exception:
         return False
-    # Query-param id/token (e.g. /order?id=<hex>)
+    # Query-param id/token (e.g. /order?id=<hex>, /view?allocation_id=3)
     for name, value in parse_qsl(parsed.query, keep_blank_values=True):
-        if name.lower() in _ID_PARAM_NAMES and value and _TOKEN_RE.fullmatch(value):
+        nl = name.lower()
+        if (nl in _ID_PARAM_NAMES or _ID_PARAM_SUFFIX_RE.search(name)) \
+                and value and _TOKEN_RE.fullmatch(value):
             return True
     # Object path with a token/id (e.g. /order/track/<hex>, /invoice/42)
     if _OBJECT_PATH_RE.search(parsed.path or ""):
@@ -208,6 +228,20 @@ def _get(sess, url, budget_box):
         return None
 
 
+def _pw_in_nav_or_header(body: str) -> bool:
+    """True when the <input type=password> lives inside <nav> or <header>
+    (a nav-bar login widget), not in the page's main content area."""
+    m = _LOGIN_FORM_RE.search(body)
+    if not m:
+        return False
+    low = body[:m.start()].lower()
+    if low.rfind("<nav") > low.rfind("</nav"):
+        return True
+    if low.rfind("<header") > low.rfind("</header"):
+        return True
+    return False
+
+
 def _is_real_content(resp) -> bool:
     """True when the response is substantive object content, not a denial/login/stub."""
     if resp is None or resp.status_code != 200:
@@ -215,9 +249,9 @@ def _is_real_content(resp) -> bool:
     body = resp.text or ""
     if len(body) < _MIN_BODY:
         return False
-    if _LOGIN_FORM_RE.search(body):
-        return False
     if _DENIED_RE.search(body):
+        return False
+    if _LOGIN_FORM_RE.search(body) and not _pw_in_nav_or_header(body):
         return False
     return True
 
@@ -259,7 +293,7 @@ def _extract_object_urls(html: str, base: str, target: str) -> list[str]:
     return out
 
 
-def _harvest(users, bases, target, budget_box, trace):
+def _harvest(users, bases, target, budget_box, trace, listing_paths):
     """Return {object_url: owner_label} by visiting each user's listing pages and
     attributing every object URL found there to that user (first owner wins)."""
     owned: dict[str, str] = {}
@@ -267,7 +301,7 @@ def _harvest(users, bases, target, budget_box, trace):
         sess = _session(cookie)
         seen_pages = 0
         for base in bases:
-            for path in _LISTING_PATHS:
+            for path in listing_paths:
                 if budget_box[0] <= 0 or seen_pages >= 8:
                     break
                 r = _get(sess, base + path, budget_box)
@@ -357,7 +391,9 @@ def _numeric_targets(url: str) -> list[tuple[str, str, str]]:
     for m in _PATH_ID_RE.finditer(parsed.path or ""):
         out.append(("path", "path-id", m.group(1)))
     for name, value in parse_qsl(parsed.query, keep_blank_values=True):
-        if name.lower() in _ID_PARAM_NAMES and re.fullmatch(r"\d{1,10}", value or ""):
+        nl = name.lower()
+        if (nl in _ID_PARAM_NAMES or _ID_PARAM_SUFFIX_RE.search(name)) \
+                and re.fullmatch(r"\d{1,10}", value or ""):
             out.append(("query", name, value))
     return out
 
@@ -438,12 +474,16 @@ def main() -> int:
     trace: list[dict] = [{"accounts": ",".join(l for l, _ in users),
                           "mode": args.mode, "note": "sessions"}]
 
+    listing_paths = _listing_paths_from_seeds(seed_urls)
+    trace.append({"listing_paths": list(listing_paths),
+                  "note": "derived from seed URLs"})
+
     if args.mode == "delete":
         findings = _delete_probe(users, bases, target, seed_urls,
-                                 budget_box, trace)
+                                 budget_box, trace, listing_paths)
     else:
         # 1) Harvest each user's own object URLs from their listing pages (establishes ownership).
-        owned = _harvest(users, bases, target, budget_box, trace)
+        owned = _harvest(users, bases, target, budget_box, trace, listing_paths)
         # 2) Also treat any seeded URL that already points at a specific object as a
         #    candidate — but we only know its owner if harvesting attributed it.
         for u in seed_urls:
@@ -519,19 +559,20 @@ def _destructive_success(resp) -> bool:
     if resp.status_code in (200, 302):
         if _DENIED_RE.search(resp.text or ""):
             return False
-        if _LOGIN_FORM_RE.search(resp.text or ""):
+        if _LOGIN_FORM_RE.search(resp.text or "") \
+                and not _pw_in_nav_or_header(resp.text or ""):
             return False
         return True
     return False
 
 
-def _delete_probe(users, bases, target, seed_urls, budget_box, trace):
+def _delete_probe(users, bases, target, seed_urls, budget_box, trace, listing_paths):
     """Cross-tenant destructive IDOR: can user B delete/cancel user A's object?"""
     findings: list[dict] = []
     if len(users) < 2:
         return findings
 
-    owned = _harvest(users, bases, target, budget_box, trace)
+    owned = _harvest(users, bases, target, budget_box, trace, listing_paths)
     for u in seed_urls:
         if _looks_like_object_url(u):
             owned.setdefault(u, _harvest_owner(users, u, budget_box, trace))

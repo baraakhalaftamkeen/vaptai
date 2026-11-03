@@ -36,6 +36,11 @@ class Settings(BaseSettings):
     source_root: str = "./var/source"
     source_max_bytes: int = 200 * 1024 * 1024   # 200 MB cap per upload
 
+    # Tenable.sc integration (read-only vulnerability feed for the portal).
+    tenable_url: str = ""
+    tenable_access_key: str = ""
+    tenable_secret_key: str = ""
+
     echo_sql: bool = False
 
     @field_validator("cors_origins", mode="before")

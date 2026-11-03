@@ -249,7 +249,7 @@ export default function EngagementsPage() {
                 </Button>
                 <Button
                   variant="danger"
-                  onClick={() => {
+                  onClick={async () => {
                     if (
                       !window.confirm(
                         "Auto-approve ALL actions for this run?\n\n" +
@@ -260,69 +260,38 @@ export default function EngagementsPage() {
                     ) {
                       return;
                     }
-                    const user = window.prompt(
-                      "ADMIN web-login USERNAME (PRIMARY account).\n\n" +
-                      "Recommended: an administrator — this unlocks /admin/* for " +
-                      "authenticated scanning.\n\n" +
-                      "Leave blank for an unauthenticated scan.\n" +
-                      "Press Cancel to abort the run."
-                    );
-                    if (user === null) return;
-                    let pass: string | null = "";
-                    if (user.trim()) {
-                      pass = window.prompt(
-                        `ADMIN web-login PASSWORD for '${user.trim()}'.\n\n` +
-                        "Stored only in Redis under this run id, with a TTL. " +
-                        "Never written to the DB, the ledger, or logs."
-                      );
-                      if (pass === null) return;
-                    }
+                    let user = "";
+                    let pass = "";
                     let userB = "";
-                    let passB: string | null = "";
+                    let passB = "";
                     let userC = "";
-                    let passC: string | null = "";
-                    if (user.trim() && pass) {
-                      const u2 = window.prompt(
-                        "OPTIONAL: FIRST normal-user USERNAME for IDOR probe " +
-                        "(cross-tenant access testing).\n\n" +
-                        "This is a REGULAR user account (not another admin). The " +
-                        "idor_probe will compare what this user can see against " +
-                        "the SECOND normal user (next prompt).\n\n" +
-                        "Blank = skip IDOR, continue with single-account scan.\n" +
-                        "Press Cancel to abort the run entirely."
-                      );
-                      if (u2 === null) return;
-                      userB = u2.trim();
-                      if (userB) {
-                        passB = window.prompt(
-                          `FIRST normal-user PASSWORD for '${userB}'.\n\n` +
-                          "Same Redis TTL + fail-safe handling as the admin set."
-                        );
-                        if (passB === null) return;
-                        const u3 = window.prompt(
-                          "OPTIONAL: SECOND normal-user USERNAME for IDOR probe " +
-                          "(enables the admin + 2-user model — RECOMMENDED).\n\n" +
-                          "With this third account, idor_probe pairs the two normal " +
-                          "users (B vs C) instead of admin vs user — eliminating " +
-                          "false 'legitimate access' positives on admin pages a " +
-                          "regular user is simply forbidden from.\n\n" +
-                          "Blank = fall back to admin-vs-user comparison.\n" +
-                          "Press Cancel to abort the run entirely."
-                        );
-                        if (u3 === null) return;
-                        userC = u3.trim();
-                        if (userC) {
-                          passC = window.prompt(
-                            `SECOND normal-user PASSWORD for '${userC}'.\n\n` +
-                            "Same Redis TTL + fail-safe handling as the other accounts."
-                          );
-                          if (passC === null) return;
+                    let passC = "";
+                    if (e.testing_mode !== "black_box") {
+                      try {
+                        const scope = await api.getEngagementScope(e.id);
+                        const creds = scope.web_credentials as {
+                          admin?: { username: string; password: string } | null;
+                          users?: { username: string; password: string }[];
+                        } | undefined;
+                        if (creds?.admin?.username) {
+                          user = creds.admin.username;
+                          pass = creds.admin.password ?? "";
                         }
+                        if (creds?.users?.[0]?.username) {
+                          userB = creds.users[0].username;
+                          passB = creds.users[0].password ?? "";
+                        }
+                        if (creds?.users?.[1]?.username) {
+                          userC = creds.users[1].username;
+                          passC = creds.users[1].password ?? "";
+                        }
+                      } catch {
+                        // scope fetch failed — continue without credentials
                       }
                     }
                     startRun(
                       e.id, true,
-                      user.trim() || undefined, pass || undefined,
+                      user || undefined, pass || undefined,
                       userB || undefined, passB || undefined,
                       userC || undefined, passC || undefined,
                     );

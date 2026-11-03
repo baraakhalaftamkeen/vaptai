@@ -17,6 +17,8 @@ import {
   StatusTag,
 } from "@/components/ui";
 
+const SEV_RANK: Record<string, number> = { critical: 5, high: 4, medium: 3, low: 2, info: 1 };
+
 export default function OverviewPage() {
   const router = useRouter();
   const [d, setD] = useState<Dashboard | null>(null);
@@ -197,13 +199,15 @@ export default function OverviewPage() {
             ) : d.recent_findings.length === 0 ? (
               <Empty>No findings yet. A run records candidates, then validation confirms them.</Empty>
             ) : (
-              d.recent_findings.map((f) => (
-                <Row key={f.id} onClick={() => router.push(`/runs/${f.run_id}`)}>
-                  <span className="w-20 shrink-0"><SeverityTag severity={f.severity} /></span>
-                  <span className="flex-1 min-w-0 truncate">{f.title}</span>
-                  <span className="w-24 shrink-0 text-right"><StatusTag status={f.status} /></span>
-                </Row>
-              ))
+              [...d.recent_findings]
+                .sort((a, b) => (SEV_RANK[b.severity] ?? 0) - (SEV_RANK[a.severity] ?? 0))
+                .map((f) => (
+                  <Row key={f.id} onClick={() => router.push(`/runs/${f.run_id}`)}>
+                    <span className="w-20 shrink-0"><SeverityTag severity={f.severity} /></span>
+                    <span className="flex-1 min-w-0 truncate">{f.title}</span>
+                    <span className="w-24 shrink-0 text-right"><StatusTag status={f.status} /></span>
+                  </Row>
+                ))
             )}
           </Panel>
         </div>

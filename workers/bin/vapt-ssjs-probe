@@ -1,0 +1,213 @@
+#!/usr/bin/env python3
+"""Server-side JavaScript injection probe — detects eval()/Function() injection.
+
+Targets applications where user input flows into server-side eval() or
+new Function() calls (common in Node.js / Express apps). The probe sends
+arithmetic expressions (e.g. "7*7") into form fields and checks whether the
+computed result (49) appears in the response without the raw expression —
+indicating the server evaluated the input.
+
+Confirmation tier: if arithmetic succeeds, sends a string-concat payload
+(e.g. 'ab'+'cd') and checks for 'abcd' in the response.
+
+Flow per endpoint:
+  1. POST the form with normal benign values to capture the baseline response.
+  2. POST with arithmetic payload in each candidate field.
+  3. If the computed result appears and the raw expression does not → finding.
+  4. Confirm with a string-concat payload to reduce false positives.
+
+Emits JSON to stdout:
+    {"findings": [...], "trace": [...]}
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import random
+import re
+import sys
+from urllib.parse import urlparse
+
+try:
+    import requests
+except Exception as e:
+    print(json.dumps({"error": f"requests not available: {e}", "findings": []}))
+    sys.exit(0)
+
+_UA = "vapt-ssjs-probe/1.0 (authorized assessment)"
+_TIMEOUT = 10
+
+
+def _in_scope(target: str, url: str) -> bool:
+    try:
+        return urlparse(url).hostname == target
+    except Exception:
+        return False
+
+
+def _load_cookie() -> str:
+    cookie = os.environ.get("VAPT_WEB_LOGIN_COOKIE", "")
+    if cookie:
+        return cookie
+    run_id = os.environ.get("VAPT_RUN_ID", "")
+    if run_id:
+        try:
+            import redis as _redis
+            r = _redis.Redis.from_url(
+                os.environ.get("VAPT_REDIS_URL", "redis://localhost:6379/0"),
+                socket_timeout=3,
+            )
+            raw = r.get(f"vapt:webcookie:{run_id}")
+            if raw:
+                return raw.decode() if isinstance(raw, bytes) else str(raw)
+        except Exception:
+            pass
+    return ""
+
+
+def _make_session(cookie: str) -> requests.Session:
+    sess = requests.Session()
+    sess.headers.update({"User-Agent": _UA})
+    if cookie:
+        for pair in cookie.split(";"):
+            pair = pair.strip()
+            if "=" in pair:
+                k, v = pair.split("=", 1)
+                sess.cookies.set(k.strip(), v.strip())
+    sess.verify = False
+    return sess
+
+
+def _build_payloads() -> list[dict]:
+    a, b = random.randint(3, 9), random.randint(3, 9)
+    product = a * b
+    w1 = "vapt"
+    w2 = "probe"
+    return [
+        {
+            "name": "arithmetic",
+            "payload": f"{a}*{b}",
+            "expect": str(product),
+            "raw_must_be_absent": f"{a}*{b}",
+            "severity": "critical",
+        },
+        {
+            "name": "string_concat",
+            "payload": f"'{w1}'+'{w2}'",
+            "expect": f"{w1}{w2}",
+            "raw_must_be_absent": f"'{w1}'+'{w2}'",
+            "severity": "critical",
+        },
+    ]
+
+
+def _test_field(sess: requests.Session, url: str, method: str,
+                fields: list[dict], target_field: str,
+                payload_info: dict, trace: list) -> dict | None:
+    data = {}
+    for f in fields:
+        if f["name"] == target_field:
+            data[f["name"]] = payload_info["payload"]
+        else:
+            data[f["name"]] = f.get("default", "1")
+
+    try:
+        if method.lower() == "post":
+            r = sess.post(url, data=data, timeout=_TIMEOUT, allow_redirects=True)
+        else:
+            r = sess.get(url, params=data, timeout=_TIMEOUT, allow_redirects=True)
+    except Exception as e:
+        trace.append({"url": url, "field": target_field,
+                      "payload": payload_info["name"], "error": str(e)})
+        return None
+
+    body = r.text or ""
+    trace.append({
+        "url": url, "field": target_field,
+        "payload": payload_info["name"],
+        "status": r.status_code,
+        "body_len": len(body),
+        "expect_found": payload_info["expect"] in body,
+        "raw_found": payload_info["raw_must_be_absent"] in body,
+    })
+
+    if payload_info["expect"] in body and payload_info["raw_must_be_absent"] not in body:
+        return {
+            "type": "ssjs_injection",
+            "severity": payload_info["severity"],
+            "url": url,
+            "param": target_field,
+            "evidence": (
+                f"Server-side JS injection: field '{target_field}' — "
+                f"sent {payload_info['name']} payload '{payload_info['payload']}', "
+                f"response contained computed result '{payload_info['expect']}' "
+                f"without the raw expression. The server evaluated the input."
+            ),
+            "confirmed": True,
+        }
+    return None
+
+
+def main() -> int:
+    p = argparse.ArgumentParser()
+    p.add_argument("--target", required=True)
+    p.add_argument("--url", required=True, help="form action URL")
+    p.add_argument("--method", default="post", choices=("get", "post"))
+    p.add_argument("--fields", required=True,
+                   help="comma-separated field_name:default pairs, e.g. "
+                        "'preTax:100,roth:100,afterTax:100'")
+    p.add_argument("--run-id", default=os.environ.get("VAPT_RUN_ID", ""))
+    args = p.parse_args()
+
+    target = args.target.strip()
+    url = args.url.strip()
+    out: dict = {"findings": [], "trace": []}
+
+    if not _in_scope(target, url):
+        out["trace"].append({"url": url, "note": "off-scope"})
+        print(json.dumps(out))
+        return 0
+
+    fields: list[dict] = []
+    for spec in args.fields.split(","):
+        spec = spec.strip()
+        if not spec:
+            continue
+        if ":" in spec:
+            name, default = spec.split(":", 1)
+            fields.append({"name": name.strip(), "default": default.strip()})
+        else:
+            fields.append({"name": spec.strip(), "default": "1"})
+
+    if not fields:
+        out["trace"].append({"note": "no fields specified"})
+        print(json.dumps(out))
+        return 0
+
+    cookie = _load_cookie()
+    sess = _make_session(cookie)
+
+    payloads = _build_payloads()
+
+    for field in fields:
+        fname = field["name"]
+        arith = payloads[0]
+        hit = _test_field(sess, url, args.method, fields, fname, arith, out["trace"])
+        if hit:
+            confirm = payloads[1]
+            confirm_hit = _test_field(sess, url, args.method, fields, fname,
+                                      confirm, out["trace"])
+            if confirm_hit:
+                hit["evidence"] += (
+                    f" Confirmed with string-concat payload "
+                    f"('{confirm['payload']}' → '{confirm['expect']}')."
+                )
+            out["findings"].append(hit)
+
+    print(json.dumps(out))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
