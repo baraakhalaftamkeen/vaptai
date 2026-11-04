@@ -80,7 +80,7 @@ def _make_session(cookie: str) -> requests.Session:
 
 
 def _build_payloads() -> list[dict]:
-    a, b = random.randint(3, 9), random.randint(3, 9)
+    a, b = random.randint(2, 5), random.randint(2, 5)
     product = a * b
     w1 = "vapt"
     w2 = "probe"

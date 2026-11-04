@@ -84,11 +84,14 @@ def _get_credentials(run_id: str) -> tuple[str, str]:
             os.environ.get("VAPT_REDIS_URL", "redis://localhost:6379/0"),
             socket_timeout=3,
         )
-        user = r.get(f"vapt:webcreds:{run_id}:username")
-        pw = r.get(f"vapt:webcreds:{run_id}:password")
-        if user and pw:
-            return (user.decode() if isinstance(user, bytes) else str(user),
-                    pw.decode() if isinstance(pw, bytes) else str(pw))
+        raw = r.get(f"vapt:webcreds:{run_id}")
+        if raw:
+            import json as _json
+            d = _json.loads(raw)
+            u = str(d.get("u", ""))
+            p = str(d.get("p", ""))
+            if u and p:
+                return u, p
     except Exception:
         pass
     return "", ""

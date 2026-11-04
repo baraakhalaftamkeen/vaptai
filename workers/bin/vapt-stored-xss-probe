@@ -224,10 +224,14 @@ def main() -> int:
     run_id = os.environ.get("VAPT_RUN_ID", "").strip()
     cookie = os.environ.get("VAPT_WEB_LOGIN_COOKIE", "").strip() \
         or (_cookie_from_redis(run_id) if run_id else "")
-    if cookie:
-        headers["Cookie"] = cookie
 
     sess = requests.Session()
+    if cookie:
+        for pair in cookie.split(";"):
+            pair = pair.strip()
+            if "=" in pair:
+                k, v = pair.split("=", 1)
+                sess.cookies.set(k.strip(), v.strip())
 
     # Fetch the POST page first to extract a CSRF token and existing form values.
     # Using existing values prevents server-side validation failures (e.g. format

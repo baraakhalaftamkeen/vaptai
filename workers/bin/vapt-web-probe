@@ -617,7 +617,11 @@ def _probe_ssrf_localhost(sess: _Session, base_url: str, pinned_param: str) -> l
         f"http://127.0.0.1:{p}/latest/meta-data/iam/security-credentials/"
         for p in _candidate_ports[:2]
     )
-    probes = (
+    _loopback_self = []
+    if base_port:
+        _loopback_self = [f"http://127.0.0.1:{base_port}/",
+                          f"http://localhost:{base_port}/"]
+    probes = tuple(_loopback_self) + (
         "http://127.0.0.1:22/", "http://127.0.0.1:80/", "http://127.0.0.1/",
         "http://localhost/", "http://169.254.169.254/latest/meta-data/",
     ) + _mock_metadata
@@ -625,6 +629,9 @@ def _probe_ssrf_localhost(sess: _Session, base_url: str, pinned_param: str) -> l
     # that any metadata-leak SSRF would surface — AKIA/ASIA access keys, AWS IAM
     # payload JSON ("iam-credentials"/"access_key"/"SecretAccessKey"), Google
     # computeMetadata markers, Azure IMDS fields.
+    # Also matches "page-within-page" patterns: when the server fetches an
+    # internal URL and embeds the result, the response contains a second
+    # <html> or <!doctype> tag — a distinctive self-referencing SSRF signal.
     sig_re = re.compile(
         r"\bSSH-\d\.\d-|<title>IIS Windows|<title>Welcome to nginx|<title>Apache|"
         r"\bami-id\b|\binstance-id\b|\biam-credentials\b|\bAccessKeyId\b|"
@@ -654,22 +661,34 @@ def _probe_ssrf_localhost(sess: _Session, base_url: str, pinned_param: str) -> l
     def classify(spec, r):
         if not r.text:
             return None
-        m = sig_re.search(r.text)
+        body = r.text
+        m = sig_re.search(body)
+        probe = spec["meta"]["probe"]
         if not m:
+            # Self-referencing SSRF: if the probe targeted the app's own port
+            # and the response embeds a fetched HTML page. Two detection modes:
+            # (a) duplicate structural tags (two <html> in a template-wrapped page)
+            # (b) response starts with non-HTML content but contains <html> from
+            #     the fetched page (e.g. NodeGoat: <h1>header</h1><html>fetched...)
+            if base_port and f":{base_port}" in probe and len(body) > 100:
+                _html_count = len(re.findall(r"<html\b", body, re.IGNORECASE))
+                _doctype_count = len(re.findall(r"<!doctype\s+html", body, re.IGNORECASE))
+                _starts_html = body[:50].strip().lower().startswith(("<!doctype", "<html"))
+                if (_html_count >= 2 or _doctype_count >= 2
+                        or (_html_count >= 1 and not _starts_html)):
+                    return {"type": "ssrf_localhost", "severity": "high",
+                            "url": spec["url"], "param": spec["meta"]["param"],
+                            "evidence": (f"self-referencing SSRF ({probe}) — "
+                                         f"response embeds HTML content "
+                                         f"fetched from the internal loopback"),
+                            "confirmed": True}
             return None
-        # Promote severity to critical when ANYWHERE in the response body
-        # contains credential material — not just the first-matched token.
-        # DineHub's mock metadata leads with "ami-id" (a banner-like marker)
-        # but the AKIA key and iam-credentials sit later in the same body;
-        # a cred_hit scan over the full body avoids misranking a critical
-        # credential leak as merely high.
-        body_lo = r.text.lower()
+        body_lo = body.lower()
         cred_hit = any(k in body_lo for k in
                        ("akia", "asia", "iam-credentials", "accesskeyid",
                         "secretaccesskey", "access_key"))
         hit = m.group(0)
         sev = "critical" if cred_hit else "high"
-        probe = spec["meta"]["probe"]
         evidence = (f"metadata/credentials exfiltrated via SSRF ({probe}) "
                     f"— response matched {hit[:30]!r} + credential-shaped "
                     f"tokens in body") if cred_hit else \
