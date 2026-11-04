@@ -620,7 +620,9 @@ def _probe_ssrf_localhost(sess: _Session, base_url: str, pinned_param: str) -> l
     _loopback_self = []
     if base_port:
         _loopback_self = [f"http://127.0.0.1:{base_port}/",
-                          f"http://localhost:{base_port}/"]
+                          f"http://localhost:{base_port}/",
+                          f"http://127.0.0.1:{base_port}/#",
+                          f"http://localhost:{base_port}/#"]
     probes = tuple(_loopback_self) + (
         "http://127.0.0.1:22/", "http://127.0.0.1:80/", "http://127.0.0.1/",
         "http://localhost/", "http://169.254.169.254/latest/meta-data/",

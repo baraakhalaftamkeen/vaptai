@@ -5467,6 +5467,8 @@ def build_engagement_graph(
         if idx == 0 and iters == 1:
             _prime_form_map()
 
+        _cookie_verified_at = [0.0]
+
         # Wildcard: build a combined webvuln plan across all discovered hosts by
         # temporarily swapping scope.target for each host. _webvuln_plan() reads
         # scope.target via closure. For non-wildcard runs this is a no-op.
@@ -5571,7 +5573,55 @@ def build_engagement_graph(
                 return None
             cached = web_credentials.get_web_cookie(scope.run_id)
             if cached:
-                return cached
+                import time as _time_ck
+                if _time_ck.time() - _cookie_verified_at[0] > 120:
+                    _verify_url = None
+                    for _, _a, _ in plan_items:
+                        _lu = (_a or {}).get("login_url") if isinstance(_a, dict) else None
+                        if _lu:
+                            from urllib.parse import urlparse as _up_ck
+                            _parsed = _up_ck(_lu)
+                            _verify_url = (
+                                f"{_parsed.scheme}://{_parsed.hostname}"
+                                + (f":{_parsed.port}" if _parsed.port else "")
+                                + "/"
+                            )
+                            break
+                    if _verify_url:
+                        try:
+                            import re as _re_ck
+                            import requests as _rq_ck
+                            _LOGOUT_CK = _re_ck.compile(
+                                r'href\s*=\s*["\'][^"\']*/'
+                                r"(?:auth/)?(?:logout|signout|sign[_-]?out|log[_-]?out)\b"
+                                r'|>\s*(?:logout|log\s*out|sign\s*out)\s*<',
+                                _re_ck.IGNORECASE)
+                            _ck_sess = _rq_ck.Session()
+                            _ck_sess.headers["User-Agent"] = "vapt-cookie-check/1.0"
+                            for _pair in cached.split(";"):
+                                _pair = _pair.strip()
+                                if "=" in _pair:
+                                    _k, _v = _pair.split("=", 1)
+                                    _ck_sess.cookies.set(_k.strip(), _v.strip())
+                            _ck_sess.verify = False
+                            _ck_r = _ck_sess.get(_verify_url, timeout=8,
+                                                  allow_redirects=True)
+                            _ck_html = _ck_r.text or ""
+                            if not _LOGOUT_CK.search(_ck_html):
+                                ledger.record_event(
+                                    db, scope.run_id, "webvuln.cookie_stale",
+                                    {"verify_url": str(_verify_url),
+                                     "status": _ck_r.status_code,
+                                     "note": "cached cookie no longer yields an "
+                                             "authenticated session; re-logging in"})
+                                web_credentials.clear_web_cookie(scope.run_id)
+                                cached = None
+                            else:
+                                _cookie_verified_at[0] = _time_ck.time()
+                        except Exception:
+                            _cookie_verified_at[0] = _time_ck.time()
+                if cached:
+                    return cached
             creds = web_credentials.get_web_credentials(scope.run_id)
             if not creds:
                 # Explicit telemetry — previously this gate was silent and operators had
@@ -5629,8 +5679,10 @@ def build_engagement_graph(
                                              else "login did not yield a session cookie; "
                                                   "continuing unauthenticated"})
             if cookie:
+                import time as _time_ck2
                 web_credentials.set_web_cookie(scope.run_id, cookie)
                 web_credentials.set_web_cookie_a(scope.run_id, cookie)
+                _cookie_verified_at[0] = _time_ck2.time()
                 ledger.record_event(db, scope.run_id, "webvuln.authenticated",
                                     {"login_url": str(login_url), "ok": True})
             # If a SECOND credential set was supplied (for IDOR testing), log that in
