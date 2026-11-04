@@ -5575,27 +5575,28 @@ def build_engagement_graph(
             if cached:
                 import time as _time_ck
                 if _time_ck.time() - _cookie_verified_at[0] > 120:
-                    _verify_url = None
+                    _login_url_raw = None
                     for _, _a, _ in plan_items:
                         _lu = (_a or {}).get("login_url") if isinstance(_a, dict) else None
                         if _lu:
-                            from urllib.parse import urlparse as _up_ck
-                            _parsed = _up_ck(_lu)
-                            _verify_url = (
-                                f"{_parsed.scheme}://{_parsed.hostname}"
-                                + (f":{_parsed.port}" if _parsed.port else "")
-                                + "/"
-                            )
+                            _login_url_raw = _lu
                             break
-                    if _verify_url:
+                    if _login_url_raw:
                         try:
                             import re as _re_ck
                             import requests as _rq_ck
+                            from urllib.parse import urlparse as _up_ck
                             _LOGOUT_CK = _re_ck.compile(
                                 r'href\s*=\s*["\'][^"\']*/'
                                 r"(?:auth/)?(?:logout|signout|sign[_-]?out|log[_-]?out)\b"
                                 r'|>\s*(?:logout|log\s*out|sign\s*out)\s*<',
                                 _re_ck.IGNORECASE)
+                            _parsed = _up_ck(_login_url_raw)
+                            _base = (
+                                f"{_parsed.scheme}://{_parsed.hostname}"
+                                + (f":{_parsed.port}" if _parsed.port else "")
+                            )
+                            _login_path = (_parsed.path or "/").rstrip("/").lower()
                             _ck_sess = _rq_ck.Session()
                             _ck_sess.headers["User-Agent"] = "vapt-cookie-check/1.0"
                             for _pair in cached.split(";"):
@@ -5604,16 +5605,32 @@ def build_engagement_graph(
                                     _k, _v = _pair.split("=", 1)
                                     _ck_sess.cookies.set(_k.strip(), _v.strip())
                             _ck_sess.verify = False
-                            _ck_r = _ck_sess.get(_verify_url, timeout=8,
-                                                  allow_redirects=True)
-                            _ck_html = _ck_r.text or ""
-                            if not _LOGOUT_CK.search(_ck_html):
+
+                            _cookie_alive = None  # None=inconclusive
+                            _checked_url = _base + "/"
+                            for _path in ("/", "/dashboard", "/home",
+                                          "/account", "/profile", "/app"):
+                                _url = _base + _path
+                                _ck_r = _ck_sess.get(
+                                    _url, timeout=8, allow_redirects=True)
+                                _final = _up_ck(_ck_r.url).path.rstrip("/").lower()
+                                _ck_html = _ck_r.text or ""
+                                if _final == _login_path:
+                                    _cookie_alive = False
+                                    _checked_url = _url
+                                    break
+                                if _LOGOUT_CK.search(_ck_html):
+                                    _cookie_alive = True
+                                    _checked_url = _url
+                                    break
+
+                            if _cookie_alive is False:
                                 ledger.record_event(
                                     db, scope.run_id, "webvuln.cookie_stale",
-                                    {"verify_url": str(_verify_url),
+                                    {"verify_url": _checked_url,
                                      "status": _ck_r.status_code,
-                                     "note": "cached cookie no longer yields an "
-                                             "authenticated session; re-logging in"})
+                                     "note": "redirected to login page; "
+                                             "session expired — re-logging in"})
                                 web_credentials.clear_web_cookie(scope.run_id)
                                 cached = None
                             else:
