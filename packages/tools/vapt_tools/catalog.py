@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import subprocess
 
 from vapt_domain.enums import AgentRole, PolicyClass
 
@@ -39,6 +40,30 @@ _WORKERS_BIN = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))),
     "workers", "bin",
 )
+
+
+def _resolve_domain_dc(domain: str, dns_server: str) -> str | None:
+    """Resolve an AD domain to its DC IP using a specific DNS server.
+
+    In multi-domain AD forests the engagement target may be a parent-domain DC
+    while the credentials belong to a child domain served by a different DC.
+    Querying the parent DC's DNS for the child domain name returns the child
+    DC's IP, which we can then substitute into ``-dc-ip`` so impacket tools
+    talk to the right server.
+    """
+    try:
+        proc = subprocess.run(
+            ["dig", "+short", domain, f"@{dns_server}"],
+            capture_output=True, text=True, timeout=5,
+            stdin=subprocess.DEVNULL,
+        )
+        for line in proc.stdout.strip().split("\n"):
+            ip = line.strip()
+            if ip and not ip.startswith(";"):
+                return ip
+    except Exception:
+        pass
+    return None
 
 
 def _port(args: dict) -> str:
@@ -198,6 +223,21 @@ def _mk_build(tool_id: str, bins: list[str], template: list[str]):
                 if strip:
                     argv = [a for a in argv if a not in strip]
                 argv += domain_cred_builder(dom, user, pw)
+                # Cross-domain DC resolution: in a multi-domain AD forest the
+                # engagement target may be a parent DC while the creds belong
+                # to a child domain on a different DC.  Resolve the cred domain
+                # via DNS (using the target as nameserver) and swap -dc-ip when
+                # the domain maps to a different IP.
+                target_ip = str(args.get("target", ""))
+                if "-dc-ip" in argv and target_ip:
+                    resolved = _resolve_domain_dc(dom, target_ip)
+                    if resolved and resolved != target_ip:
+                        try:
+                            idx = argv.index("-dc-ip")
+                            if idx + 1 < len(argv):
+                                argv[idx + 1] = resolved
+                        except ValueError:
+                            pass
         return argv
     return build
 
