@@ -25,7 +25,7 @@ import os
 
 from vapt_domain.enums import AgentRole, PolicyClass
 
-from .registry import REGISTRY, ToolSpec, _valid_host
+from .registry import REGISTRY, ToolSpec, _domain_credentials, _valid_host
 
 _P0, _P1, _P2, _P3 = (PolicyClass.P0_PASSIVE, PolicyClass.P1_LOW_IMPACT,
                       PolicyClass.P2_INTRUSIVE, PolicyClass.P3_EXCLUDED)
@@ -102,6 +102,9 @@ def _resolve(tok: str, args: dict):
         # xxe_probe wrapper treats __NONE__ as no override.
         v = str(args.get("param") or "").strip()
         return v if v else "__NONE__"
+    if "{target}" in tok:
+        host = _valid_host(str(args["target"]))
+        return tok.replace("{target}", host) if host else None
     return tok  # literal
 
 
@@ -123,15 +126,36 @@ _COOKIE_HEADER_FLAG = {
 }
 
 
+# Network tools that accept domain credentials for authenticated AD scans.
+_DOMAIN_CRED_ARGS: dict[str, object] = {
+    "smbmap":              lambda d, u, p: ["-u", u, "-p", p, "-d", d],
+    "enum4linux_ng":       lambda d, u, p: ["-u", f"{d}\\{u}", "-p", p],
+    "smbclient_list":      lambda d, u, p: ["-U", f"{d}\\{u}%{p}"],
+    "ldapsearch_base":     lambda d, u, p: ["-D", f"{u}@{d}", "-w", p],
+    "netexec_smb":         lambda d, u, p: ["-u", u, "-p", p, "-d", d],
+    "impacket_secretsdump": lambda d, u, p: [f"{d}/{u}:{p}@"],
+    "bloodyad":            lambda d, u, p: ["-u", f"{u}@{d}", "-p", p],
+    "certipy_find":        lambda d, u, p: ["-u", f"{u}@{d}", "-p", p],
+    "impacket_getuserspns": lambda d, u, p: [f"{d}/{u}:{p}"],
+    "impacket_getnpusers":  lambda d, u, p: [f"{d}/{u}:{p}"],
+    "bloodhound_python":    lambda d, u, p: ["-u", f"{u}@{d}", "-p", p, "-d", d],
+    "dig_axfr":             lambda d, u, p: [d, "AXFR"],
+}
+_DOMAIN_STRIP_FLAGS: dict[str, set[str]] = {
+    "smbclient_list": {"-N"},
+}
+
+
 def _mk_build(tool_id: str, bins: list[str], template: list[str]):
     env_key = "VAPT_" + tool_id.upper().replace("-", "_") + "_BIN"
     flag = _COOKIE_HEADER_FLAG.get(tool_id)
+    domain_cred_builder = _DOMAIN_CRED_ARGS.get(tool_id)
 
     def build(args: dict) -> list[str]:
         argv = [os.environ.get(env_key, bins[0])]
         for tok in template:
             v = _resolve(tok, args)
-            if v is not None and v != "":
+            if v is not None:
                 argv.append(v)
         # Authenticated-scanning cookie — appended at argv build time, not plan time, so a
         # single plan item adapts to "unauth before login" vs "authed after login".
@@ -140,6 +164,21 @@ def _mk_build(tool_id: str, bins: list[str], template: list[str]):
             if cookie and not cookie.startswith("-") \
                and all(c not in cookie for c in ("\r", "\n", "\x00")):
                 argv += [flag, f"Cookie: {cookie}"]
+        # Domain credentials (network AD targets) — appended at argv build time so they
+        # never appear in the plan/digest/ledger. Also accepts creds passed via args by
+        # the tool router (domain_user, domain_pass, domain keys).
+        if domain_cred_builder:
+            dc = None
+            if args.get("domain_user") and args.get("domain_pass") and args.get("domain"):
+                dc = (args["domain"], args["domain_user"], args["domain_pass"])
+            if not dc:
+                dc = _domain_credentials()
+            if dc:
+                dom, user, pw = dc
+                strip = _DOMAIN_STRIP_FLAGS.get(tool_id, set())
+                if strip:
+                    argv = [a for a in argv if a not in strip]
+                argv += domain_cred_builder(dom, user, pw)
         return argv
     return build
 
@@ -192,6 +231,10 @@ CATALOG: list[tuple] = [
     ("enum4linux_ng", ["enum4linux-ng", "enum4linux"], ["-A", "{target}"],          _P1, [_SC], "network"),
     ("smbclient_list", ["smbclient"], ["-L", "{target}", "-N"],                      _P1, [_SC], "network", (0, 1)),
     ("ldapsearch_base", ["ldapsearch"], ["-x", "-H", "ldap://{target}", "-s", "base", "-b", ""], _P1, [_SC], "network"),
+    ("impacket_getuserspns", ["vapt-getuserspns", "impacket-GetUserSPNs", "GetUserSPNs.py"], ["-dc-ip", "{target}", "-request"], _P1, [_SC], "network"),
+    ("impacket_getnpusers", ["vapt-getnpusers", "impacket-GetNPUsers", "GetNPUsers.py"], ["-dc-ip", "{target}"], _P1, [_SC], "network"),
+    ("bloodhound_python", ["bloodhound-python", "bloodhound"], ["-ns", "{target}", "-c", "All"], _P1, [_SC], "network"),
+    ("dig_axfr",    ["dig"],          ["@{target}"],                                 _P1, [_SC], "network"),
     ("cewl",        ["cewl"],         ["-d", "1", "{url}"],                          _P1, [_SC], "network"),
     ("onesixtyone", ["onesixtyone"],  ["{target}"],                                  _P2, [_SC], "network"),  # SNMP community brute → gated
     ("smtp_user_enum", ["smtp-user-enum"], ["-M", "VRFY", "-U", "{wordlist}", "-t", "{target}"], _P2, [_SC], "network"),
@@ -256,7 +299,7 @@ CATALOG: list[tuple] = [
     ("impacket_secretsdump", ["impacket-secretsdump", "secretsdump.py"], ["{target}"], _P2, [_AT], "network"),
     ("lsassy",      ["lsassy"],       ["{target}"],                                  _P2, [_AT], "network"),
     ("bloodyad",    ["bloodyAD", "bloodyad"], ["--host", "{target}", "get", "search"], _P2, [_AT], "network"),
-    ("certipy_find", ["certipy", "certipy-ad"], ["find", "-target", "{target}"],     _P2, [_AT], "network"),
+    ("certipy_find", ["certipy", "certipy-ad"], ["find", "-target", "{target}"],     _P1, [_SC, _AT], "network"),
     ("chisel",      ["chisel"],       ["client"],                                    _P2, [_AT], "network"),
     ("ligolo_proxy", ["ligolo-proxy"], ["-selfcert"],                               _P2, [_AT], "local"),
     ("krbrelayx",   ["krbrelayx", "krbrelayx.py"], [],                               _P3, [_AT], "network"),
@@ -297,6 +340,10 @@ _PURPOSE: dict[str, str] = {
     "enum4linux_ng": "Full SMB/NetBIOS enumeration (users, shares, groups, policy). Use when SMB is open.",
     "smbclient_list": "List SMB shares with a null session. Use when 445 is open.",
     "ldapsearch_base": "Read the LDAP root DSE (naming contexts, domain info). Use when 389/636 is open.",
+    "impacket_getuserspns": "Kerberoasting — request TGS tickets for service accounts with SPNs to crack offline. Use when Kerberos (88) is open and domain creds available.",
+    "impacket_getnpusers": "AS-REP roasting — find accounts without Kerberos pre-authentication. Use when Kerberos (88) is open and domain creds available.",
+    "bloodhound_python": "Active Directory attack-path collection (users, groups, ACLs, sessions, trusts). Use when LDAP+SMB are open and domain creds available.",
+    "dig_axfr": "DNS zone transfer (AXFR) attempt against a DNS server. Leaks all DNS records if the server allows it. Use when port 53 is open and domain name known.",
     "cewl": "Build a wordlist by spidering a website (for later auth testing).",
     "onesixtyone": "SNMP community-string brute (gated). Use when 161/udp SNMP is present.",
     "smtp_user_enum": "SMTP user enumeration via VRFY/EXPN (gated). Use when 25/465/587 is open.",
@@ -338,7 +385,7 @@ _PURPOSE: dict[str, str] = {
     "impacket_secretsdump": "Dump secrets (SAM/LSA/NTDS) with creds. ATTACK only, human-gated.",
     "lsassy": "Remote LSASS credential extraction with creds. ATTACK only, human-gated.",
     "bloodyad": "Active Directory object read/modify with creds. ATTACK only, human-gated.",
-    "certipy_find": "AD CS (ADCS) misconfiguration enumeration. ATTACK only, human-gated.",
+    "certipy_find": "AD CS (ADCS) certificate template and CA enumeration — finds ESC1-ESC8 misconfigurations. Use when LDAP is open and domain creds available.",
     "chisel": "TCP/UDP tunnel for pivoting. ATTACK only, human-gated.",
     "ligolo_proxy": "Reverse tunnel/pivot proxy. ATTACK only, human-gated.",
     "krbrelayx": "Kerberos relay/unconstrained-delegation abuse. Policy-DENIED — never auto-runs.",

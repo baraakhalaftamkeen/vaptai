@@ -113,6 +113,67 @@ def _path_in_text(txt: str) -> str:
     return path if "/" in path and len(path) > 1 else ""
 
 
+def _probe_network_reachable(target: str, *, timeout_s: int = 10,
+                             allowed_ports: str = "") -> tuple[bool, dict]:
+    """TCP reachability probe for network (AD) targets. Tries SMB (445), LDAP (389),
+    Kerberos (88), and any allowed_ports."""
+    import socket
+    probe_ports = [445, 139, 389, 636, 88, 3389]
+    if allowed_ports:
+        for p in allowed_ports.split(","):
+            p = p.strip().split("-")[0]
+            if p.isdigit():
+                probe_ports.append(int(p))
+    seen: set[int] = set()
+    for port in probe_ports:
+        if port in seen:
+            continue
+        seen.add(port)
+        try:
+            sock = socket.create_connection((target, port), timeout=timeout_s)
+            sock.close()
+            return True, {"host": target, "port": port, "method": "tcp_connect"}
+        except Exception:
+            continue
+    return False, {"host": target, "error": "no_reachable_ports",
+                   "probed": sorted(seen)}
+
+
+def _validate_domain_creds_smb(target: str, domain: str, username: str,
+                                password: str) -> tuple[bool, str]:
+    """Validate AD domain credentials via SMB. Returns (ok, method_used)."""
+    import shutil
+    import subprocess
+
+    nxc_bin = shutil.which("netexec") or shutil.which("nxc") or shutil.which("crackmapexec")
+    if nxc_bin:
+        try:
+            proc = subprocess.run(
+                [nxc_bin, "smb", target, "-u", username, "-p", password, "-d", domain],
+                capture_output=True, text=True, timeout=30,
+                stdin=subprocess.DEVNULL,
+            )
+            if "[+]" in (proc.stdout or ""):
+                return True, "netexec"
+        except Exception:
+            pass
+
+    if shutil.which("smbclient"):
+        try:
+            proc = subprocess.run(
+                ["smbclient", "-L", target,
+                 "-U", f"{domain}\\{username}%{password}"],
+                capture_output=True, text=True, timeout=30,
+                stdin=subprocess.DEVNULL,
+            )
+            if proc.returncode == 0 or "Sharename" in (proc.stdout or ""):
+                return True, "smbclient"
+        except Exception:
+            pass
+
+    return False, "none"
+
+
 def _probe_target_reachable(target: str, *, timeout_s: int = 15,
                             allowed_ports: str = "") -> tuple[bool, dict]:
     """HTTP(S) reachability probe for the intake pre-flight.
@@ -359,8 +420,13 @@ def build_engagement_graph(
         log: list[str] = [f"intake: run {scope.run_id} accepted"]
 
         # ---- 1. Target reachability probe ------------------------------------
-        reachable, probe_detail = _probe_target_reachable(
-            scope.target, allowed_ports=scope.allowed_ports)
+        is_network = getattr(scope, 'target_type', 'web') == 'network'
+        if is_network:
+            reachable, probe_detail = _probe_network_reachable(
+                scope.target, allowed_ports=scope.allowed_ports)
+        else:
+            reachable, probe_detail = _probe_target_reachable(
+                scope.target, allowed_ports=scope.allowed_ports)
         if reachable:
             log.append(f"intake: target reachable ({probe_detail.get('url')} → {probe_detail.get('status')})")
 
@@ -379,13 +445,70 @@ def build_engagement_graph(
         auth_status = "no_credentials"
         login_url_used = ""
         is_black_box = scope.testing_mode == TestingMode.BLACK_BOX
-        creds = None if is_black_box else web_credentials.get_web_credentials(scope.run_id)
+
         if is_black_box:
             ledger.record_event(db, scope.run_id, "intake.auth",
                                 {"ok": False, "reason": "black_box_mode",
                                  "note": "black-box engagement — auth skipped"})
             log.append("intake: black-box mode — skipping auth")
-        elif creds:
+        elif is_network:
+            # --- Network gray/white-box: validate domain credentials via SMB ---
+            domain_creds = web_credentials.get_domain_credentials(scope.run_id)
+            if domain_creds:
+                dom, d_user, d_pw = domain_creds
+                smb_ok, smb_method = _validate_domain_creds_smb(
+                    scope.target, dom, d_user, d_pw)
+                if smb_ok:
+                    auth_status = "ok"
+                    ledger.record_event(db, scope.run_id, "intake.domain_auth",
+                                        {"ok": True, "domain": dom, "method": smb_method})
+                    log.append(f"intake: domain auth OK ({dom}\\{d_user} via {smb_method})")
+                else:
+                    auth_status = "failed"
+                    ledger.record_event(db, scope.run_id, "intake.domain_auth",
+                                        {"ok": False, "domain": dom,
+                                         "note": "domain credentials supplied but SMB auth failed"})
+                    log.append("intake: domain auth failed — continuing unauthenticated")
+            else:
+                creds_after_resume = web_credentials.get_domain_credentials(scope.run_id)
+                if creds_after_resume:
+                    log.append("intake: domain credentials received after prompt — validating")
+                else:
+                    ledger.record_event(db, scope.run_id, "intake.auth",
+                                        {"ok": False, "reason": "awaiting_domain_credentials",
+                                         "note": "network gray-box — prompting for domain credentials"})
+                    log.append("intake: network gray-box — requesting domain credentials")
+                    verdict = interrupt({
+                        "kind": "domain_credentials_required",
+                        "reason": "Network gray-box engagement requires domain credentials "
+                                  "(DOMAIN\\username + password)",
+                        "run_id": scope.run_id,
+                        "target": scope.target,
+                    })
+                    decision = (verdict or {}).get("decision", "skip")
+                    creds_now = web_credentials.get_domain_credentials(scope.run_id)
+                    if decision == "skip" or not creds_now:
+                        auth_status = "no_credentials"
+                        ledger.record_event(db, scope.run_id, "intake.auth",
+                                            {"ok": False, "reason": "no_domain_credentials",
+                                             "note": "operator skipped — running unauthenticated"})
+                        log.append("intake: operator skipped domain credentials")
+                    else:
+                        dom, d_user, d_pw = creds_now
+                        smb_ok, smb_method = _validate_domain_creds_smb(
+                            scope.target, dom, d_user, d_pw)
+                        if smb_ok:
+                            auth_status = "ok"
+                            ledger.record_event(db, scope.run_id, "intake.domain_auth",
+                                                {"ok": True, "domain": dom, "method": smb_method})
+                            log.append(f"intake: domain auth OK ({dom}\\{d_user} via {smb_method})")
+                        else:
+                            auth_status = "failed"
+                            ledger.record_event(db, scope.run_id, "intake.domain_auth",
+                                                {"ok": False, "domain": dom,
+                                                 "note": "credentials supplied but SMB auth failed"})
+                            log.append("intake: domain auth failed — continuing unauthenticated")
+        elif not is_black_box and (creds := web_credentials.get_web_credentials(scope.run_id)):
             user, pw = creds
             from urllib.parse import urlparse as _up2
 
@@ -5456,6 +5579,12 @@ def build_engagement_graph(
                                 {"skipped": "engagement did not enable P2 intrusive"})
             return {"phase": "attack",
                     "log": ["webvuln: skipped (P2 intrusive not enabled for this engagement)"]}
+        is_network = getattr(scope, 'target_type', 'web') == 'network'
+        if is_network:
+            ledger.record_event(db, scope.run_id, "phase.webvuln",
+                                {"skipped": "network target — web vulnerability scanning not applicable"})
+            return {"phase": "attack",
+                    "log": ["webvuln: skipped (network target)"]}
 
         idx = int(state.get("webvuln_idx", 0))
         iters = int(state.get("webvuln_iters", 0)) + 1

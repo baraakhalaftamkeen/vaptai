@@ -127,10 +127,22 @@ def route_actions(db: Session, scope: RunScope, harness, *, limit: int = 32
     if "22" in ports or "ssh" in names:
         add("ssh_audit", {})
 
+    # --- Domain credentials (fetched once, reused across AD sections) ---------------
+    domain_args: dict = {}
+    try:
+        from vapt_persistence import web_credentials as _wc
+        _dc = _wc.get_domain_credentials(scope.run_id)
+        if _dc:
+            _dom, _du, _dp = _dc
+            domain_args = {"domain_user": _du, "domain_pass": _dp, "domain": _dom}
+    except Exception:
+        pass
+
     # --- SMB / Windows ---------------------------------------------------------------
     if {"445", "139"} & ports or "microsoft-ds" in names or "netbios" in names or "smb" in names:
-        add("smbmap", {})
-        add("enum4linux_ng", {})
+        add("smbmap", {**domain_args})
+        add("enum4linux_ng", {**domain_args})
+        add("smbclient_list", {**domain_args})
 
     # --- SMTP ------------------------------------------------------------------------
     if {"25", "465", "587"} & ports or "smtp" in names:
@@ -138,7 +150,24 @@ def route_actions(db: Session, scope: RunScope, harness, *, limit: int = 32
 
     # --- LDAP / AD -------------------------------------------------------------------
     if {"389", "636", "3268"} & ports or "ldap" in names:
-        add("ldapsearch_base", {})
+        add("ldapsearch_base", {**domain_args})
+        if domain_args:
+            add("certipy_find", {**domain_args})
+
+    # --- Kerberos / AD ---------------------------------------------------------------
+    if "88" in ports or "kerberos" in names:
+        if domain_args:
+            add("impacket_getuserspns", {**domain_args})
+            add("impacket_getnpusers", {**domain_args})
+
+    # --- DNS -------------------------------------------------------------------------
+    if "53" in ports or "domain" in names or "dns" in names:
+        if domain_args:
+            add("dig_axfr", {**domain_args})
+
+    # --- AD graph collection (BloodHound) — needs LDAP + SMB + domain creds ----------
+    if domain_args and ({"389", "636", "3268"} & ports) and ({"445", "139"} & ports):
+        add("bloodhound_python", {**domain_args})
 
     # --- Subdomain takeover (named targets only) -------------------------------------
     if scope.domains and not _is_ip(scope.target):

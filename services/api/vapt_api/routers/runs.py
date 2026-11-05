@@ -62,7 +62,9 @@ def create_run(
     creds_stashed = False
     creds_b_stashed = False
     creds_c_stashed = False
+    domain_creds_stashed = False
     is_black_box = eng.testing_mode == TestingMode.BLACK_BOX.value
+    is_network = eng.target_type == "network"
 
     web_username = body.web_username
     web_password = body.web_password
@@ -110,12 +112,39 @@ def create_run(
             creds_stashed = False  # degrade to unauthenticated, don't fail the run
             creds_b_stashed = False
             creds_c_stashed = False
+    # Stash domain credentials for network gray/white-box engagements (AD pentesting).
+    if is_network and not is_black_box:
+        d_user = body.domain_username
+        d_pass = body.domain_password
+        d_name = body.domain_name
+        if not (d_user and d_pass and d_name):
+            sv = db.execute(
+                select(ScopeVersion)
+                .where(ScopeVersion.engagement_id == eng.id,
+                       ScopeVersion.version == eng.scope_version)
+            ).scalar_one_or_none()
+            if sv and sv.scope:
+                dc = sv.scope.get("domain_credentials") or {}
+                if dc.get("domain") and dc.get("username") and dc.get("password"):
+                    d_name = d_name or dc["domain"]
+                    d_user = d_user or dc["username"]
+                    d_pass = d_pass or dc["password"]
+        if d_user and d_pass and d_name:
+            try:
+                from vapt_persistence import web_credentials as wc_store2
+                wc_store2.set_domain_credentials(
+                    run.id, d_name.strip(), d_user.strip(), d_pass)
+                domain_creds_stashed = True
+            except Exception:
+                domain_creds_stashed = False
+
     db.add(RunEvent(run_id=run.id, seq=1, kind="run.created",
                     payload={"phase": "intake",
                              "auto_approve": bool(body.auto_approve),
                              "web_credentials": "provided" if creds_stashed else "none",
                              "web_credentials_b": "provided" if creds_b_stashed else "none",
-                             "web_credentials_c": "provided" if creds_c_stashed else "none"}))
+                             "web_credentials_c": "provided" if creds_c_stashed else "none",
+                             "domain_credentials": "provided" if domain_creds_stashed else "none"}))
     db.add(Outbox(run_id=run.id, topic="run.start", payload={"run_id": run.id}))
     db.commit()
     db.refresh(run)

@@ -51,6 +51,11 @@ export default function NewEngagementPage() {
   const [adminPass, setAdminPass] = useState("");
   const [userCreds, setUserCreds] = useState<{ username: string; password: string }[]>([]);
 
+  // Domain credentials (network gray/white box)
+  const [domainName, setDomainName] = useState("");
+  const [domainUser, setDomainUser] = useState("");
+  const [domainPass, setDomainPass] = useState("");
+
   useEffect(() => {
     api.listPlaybooks().then(setPlaybooks).catch(() => setPlaybooks([]));
   }, []);
@@ -75,7 +80,7 @@ export default function NewEngagementPage() {
           allowed_action_classes: classes,
           allow_exploitation: exploit,
           poc_playbook: playbook,
-          ...(mode !== "black_box"
+          ...(mode !== "black_box" && target !== "network"
             ? {
                 web_credentials: {
                   admin: adminUser.trim()
@@ -84,6 +89,15 @@ export default function NewEngagementPage() {
                   users: userCreds
                     .filter((c) => c.username.trim())
                     .map((c) => ({ username: c.username.trim(), password: c.password })),
+                },
+              }
+            : {}),
+          ...(mode !== "black_box" && target === "network" && domainName.trim()
+            ? {
+                domain_credentials: {
+                  domain: domainName.trim(),
+                  username: domainUser.trim(),
+                  password: domainPass,
                 },
               }
             : {}),
@@ -186,7 +200,50 @@ export default function NewEngagementPage() {
             </p>
           )}
 
-          {mode !== "black_box" && (
+          {mode !== "black_box" && target === "network" && (
+            <div className="border border-line rounded-lg overflow-hidden">
+              <div className="px-4 py-3 bg-surface-2/50 border-b border-line">
+                <h3 className="text-sm font-medium text-ink">Domain credentials</h3>
+                <p className="text-2xs text-ink-3 mt-0.5">
+                  Active Directory credentials for authenticated network scanning. Stored in scope, never logged.
+                </p>
+              </div>
+              <div className="px-4 py-4 space-y-3">
+                <label className="block">
+                  <span className="block text-xs text-ink-2 mb-1.5">Domain</span>
+                  <input
+                    className={inputCls}
+                    value={domainName}
+                    onChange={(e) => setDomainName(e.target.value)}
+                    placeholder="north.sevenkingdoms.local"
+                    autoComplete="off"
+                  />
+                </label>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <input
+                    className={inputCls}
+                    value={domainUser}
+                    onChange={(e) => setDomainUser(e.target.value)}
+                    placeholder="Username"
+                    autoComplete="off"
+                  />
+                  <input
+                    className={inputCls}
+                    type="password"
+                    value={domainPass}
+                    onChange={(e) => setDomainPass(e.target.value)}
+                    placeholder="Password"
+                    autoComplete="new-password"
+                  />
+                </div>
+                <p className="text-2xs text-ink-3">
+                  Used for SMB, LDAP, and Kerberos authentication. Validated at run start via SMB.
+                </p>
+              </div>
+            </div>
+          )}
+
+          {mode !== "black_box" && target !== "network" && (
             <div className="border border-line rounded-lg overflow-hidden">
               <div className="px-4 py-3 bg-surface-2/50 border-b border-line">
                 <h3 className="text-sm font-medium text-ink">Web credentials</h3>

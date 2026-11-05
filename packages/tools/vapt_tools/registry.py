@@ -94,6 +94,38 @@ def _web_login_credentials() -> tuple[str, str] | None:
         return None
 
 
+def _domain_credentials() -> tuple[str, str, str] | None:
+    """Domain credentials for the current run (AD gray-box). Returns (domain, username,
+    password) or None. Same Redis pattern as web credentials."""
+    import os as _os
+    import json as _json
+    run_id = _os.environ.get("VAPT_RUN_ID", "").strip()
+    if not run_id:
+        return None
+    try:
+        import redis as _redis
+        _r = _redis.Redis.from_url(
+            _os.environ.get("VAPT_REDIS_URL", "redis://localhost:6379/0"),
+            socket_timeout=3,
+        )
+        raw = _r.get(f"vapt:domaincreds:{run_id}")
+        if not raw:
+            return None
+        d = _json.loads(raw if isinstance(raw, (bytes, str)) else str(raw))
+        dom = str(d.get("d", "")).strip()
+        u = str(d.get("u", "")).strip()
+        p = str(d.get("p", "")).strip()
+        if not (dom and u and p):
+            return None
+        if any(ch in dom + u + p for ch in ("\r", "\n", "\x00")):
+            return None
+        if any(v.startswith("-") for v in (dom, u, p)):
+            return None
+        return (dom, u, p)
+    except Exception:
+        return None
+
+
 def _valid_host(host: str) -> str:
     _reject_option_like(host)
     try:

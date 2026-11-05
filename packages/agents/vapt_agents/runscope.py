@@ -36,3 +36,4 @@ class RunScope:
     target_description: str = ""
     is_wildcard: bool = False
     wildcard_base: str = ""
+    target_type: str = "web"

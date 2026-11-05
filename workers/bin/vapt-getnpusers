@@ -1,0 +1,9 @@
+#!/usr/bin/env python3
+"""Thin wrapper: call impacket GetNPUsers with python3 (shebang fix)."""
+import os, sys
+_SCRIPT = "/usr/share/doc/python3-impacket/examples/GetNPUsers.py"
+if not os.path.isfile(_SCRIPT):
+    print(f"impacket GetNPUsers not found at {_SCRIPT}", file=sys.stderr)
+    sys.exit(127)
+sys.argv[0] = _SCRIPT
+exec(open(_SCRIPT).read())

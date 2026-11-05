@@ -56,6 +56,7 @@ class ScopeInput(BaseModel):
     allow_exploitation: bool = False
     poc_playbook: str = "http_evidence"
     web_credentials: dict | None = None
+    domain_credentials: dict | None = None
 
     @field_validator("allowed_ports", mode="before")
     @classmethod
@@ -146,6 +147,11 @@ class RunCreate(BaseModel):
     # omitted the probe falls back to the legacy A+B behavior.
     web_username_c: str | None = None
     web_password_c: str | None = None
+    # Domain credentials for network gray/white-box (AD pentesting). Stored in Redis
+    # under the run_id, same TTL + fail-safe semantics as web creds. Never persisted to SQL.
+    domain_username: str | None = None
+    domain_password: str | None = None
+    domain_name: str | None = None
 
 
 class RunOut(BaseModel):

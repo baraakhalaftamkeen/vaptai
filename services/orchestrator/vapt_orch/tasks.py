@@ -165,6 +165,7 @@ def _run_scope(db, run: Run, eng: Engagement) -> RunScope:
         target_description=eng.target_description or "",
         is_wildcard=is_wildcard,
         wildcard_base=wildcard_base,
+        target_type=eng.target_type or "web",
     )
 
 

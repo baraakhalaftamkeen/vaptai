@@ -214,6 +214,49 @@ def set_web_cookie_c(run_id: str, cookie: str, *, ttl: int | None = None) -> Non
         return
 
 
+# --- Domain credentials for AD / network gray-box testing ----------------
+_DOMAIN_PREFIX = "vapt:domaincreds:"
+
+
+def set_domain_credentials(run_id: str, domain: str, username: str, password: str,
+                           *, ttl: int | None = None) -> None:
+    """Stash domain credentials for an AD-facing network engagement."""
+    if not run_id:
+        raise ValueError("run_id required")
+    if not domain or not username or not password:
+        raise ValueError("domain, username and password required")
+    if any(len(f) > _MAX_FIELD for f in (domain, username, password)):
+        raise ValueError("credential field too long")
+    if any(c in domain + username + password for c in ("\r", "\n", "\x00")):
+        raise ValueError("credential contains control characters")
+    payload = json.dumps({"d": domain, "u": username, "p": password})
+    _client().set(_DOMAIN_PREFIX + run_id, payload,
+                  ex=max(1, ttl if ttl is not None else _DEFAULT_TTL))
+
+
+def get_domain_credentials(run_id: str) -> tuple[str, str, str] | None:
+    """Return (domain, username, password) or None. Fails SAFE."""
+    try:
+        raw = _client().get(_DOMAIN_PREFIX + run_id)
+        if not raw:
+            return None
+        d = json.loads(raw)
+        dom = str(d.get("d", ""))
+        u = str(d.get("u", ""))
+        p = str(d.get("p", ""))
+        return (dom, u, p) if (dom and u and p) else None
+    except Exception:
+        return None
+
+
+def clear_domain_credentials(run_id: str) -> None:
+    """Delete the domain credentials slot. Best-effort; TTL is the backstop."""
+    try:
+        _client().delete(_DOMAIN_PREFIX + run_id)
+    except Exception:
+        pass
+
+
 # Extend the primary clear() so the secondary slots don't outlive the scan.
 _orig_clear = clear_web_credentials
 
@@ -229,5 +272,6 @@ def clear_web_credentials(run_id: str) -> None:  # type: ignore[no-redef]
         c.delete(_COOKIE_PREFIX + run_id + ":A")
         c.delete(_COOKIE_PREFIX + run_id + ":B")
         c.delete(_COOKIE_PREFIX + run_id + ":C")
+        c.delete(_DOMAIN_PREFIX + run_id)
     except Exception:
         pass
