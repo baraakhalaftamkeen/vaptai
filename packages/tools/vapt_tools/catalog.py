@@ -22,6 +22,7 @@ engine + harness + human approval still gate every call exactly as for the built
 from __future__ import annotations
 
 import os
+import shutil
 
 from vapt_domain.enums import AgentRole, PolicyClass
 
@@ -33,6 +34,11 @@ _RE, _SC, _VA, _AT = (AgentRole.RECON, AgentRole.SCAN, AgentRole.VALIDATE, Agent
 _MODES = ["black_box", "gray_box", "white_box"]
 
 _WORDLIST_DEFAULT = "/usr/share/seclists/Discovery/Web-Content/common.txt"
+
+_WORKERS_BIN = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))),
+    "workers", "bin",
+)
 
 
 def _port(args: dict) -> str:
@@ -151,8 +157,21 @@ def _mk_build(tool_id: str, bins: list[str], template: list[str]):
     flag = _COOKIE_HEADER_FLAG.get(tool_id)
     domain_cred_builder = _DOMAIN_CRED_ARGS.get(tool_id)
 
+    def _resolve_bin() -> str:
+        override = os.environ.get(env_key)
+        if override:
+            return override
+        for b in bins:
+            if b.startswith("vapt-"):
+                shipped = os.path.join(_WORKERS_BIN, b)
+                if os.path.isfile(shipped):
+                    return shipped
+            if shutil.which(b):
+                return b
+        return bins[0]
+
     def build(args: dict) -> list[str]:
-        argv = [os.environ.get(env_key, bins[0])]
+        argv = [_resolve_bin()]
         for tok in template:
             v = _resolve(tok, args)
             if v is not None:
