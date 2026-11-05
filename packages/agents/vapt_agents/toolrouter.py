@@ -186,6 +186,11 @@ def route_actions(db: Session, scope: RunScope, harness, *, limit: int = 48
     if domain_args and ({"389", "636", "3268"} & ports) and ({"445", "139"} & ports):
         add("bloodhound_python", {**domain_args})
         add("impacket_lookupsid", {**domain_args})
+        add("bloodhound_analyzer", {})
+
+    # --- ADCS analysis (after certipy_find) ------------------------------------------
+    if domain_args and ({"389", "636", "3268"} & ports):
+        add("certipy_analyzer", {})
 
     # --- Subdomain takeover (named targets only) -------------------------------------
     if scope.domains and not _is_ip(scope.target):

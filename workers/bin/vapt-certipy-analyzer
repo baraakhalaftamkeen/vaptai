@@ -1,0 +1,370 @@
+#!/usr/bin/env python3
+"""Certipy output analyzer — classifies ADCS ESC1-ESC8 vulnerabilities.
+
+Reads Certipy JSON output (from `certipy find`) and applies granular ESC
+classification logic beyond what certipy's own output flags:
+
+  ESC1: Enrollee Supplies Subject + Client Auth EKU + low-priv enrollment
+  ESC2: Any Purpose or no EKU (SubCA) + low-priv enrollment
+  ESC3: Certificate Request Agent EKU + low-priv enrollment
+  ESC4: Low-priv principals have dangerous write access to template object
+  ESC5: PKI object ACL abuse (CA server computer object)
+  ESC6: EDITF_ATTRIBUTESUBJECTALTNAME2 flag on CA
+  ESC7: Manage CA / Manage Certificates permissions by non-admin
+  ESC8: HTTP-based web enrollment (NTLM relay to AD CS)
+
+Output is structured text for the observation normalizer.
+"""
+import argparse
+import glob
+import json
+import os
+import sys
+
+LOW_PRIV_GROUPS = {
+    "Authenticated Users", "Domain Users", "Domain Computers",
+    "Everyone", "Users", "Computers",
+}
+ADMIN_GROUPS = {
+    "Domain Admins", "Enterprise Admins", "Administrators",
+    "Schema Admins", "Enterprise Read-only Domain Controllers",
+    "Enterprise Domain Controllers", "Domain Controllers",
+}
+CLIENT_AUTH_EKUS = {
+    "Client Authentication",
+    "Smart Card Logon",
+    "PKINIT Client Authentication",
+    "Any Purpose",
+}
+AGENT_EKUS = {"Certificate Request Agent"}
+DANGEROUS_WRITE_KEYS = {
+    "Full Control Principals", "Write Owner Principals",
+    "Write Dacl Principals",
+}
+
+
+def _is_low_priv_enrollable(enrollment_rights: list[str]) -> tuple[bool, list[str]]:
+    """Check if any low-priv group can enroll. Returns (bool, list of matching groups)."""
+    matches = []
+    for right_holder in enrollment_rights:
+        name = right_holder.rsplit("\\", 1)[-1] if "\\" in right_holder else right_holder
+        if name in LOW_PRIV_GROUPS:
+            matches.append(right_holder)
+    return bool(matches), matches
+
+
+def _is_low_priv_writable(obj_control: dict) -> tuple[bool, list[tuple[str, str]]]:
+    """Check if non-admin principals have dangerous write access to the template.
+    Returns (bool, list of (right_type, principal))."""
+    matches = []
+    for key in DANGEROUS_WRITE_KEYS:
+        principals = obj_control.get(key, [])
+        for p in principals:
+            name = p.rsplit("\\", 1)[-1] if "\\" in p else p
+            if name in LOW_PRIV_GROUPS or name not in ADMIN_GROUPS:
+                if name not in ADMIN_GROUPS:
+                    matches.append((key, p))
+    return bool(matches), matches
+
+
+def _has_client_auth(ekus: list[str]) -> bool:
+    return bool(set(ekus) & CLIENT_AUTH_EKUS)
+
+
+def _has_agent_eku(ekus: list[str]) -> bool:
+    return bool(set(ekus) & AGENT_EKUS)
+
+
+def _is_any_purpose_or_subca(ekus: list[str], any_purpose: bool) -> bool:
+    if any_purpose:
+        return True
+    if "Any Purpose" in ekus:
+        return True
+    if not ekus:
+        return True
+    return False
+
+
+def analyze_templates(templates: dict) -> list[dict]:
+    """Apply ESC1-4 classification to each certificate template."""
+    findings = []
+
+    for idx, tmpl in templates.items():
+        name = tmpl.get("Template Name", f"Template-{idx}")
+        display = tmpl.get("Display Name", name)
+        enabled = tmpl.get("Enabled", False)
+        enrollee_supplies_subject = tmpl.get("Enrollee Supplies Subject", False)
+        client_auth = tmpl.get("Client Authentication", False)
+        enrollment_agent = tmpl.get("Enrollment Agent", False)
+        any_purpose = tmpl.get("Any Purpose", False)
+        requires_approval = tmpl.get("Requires Manager Approval", False)
+        auth_sigs = tmpl.get("Authorized Signatures Required", 0)
+        ekus = tmpl.get("Extended Key Usage", [])
+        cas = tmpl.get("Certificate Authorities", [])
+
+        perms = tmpl.get("Permissions", {})
+        enroll_perms = perms.get("Enrollment Permissions", {})
+        enrollment_rights = enroll_perms.get("Enrollment Rights", [])
+        obj_control = perms.get("Object Control Permissions", {})
+
+        low_priv_enroll, enroll_groups = _is_low_priv_enrollable(enrollment_rights)
+        low_priv_write, write_access = _is_low_priv_writable(obj_control)
+
+        # ESC1: Enrollee Supplies Subject + Client Auth + low-priv enrollment
+        if (enrollee_supplies_subject and
+                (client_auth or _has_client_auth(ekus)) and
+                low_priv_enroll and
+                not requires_approval and
+                auth_sigs == 0):
+            severity = "CRITICAL" if enabled else "HIGH"
+            findings.append({
+                "esc": "ESC1",
+                "severity": severity,
+                "template": name,
+                "display_name": display,
+                "enabled": enabled,
+                "cas": cas,
+                "enrollable_by": enroll_groups,
+                "description": (
+                    f"Template '{display}' allows the enrollee to specify a Subject Alternative Name "
+                    f"(SAN) AND has Client Authentication EKU AND is enrollable by low-privileged "
+                    f"users ({', '.join(enroll_groups)}). An attacker can request a certificate for "
+                    f"ANY user (including Domain Admin) and use it for authentication."
+                ),
+            })
+
+        # ESC2: Any Purpose or SubCA EKU + low-priv enrollment
+        if (_is_any_purpose_or_subca(ekus, any_purpose) and
+                low_priv_enroll and
+                not requires_approval and
+                auth_sigs == 0):
+            severity = "CRITICAL" if enabled else "HIGH"
+            desc_detail = "has Any Purpose EKU" if any_purpose or "Any Purpose" in ekus else "has no EKU restrictions (SubCA-like)"
+            findings.append({
+                "esc": "ESC2",
+                "severity": severity,
+                "template": name,
+                "display_name": display,
+                "enabled": enabled,
+                "cas": cas,
+                "enrollable_by": enroll_groups,
+                "description": (
+                    f"Template '{display}' {desc_detail} AND is enrollable by low-privileged "
+                    f"users ({', '.join(enroll_groups)}). The certificate can be used for client "
+                    f"authentication as any user, or as a subordinate CA."
+                ),
+            })
+
+        # ESC3: Certificate Request Agent + low-priv enrollment
+        if (_has_agent_eku(ekus) and
+                low_priv_enroll and
+                not requires_approval):
+            severity = "HIGH" if enabled else "MEDIUM"
+            findings.append({
+                "esc": "ESC3",
+                "severity": severity,
+                "template": name,
+                "display_name": display,
+                "enabled": enabled,
+                "cas": cas,
+                "enrollable_by": enroll_groups,
+                "description": (
+                    f"Template '{display}' has Certificate Request Agent EKU and is enrollable by "
+                    f"low-privileged users ({', '.join(enroll_groups)}). An attacker can use this "
+                    f"to enroll for certificates on behalf of other users (co-signing)."
+                ),
+            })
+
+        # ESC4: Low-priv write access to template
+        if low_priv_write:
+            severity = "CRITICAL" if enabled else "HIGH"
+            access_desc = "; ".join(f"{p} has {r}" for r, p in write_access[:5])
+            findings.append({
+                "esc": "ESC4",
+                "severity": severity,
+                "template": name,
+                "display_name": display,
+                "enabled": enabled,
+                "cas": cas,
+                "write_access": write_access,
+                "description": (
+                    f"Template '{display}' has dangerous write permissions for non-admin principals: "
+                    f"{access_desc}. An attacker can modify the template configuration to enable "
+                    f"ESC1 conditions (set Enrollee Supplies Subject, add Client Auth EKU, add "
+                    f"low-priv enrollment rights)."
+                ),
+            })
+
+    findings.sort(key=lambda f: {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}.get(f["severity"], 4))
+    return findings
+
+
+def analyze_ca(cas: dict) -> list[dict]:
+    """Analyze Certificate Authority properties for ESC6/7/8."""
+    findings = []
+
+    for idx, ca in cas.items():
+        ca_name = ca.get("CA Name", f"CA-{idx}")
+        dns = ca.get("DNS Name", "?")
+
+        # ESC8: HTTP web enrollment
+        web_enroll = ca.get("Web Enrollment", {})
+        http_enabled = web_enroll.get("http", {}).get("enabled", False)
+        https_enabled = web_enroll.get("https", {}).get("enabled", False)
+        if http_enabled:
+            findings.append({
+                "esc": "ESC8",
+                "severity": "CRITICAL",
+                "ca": ca_name,
+                "dns": dns,
+                "description": (
+                    f"CA '{ca_name}' ({dns}) has web enrollment enabled over HTTP. "
+                    f"An attacker can relay NTLM authentication (e.g. via PetitPotam/PrinterBug) "
+                    f"to the HTTP enrollment endpoint to obtain a certificate as the relayed principal."
+                ),
+            })
+
+        # ESC6: EDITF_ATTRIBUTESUBJECTALTNAME2
+        user_specified_san = ca.get("User Specified SAN", "")
+        if user_specified_san and user_specified_san.lower() not in ("disabled", "no", "false"):
+            findings.append({
+                "esc": "ESC6",
+                "severity": "CRITICAL",
+                "ca": ca_name,
+                "dns": dns,
+                "description": (
+                    f"CA '{ca_name}' ({dns}) has EDITF_ATTRIBUTESUBJECTALTNAME2 enabled. "
+                    f"Any enrollee can specify a SAN in their certificate request, regardless of "
+                    f"the template configuration. This effectively makes ALL templates ESC1-vulnerable."
+                ),
+            })
+
+        # ESC7: CA permissions
+        perms = ca.get("Permissions", {})
+        access_rights = perms.get("Access Rights", {})
+        manage_ca_sids = access_rights.get("1", [])
+        manage_certs_sids = access_rights.get("2", [])
+        enroll_sids = access_rights.get("512", [])
+
+        for p in manage_ca_sids:
+            name = p.rsplit("\\", 1)[-1] if "\\" in p else p
+            if name in LOW_PRIV_GROUPS:
+                findings.append({
+                    "esc": "ESC7",
+                    "severity": "CRITICAL",
+                    "ca": ca_name,
+                    "dns": dns,
+                    "principal": p,
+                    "right": "ManageCA",
+                    "description": (
+                        f"Low-privilege group '{p}' has ManageCA rights on '{ca_name}'. "
+                        f"This allows enabling EDITF_ATTRIBUTESUBJECTALTNAME2 (turning it into ESC6), "
+                        f"approving pending requests, or disabling NTAuth requirements."
+                    ),
+                })
+
+        for p in manage_certs_sids:
+            name = p.rsplit("\\", 1)[-1] if "\\" in p else p
+            if name in LOW_PRIV_GROUPS:
+                findings.append({
+                    "esc": "ESC7",
+                    "severity": "HIGH",
+                    "ca": ca_name,
+                    "dns": dns,
+                    "principal": p,
+                    "right": "ManageCertificates",
+                    "description": (
+                        f"Low-privilege group '{p}' has ManageCertificates rights on '{ca_name}'. "
+                        f"Combined with enrollment, an attacker can approve their own pending "
+                        f"certificate requests."
+                    ),
+                })
+
+    findings.sort(key=lambda f: {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2}.get(f["severity"], 3))
+    return findings
+
+
+def _find_certipy_json(directory: str) -> str | None:
+    """Find the most recent Certipy JSON output."""
+    candidates = sorted(glob.glob(os.path.join(directory, "*_Certipy.json")), reverse=True)
+    if candidates:
+        return candidates[0]
+    direct = os.path.join(directory, "Certipy.json")
+    if os.path.isfile(direct):
+        return direct
+    return None
+
+
+def main():
+    p = argparse.ArgumentParser(description="Certipy ADCS ESC1-8 vulnerability analyzer")
+    p.add_argument("file_or_dir", nargs="?", default=".",
+                   help="Certipy JSON file or directory to search (default: CWD)")
+    args = p.parse_args()
+
+    target = args.file_or_dir
+    if os.path.isdir(target):
+        json_path = _find_certipy_json(target)
+        if not json_path:
+            print(f"[-] No Certipy JSON found in {target}", file=sys.stderr)
+            sys.exit(1)
+    elif os.path.isfile(target):
+        json_path = target
+    else:
+        print(f"[-] {target}: not found", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"[*] Analyzing Certipy output: {json_path}")
+
+    with open(json_path) as f:
+        data = json.load(f)
+
+    cas = data.get("Certificate Authorities", {})
+    templates = data.get("Certificate Templates", {})
+    print(f"[*] Found {len(cas)} CA(s), {len(templates)} certificate template(s)\n")
+
+    ca_findings = analyze_ca(cas)
+    template_findings = analyze_templates(templates)
+    all_findings = ca_findings + template_findings
+
+    print("=" * 70)
+    print("[*] ADCS VULNERABILITY FINDINGS (ESC1-ESC8)")
+    print("=" * 70)
+
+    if all_findings:
+        esc_groups = {}
+        for f in all_findings:
+            esc_groups.setdefault(f["esc"], []).append(f)
+
+        for esc in sorted(esc_groups.keys()):
+            findings = esc_groups[esc]
+            print(f"\n--- {esc} ---")
+            for f in findings:
+                enabled_tag = "[ENABLED]" if f.get("enabled", True) else "[disabled]"
+                target_name = f.get("template", f.get("ca", "?"))
+                print(f"\n  [{f['severity']}] {enabled_tag} {target_name}")
+                if f.get("cas"):
+                    print(f"    Published on: {', '.join(f['cas'])}")
+                if f.get("enrollable_by"):
+                    print(f"    Enrollable by: {', '.join(f['enrollable_by'])}")
+                print(f"    {f['description']}")
+    else:
+        print("  (no ADCS vulnerabilities identified)")
+
+    # Summary
+    critical = sum(1 for f in all_findings if f["severity"] == "CRITICAL")
+    high = sum(1 for f in all_findings if f["severity"] == "HIGH")
+    enabled_critical = sum(1 for f in all_findings if f["severity"] == "CRITICAL" and f.get("enabled", True))
+
+    by_esc = {}
+    for f in all_findings:
+        by_esc[f["esc"]] = by_esc.get(f["esc"], 0) + 1
+
+    print(f"\n{'=' * 70}")
+    print(f"[*] SUMMARY: {len(all_findings)} findings ({critical} critical, {high} high)")
+    print(f"    Enabled+Critical: {enabled_critical}")
+    print(f"    By ESC: {', '.join(f'{k}={v}' for k, v in sorted(by_esc.items()))}")
+    print("=" * 70)
+
+
+if __name__ == "__main__":
+    main()

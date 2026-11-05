@@ -6,4 +6,15 @@ if not os.path.isfile(_SCRIPT):
     print(f"impacket GetUserSPNs not found at {_SCRIPT}", file=sys.stderr)
     sys.exit(127)
 sys.argv[0] = _SCRIPT
-exec(open(_SCRIPT).read())
+try:
+    exec(open(_SCRIPT).read())
+except ImportError as e:
+    print(f"[-] ImportError running GetUserSPNs: {e}", file=sys.stderr)
+    print(f"    python={sys.executable} argv={sys.argv}", file=sys.stderr)
+    sys.exit(1)
+except SystemExit:
+    raise
+except Exception as e:
+    print(f"[-] Error running GetUserSPNs: {type(e).__name__}: {e}", file=sys.stderr)
+    print(f"    python={sys.executable} argv={sys.argv}", file=sys.stderr)
+    sys.exit(1)

@@ -1,0 +1,518 @@
+#!/usr/bin/env python3
+"""BloodHound data analyzer — identifies AD attack paths from collected JSON.
+
+Reads BloodHound-python JSON output (users, groups, computers, domains, gpos,
+ous, containers) and identifies:
+  1. Dangerous ACL relationships (GenericAll, WriteDacl, WriteOwner, GenericWrite,
+     ForceChangePassword, AllExtendedRights, AddMember, AddKeyCredentialLink)
+     from non-admin principals to interesting targets
+  2. GPO abuse — non-admin principals with write access to GPOs linked to
+     privileged OUs or the domain root
+  3. Delegation abuse — unconstrained, constrained, and RBCD configurations
+  4. Attack path chains — low-priv user → group membership → dangerous ACL → high-value target
+
+Output is structured text consumed by the observation normalizer (and optionally
+by the LLM agent for deeper reasoning).
+"""
+import argparse
+import glob
+import json
+import os
+import sys
+from collections import defaultdict
+
+ADMIN_SIDS_SUFFIXES = {
+    "-512",   # Domain Admins
+    "-519",   # Enterprise Admins
+    "-518",   # Schema Admins
+    "-500",   # Administrator
+    "-516",   # Domain Controllers
+    "-498",   # Enterprise Read-only DCs
+    "-521",   # Read-only DCs
+}
+ADMIN_BUILTIN_SIDS = {
+    "S-1-5-32-544",  # BUILTIN\Administrators
+    "S-1-5-32-548",  # Account Operators
+    "S-1-5-32-549",  # Server Operators
+    "S-1-5-18",      # SYSTEM
+}
+
+DANGEROUS_RIGHTS = {
+    "GenericAll", "WriteDacl", "WriteOwner", "GenericWrite",
+    "ForceChangePassword", "AllExtendedRights", "AddMember",
+    "AddKeyCredentialLink", "ReadLAPSPassword", "ReadGMSAPassword",
+    "WriteSPN", "AddSelf",
+}
+
+GPO_WRITE_RIGHTS = {"GenericAll", "GenericWrite", "WriteDacl", "WriteOwner", "AllExtendedRights"}
+
+
+def _is_admin_sid(sid: str) -> bool:
+    if sid in ADMIN_BUILTIN_SIDS:
+        return True
+    for sfx in ADMIN_SIDS_SUFFIXES:
+        if sid.endswith(sfx):
+            return True
+    if "-S-1-5-32-544" in sid or "-S-1-5-32-548" in sid or "-S-1-5-32-549" in sid:
+        return True
+    if "-S-1-5-18" in sid or "-S-1-5-9" in sid:
+        return True
+    return False
+
+
+def _find_latest_files(directory: str):
+    """Find the most recent BloodHound JSON set by timestamp prefix."""
+    pattern = os.path.join(directory, "*_users.json")
+    candidates = sorted(glob.glob(pattern), reverse=True)
+    if not candidates:
+        return None
+    prefix = os.path.basename(candidates[0]).rsplit("_users.json", 1)[0]
+    return prefix, directory
+
+
+def _load_entities(directory: str, prefix: str):
+    """Load all entity types into a unified structure."""
+    entities = {}
+    sid_map = {}
+    sid_type = {}
+
+    for etype in ("users", "groups", "computers", "domains", "containers", "ous", "gpos"):
+        fname = os.path.join(directory, f"{prefix}_{etype}.json")
+        if not os.path.isfile(fname):
+            continue
+        with open(fname) as f:
+            data = json.load(f)
+        entries = data.get("data", [])
+        entities[etype] = entries
+        for entry in entries:
+            sid = entry.get("ObjectIdentifier", "")
+            name = entry.get("Properties", {}).get("name", sid)
+            if sid:
+                sid_map[sid] = name
+                sid_type[sid] = etype.rstrip("s")
+    return entities, sid_map, sid_type
+
+
+def _resolve_name(sid: str, sid_map: dict) -> str:
+    if sid in sid_map:
+        return sid_map[sid]
+    if sid.endswith("-512"):
+        return f"Domain Admins ({sid})"
+    if sid.endswith("-519"):
+        return f"Enterprise Admins ({sid})"
+    if sid.endswith("-513"):
+        return f"Domain Users ({sid})"
+    return sid
+
+
+def _resolve_principal(ace: dict, sid_map: dict) -> tuple[str, str, str]:
+    """Returns (sid, resolved_name, principal_type)."""
+    sid = ace.get("PrincipalSID", "")
+    ptype = ace.get("PrincipalType", "Unknown")
+    return sid, _resolve_name(sid, sid_map), ptype
+
+
+def analyze_acl_abuse(entities: dict, sid_map: dict, sid_type: dict):
+    """Find dangerous ACL relationships from non-admin to interesting targets."""
+    findings = []
+
+    high_value_sids = set()
+    for etype in ("users", "groups", "computers", "domains"):
+        for entry in entities.get(etype, []):
+            props = entry.get("Properties", {})
+            if props.get("highvalue") or props.get("admincount"):
+                high_value_sids.add(entry.get("ObjectIdentifier", ""))
+
+    group_members = defaultdict(set)
+    for g in entities.get("groups", []):
+        gsid = g.get("ObjectIdentifier", "")
+        for m in g.get("Members", []):
+            msid = m.get("ObjectIdentifier", "")
+            mtype = m.get("ObjectType", "")
+            if msid:
+                group_members[gsid].add((msid, mtype))
+
+    for etype in ("users", "groups", "computers", "domains"):
+        for entry in entities.get(etype, []):
+            target_sid = entry.get("ObjectIdentifier", "")
+            target_name = entry.get("Properties", {}).get("name", target_sid)
+            target_is_highvalue = target_sid in high_value_sids
+
+            for ace in entry.get("Aces", []):
+                right = ace.get("RightName", "")
+                if right not in DANGEROUS_RIGHTS:
+                    continue
+                if ace.get("IsInherited", False):
+                    continue
+
+                p_sid, p_name, p_type = _resolve_principal(ace, sid_map)
+                if _is_admin_sid(p_sid):
+                    continue
+
+                severity = "HIGH" if target_is_highvalue else "MEDIUM"
+                if right in ("GenericAll", "WriteDacl", "WriteOwner") and target_is_highvalue:
+                    severity = "CRITICAL"
+
+                findings.append({
+                    "type": "ACL_ABUSE",
+                    "severity": severity,
+                    "right": right,
+                    "principal": p_name,
+                    "principal_sid": p_sid,
+                    "principal_type": p_type,
+                    "target": target_name,
+                    "target_sid": target_sid,
+                    "target_type": etype.rstrip("s"),
+                    "target_highvalue": target_is_highvalue,
+                    "inherited": False,
+                    "description": _describe_acl_abuse(right, p_name, target_name, etype),
+                })
+
+    findings.sort(key=lambda f: {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2}.get(f["severity"], 3))
+    return findings
+
+
+def _describe_acl_abuse(right: str, principal: str, target: str, target_type: str) -> str:
+    attacks = {
+        "GenericAll": "Full control — can reset password, modify attributes, add to groups, or perform any action",
+        "WriteDacl": "Can modify the object's ACL to grant themselves GenericAll or other rights",
+        "WriteOwner": "Can take ownership of the object then modify its ACL",
+        "GenericWrite": "Can write to non-protected attributes — add SPN (Kerberoast), modify logon script, or set RBCD",
+        "ForceChangePassword": "Can reset the target's password without knowing the current password",
+        "AllExtendedRights": "All extended rights including ForceChangePassword and reading LAPS/gMSA passwords",
+        "AddMember": "Can add principals to this group, escalating privileges of the added principal",
+        "AddKeyCredentialLink": "Shadow Credentials — can add key credentials for PKINIT auth as the target",
+        "ReadLAPSPassword": "Can read the LAPS local admin password for this computer",
+        "ReadGMSAPassword": "Can read the gMSA password for this service account",
+        "WriteSPN": "Can set an SPN to make this account Kerberoastable",
+        "AddSelf": "Can add themselves to this group",
+    }
+    desc = attacks.get(right, f"Has {right} on target")
+    return f"{principal} has {right} on {target} ({target_type}). {desc}."
+
+
+def analyze_gpo_abuse(entities: dict, sid_map: dict):
+    """Find GPOs writable by non-admin principals that are linked to privileged OUs."""
+    findings = []
+
+    gpo_links = {}
+    for d in entities.get("domains", []):
+        for link in d.get("Links", []):
+            guid = link.get("GUID", "").upper()
+            gpo_links.setdefault(guid, []).append({
+                "target": d["Properties"].get("name", "?"),
+                "target_type": "domain",
+                "enforced": link.get("IsEnforced", False),
+            })
+    for o in entities.get("ous", []):
+        for link in o.get("Links", []):
+            guid = link.get("GUID", "").upper()
+            gpo_links.setdefault(guid, []).append({
+                "target": o["Properties"].get("name", "?"),
+                "target_type": "OU",
+                "enforced": link.get("IsEnforced", False),
+                "children": len(o.get("ChildObjects", [])),
+            })
+
+    for gpo in entities.get("gpos", []):
+        gpo_name = gpo.get("Properties", {}).get("name", "?")
+        gpo_sid = gpo.get("ObjectIdentifier", "")
+        gpo_guid = gpo_sid.replace("{", "").replace("}", "").upper()
+        gpc_path = gpo.get("Properties", {}).get("gpcpath", "")
+
+        linked_to = gpo_links.get(gpo_guid, [])
+        if not gpo_guid:
+            for k in gpo_links:
+                if k in gpc_path.upper():
+                    linked_to = gpo_links[k]
+                    break
+
+        for ace in gpo.get("Aces", []):
+            right = ace.get("RightName", "")
+            if right not in GPO_WRITE_RIGHTS:
+                continue
+            if ace.get("IsInherited", False):
+                continue
+
+            p_sid = ace.get("PrincipalSID", "")
+            if _is_admin_sid(p_sid):
+                continue
+
+            p_name = _resolve_name(p_sid, sid_map)
+
+            for lt in linked_to:
+                findings.append({
+                    "type": "GPO_ABUSE",
+                    "severity": "HIGH" if lt["target_type"] == "domain" else "MEDIUM",
+                    "right": right,
+                    "principal": p_name,
+                    "principal_sid": p_sid,
+                    "gpo": gpo_name,
+                    "gpc_path": gpc_path,
+                    "linked_to": lt["target"],
+                    "linked_type": lt["target_type"],
+                    "enforced": lt.get("enforced", False),
+                    "description": (
+                        f"{p_name} has {right} on GPO '{gpo_name}' which is linked to "
+                        f"{lt['target_type']} '{lt['target']}'. An attacker with this access "
+                        f"can modify the GPO to push malicious scripts, scheduled tasks, or "
+                        f"registry changes to all objects in the linked scope."
+                    ),
+                })
+
+            if not linked_to:
+                findings.append({
+                    "type": "GPO_ABUSE",
+                    "severity": "LOW",
+                    "right": right,
+                    "principal": p_name,
+                    "principal_sid": p_sid,
+                    "gpo": gpo_name,
+                    "gpc_path": gpc_path,
+                    "linked_to": "(unlinked)",
+                    "linked_type": "none",
+                    "enforced": False,
+                    "description": (
+                        f"{p_name} has {right} on GPO '{gpo_name}' (currently unlinked). "
+                        f"If this GPO can be linked to an OU, it could be used for code execution."
+                    ),
+                })
+
+    findings.sort(key=lambda f: {"HIGH": 0, "MEDIUM": 1, "LOW": 2}.get(f["severity"], 3))
+    return findings
+
+
+def analyze_delegation(entities: dict, sid_map: dict):
+    """Find unconstrained, constrained, and RBCD delegation configurations."""
+    findings = []
+
+    for comp in entities.get("computers", []):
+        props = comp.get("Properties", {})
+        name = props.get("name", "?")
+
+        if props.get("unconstraineddelegation"):
+            findings.append({
+                "type": "DELEGATION",
+                "subtype": "unconstrained",
+                "severity": "CRITICAL",
+                "principal": name,
+                "description": (
+                    f"{name} has unconstrained delegation enabled. Any user authenticating to "
+                    f"this host forwards their TGT, allowing the host (or an attacker who "
+                    f"compromises it) to impersonate them to ANY service in the domain."
+                ),
+            })
+
+        if props.get("trustedtoauth"):
+            delegates = comp.get("AllowedToDelegate", [])
+            targets = ", ".join(
+                _resolve_name(d.get("ObjectIdentifier", ""), sid_map) if isinstance(d, dict) else str(d)
+                for d in delegates
+            ) if delegates else "(unspecified)"
+            findings.append({
+                "type": "DELEGATION",
+                "subtype": "constrained",
+                "severity": "HIGH",
+                "principal": name,
+                "targets": targets,
+                "description": (
+                    f"{name} has constrained delegation to: {targets}. An attacker who "
+                    f"compromises this host can impersonate any user to those specific services "
+                    f"(S4U2Proxy). If protocol transition is enabled, they don't even need the "
+                    f"user to authenticate first (S4U2Self)."
+                ),
+            })
+
+        allowed_to_act = comp.get("AllowedToAct", [])
+        if allowed_to_act:
+            actors = ", ".join(
+                _resolve_name(a.get("ObjectIdentifier", str(a)), sid_map) if isinstance(a, dict) else str(a)
+                for a in allowed_to_act
+            )
+            findings.append({
+                "type": "DELEGATION",
+                "subtype": "RBCD",
+                "severity": "HIGH",
+                "principal": name,
+                "actors": actors,
+                "description": (
+                    f"{name} has Resource-Based Constrained Delegation (RBCD) configured. "
+                    f"Principals allowed to act: {actors}. These principals can impersonate "
+                    f"any user to services on {name}."
+                ),
+            })
+
+    for user in entities.get("users", []):
+        props = user.get("Properties", {})
+        name = props.get("name", "?")
+        delegates = user.get("AllowedToDelegate", [])
+        if delegates:
+            targets = ", ".join(
+                _resolve_name(d.get("ObjectIdentifier", ""), sid_map) if isinstance(d, dict) else str(d)
+                for d in delegates
+            )
+            findings.append({
+                "type": "DELEGATION",
+                "subtype": "constrained_user",
+                "severity": "HIGH",
+                "principal": name,
+                "targets": targets,
+                "description": (
+                    f"User {name} has constrained delegation to: {targets}. Compromising this "
+                    f"account allows impersonating any user to those services."
+                ),
+            })
+
+    return findings
+
+
+def analyze_attack_paths(entities: dict, sid_map: dict, acl_findings: list):
+    """Identify multi-hop attack paths: low-priv → group → dangerous ACL → high-value."""
+    group_members = defaultdict(set)
+    member_of = defaultdict(set)
+
+    for g in entities.get("groups", []):
+        gsid = g.get("ObjectIdentifier", "")
+        for m in g.get("Members", []):
+            msid = m.get("ObjectIdentifier", "")
+            if msid:
+                group_members[gsid].add(msid)
+                member_of[msid].add(gsid)
+
+    domain_users_sids = set()
+    for sid, name in sid_map.items():
+        if "DOMAIN USERS" in name.upper():
+            domain_users_sids.add(sid)
+
+    all_domain_user_sids = set()
+    for u in entities.get("users", []):
+        usid = u.get("ObjectIdentifier", "")
+        if usid and not _is_admin_sid(usid):
+            all_domain_user_sids.add(usid)
+
+    paths = []
+    for finding in acl_findings:
+        p_sid = finding.get("principal_sid", "")
+        if finding["principal_type"] != "Group":
+            continue
+
+        indirect_members = set()
+        for du_sid in domain_users_sids:
+            if du_sid in group_members.get(p_sid, set()):
+                indirect_members.add("Domain Users (all domain users)")
+                break
+
+        for usid in all_domain_user_sids:
+            if usid in group_members.get(p_sid, set()):
+                indirect_members.add(_resolve_name(usid, sid_map))
+
+        if indirect_members and len(indirect_members) <= 20:
+            chain_users = ", ".join(list(indirect_members)[:5])
+            if len(indirect_members) > 5:
+                chain_users += f" (+{len(indirect_members) - 5} more)"
+            paths.append({
+                "type": "ATTACK_PATH",
+                "severity": finding["severity"],
+                "chain": f"{chain_users} → {finding['principal']} → [{finding['right']}] → {finding['target']}",
+                "description": (
+                    f"Attack path: members of {finding['principal']} ({chain_users}) can "
+                    f"abuse {finding['right']} on {finding['target']} via group membership."
+                ),
+            })
+
+    seen = set()
+    unique = []
+    for p in paths:
+        key = p["chain"]
+        if key not in seen:
+            seen.add(key)
+            unique.append(p)
+    return unique[:50]
+
+
+def main():
+    p = argparse.ArgumentParser(description="BloodHound data attack-path analyzer")
+    p.add_argument("directory", nargs="?", default=".",
+                   help="Directory containing BloodHound JSON files (default: CWD)")
+    args = p.parse_args()
+
+    result = _find_latest_files(args.directory)
+    if not result:
+        print(f"[-] No BloodHound JSON files found in {args.directory}", file=sys.stderr)
+        print(f"[-] Looking for pattern: *_users.json", file=sys.stderr)
+        sys.exit(1)
+
+    prefix, directory = result
+    print(f"[*] Analyzing BloodHound data: prefix={prefix}, dir={directory}")
+
+    entities, sid_map, sid_type = _load_entities(directory, prefix)
+    total = sum(len(v) for v in entities.values())
+    print(f"[*] Loaded {total} entities across {len(entities)} types, {len(sid_map)} SIDs mapped\n")
+
+    acl_findings = analyze_acl_abuse(entities, sid_map, sid_type)
+    gpo_findings = analyze_gpo_abuse(entities, sid_map)
+    delegation_findings = analyze_delegation(entities, sid_map)
+    path_findings = analyze_attack_paths(entities, sid_map, acl_findings)
+
+    # --- Output ---
+    print("=" * 70)
+    print("[*] ACL ABUSE FINDINGS")
+    print("=" * 70)
+    if acl_findings:
+        for f in acl_findings:
+            print(f"\n  [{f['severity']}] {f['right']}: {f['principal']} → {f['target']}")
+            print(f"    Type: {f['principal_type']} → {f['target_type']}")
+            print(f"    {f['description']}")
+        non_admin_unique = set()
+        for f in acl_findings:
+            if f["principal_type"] == "User" and not _is_admin_sid(f["principal_sid"]):
+                non_admin_unique.add(f["principal"])
+        if non_admin_unique:
+            print(f"\n  [!] Non-admin USERS with dangerous ACL rights: {', '.join(sorted(non_admin_unique))}")
+    else:
+        print("  (no non-admin dangerous ACL relationships found)")
+
+    print(f"\n{'=' * 70}")
+    print("[*] GPO ABUSE FINDINGS")
+    print("=" * 70)
+    if gpo_findings:
+        for f in gpo_findings:
+            print(f"\n  [{f['severity']}] {f['right']}: {f['principal']} → GPO '{f['gpo']}' → {f['linked_to']}")
+            print(f"    {f['description']}")
+    else:
+        print("  (no GPO abuse paths found)")
+
+    print(f"\n{'=' * 70}")
+    print("[*] DELEGATION FINDINGS")
+    print("=" * 70)
+    if delegation_findings:
+        for f in delegation_findings:
+            print(f"\n  [{f['severity']}] {f['subtype'].upper()}: {f['principal']}")
+            print(f"    {f['description']}")
+    else:
+        print("  (no delegation misconfigurations found)")
+
+    print(f"\n{'=' * 70}")
+    print("[*] ATTACK PATH CHAINS")
+    print("=" * 70)
+    if path_findings:
+        for f in path_findings:
+            print(f"\n  [{f['severity']}] {f['chain']}")
+            print(f"    {f['description']}")
+    else:
+        print("  (no multi-hop attack paths identified)")
+
+    # Summary
+    total_findings = len(acl_findings) + len(gpo_findings) + len(delegation_findings) + len(path_findings)
+    critical = sum(1 for f in acl_findings + gpo_findings + delegation_findings if f.get("severity") == "CRITICAL")
+    high = sum(1 for f in acl_findings + gpo_findings + delegation_findings if f.get("severity") == "HIGH")
+
+    print(f"\n{'=' * 70}")
+    print(f"[*] SUMMARY: {total_findings} findings ({critical} critical, {high} high)")
+    print(f"    ACL abuse: {len(acl_findings)}, GPO abuse: {len(gpo_findings)}, "
+          f"Delegation: {len(delegation_findings)}, Attack paths: {len(path_findings)}")
+    print("=" * 70)
+
+
+if __name__ == "__main__":
+    main()

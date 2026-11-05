@@ -243,6 +243,15 @@ def _mk_build(tool_id: str, bins: list[str], template: list[str]):
                                 argv[idx + 1] = resolved
                         except ValueError:
                             pass
+            else:
+                import sys as _sys
+                print(f"[catalog-diag] {tool_id}: no domain creds — "
+                      f"args_keys={sorted(args.keys())} "
+                      f"domain_user={bool(args.get('domain_user'))} "
+                      f"domain_pass={bool(args.get('domain_pass'))} "
+                      f"domain={bool(args.get('domain'))} "
+                      f"redis_fallback=None",
+                      file=_sys.stderr)
         return argv
     return build
 
@@ -291,7 +300,7 @@ CATALOG: list[tuple] = [
     ("feroxbuster", ["feroxbuster"],  ["--silent", "-k", "-n", "-u", "{url}", "-w", "{wordlist}"], _P1, [_SC], "network"),  # --silent+-q conflict → exit 2; -n bounds recursion
     ("dirsearch",   ["dirsearch"],    ["-q", "-u", "{url}"],                         _P1, [_SC], "network"),
     ("arjun",       ["arjun"],        ["-u", "{url}"],                               _P1, [_SC], "network"),  # overridden by the built-in spec (per-endpoint url); kept so the id stays in the SCAN manifest
-    ("smbmap",      ["smbmap"],       ["-H", "{target}"],                            _P1, [_SC], "network"),
+    ("smbmap",      ["smbmap"],       ["-H", "{target}", "--no-write-check", "--depth", "1", "--timeout", "30"], _P1, [_SC], "network"),
     ("enum4linux_ng", ["enum4linux-ng", "enum4linux"], ["-A", "{target}"],          _P1, [_SC], "network"),
     ("smbclient_list", ["smbclient"], ["-L", "{target}", "-N"],                      _P1, [_SC], "network", (0, 1)),
     ("ldapsearch_base", ["ldapsearch"], ["-x", "-H", "ldap://{target}", "-s", "base", "-b", ""], _P1, [_SC], "network"),
@@ -306,6 +315,8 @@ CATALOG: list[tuple] = [
     ("impacket_mssqlenum", ["vapt-mssqlenum"], ["-target-ip", "{target}"],           _P1, [_SC], "network"),
     ("ad_enum", ["vapt-ad-enum"],       ["-dc-ip", "{target}"],                       _P1, [_SC], "network"),
     ("bloodhound_python", ["bloodhound-python", "bloodhound"], ["-ns", "{target}", "-c", "All"], _P1, [_SC], "network"),
+    ("bloodhound_analyzer", ["vapt-bloodhound-analyzer"], ["."],                     _P1, [_SC, _VA], "network"),
+    ("certipy_analyzer", ["vapt-certipy-analyzer"], ["."],                           _P1, [_SC, _VA], "network"),
     ("dig_axfr",    ["dig"],          ["@{target}"],                                 _P1, [_SC], "network"),
     ("cewl",        ["cewl"],         ["-d", "1", "{url}"],                          _P1, [_SC], "network"),
     ("onesixtyone", ["onesixtyone"],  ["{target}"],                                  _P2, [_SC], "network"),  # SNMP community brute → gated
@@ -423,6 +434,8 @@ _PURPOSE: dict[str, str] = {
     "impacket_mssqlenum": "MSSQL enumeration — lists databases, linked servers, server roles, and current user context via Windows authentication. Linked servers enable cross-domain pivoting. Use when MSSQL (1433) is open and domain creds available.",
     "ad_enum": "AD misconfiguration enumeration — checks for passwords in description fields, LAPS readability, gMSA accounts, trust relationships, and admin group membership. Use when LDAP is open and domain creds available.",
     "bloodhound_python": "Active Directory attack-path collection (users, groups, ACLs, sessions, trusts). Use when LDAP+SMB are open and domain creds available.",
+    "bloodhound_analyzer": "Analyzes BloodHound JSON output for AD attack paths — identifies dangerous ACL relationships (GenericAll, WriteDacl, WriteOwner, ForceChangePassword), GPO abuse (writable GPOs linked to privileged OUs), delegation abuse (unconstrained, constrained, RBCD), and multi-hop privilege escalation chains. Run AFTER bloodhound_python.",
+    "certipy_analyzer": "Analyzes Certipy JSON output for ADCS ESC1-ESC8 vulnerabilities — classifies each certificate template and CA for exploitable misconfigurations (enrollee-supplies-subject, low-priv enrollment, template write access, HTTP enrollment, SAN override). Run AFTER certipy_find.",
     "dig_axfr": "DNS zone transfer (AXFR) attempt against a DNS server. Leaks all DNS records if the server allows it. Use when port 53 is open and domain name known.",
     "cewl": "Build a wordlist by spidering a website (for later auth testing).",
     "onesixtyone": "SNMP community-string brute (gated). Use when 161/udp SNMP is present.",
