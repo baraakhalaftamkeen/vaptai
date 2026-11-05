@@ -29,9 +29,10 @@ from .runscope import RunScope
 # remote-access, mail, directory, database and Windows service ports. The engagement's
 # own "Allowed ports" field overrides this (including a full-range sweep like 1-65535).
 DEFAULT_PORTS = (
-    "21,22,23,25,53,80,110,135,139,143,389,443,445,465,587,636,993,995,"
-    "1433,1521,2049,3000,3001,3306,3389,4200,5000,5001,5432,5601,5900,5985,5986,6379,"
-    "7001,7070,8000,8001,8002,8008,8080,8081,8088,8090,8443,8888,9000,9001,9200,27017"
+    "21,22,23,25,53,80,88,110,135,139,143,389,443,445,464,465,587,636,993,995,"
+    "1433,1521,2049,3000,3001,3268,3269,3306,3389,4200,5000,5001,5432,5601,5900,"
+    "5985,5986,6379,7001,7070,8000,8001,8002,8008,8080,8081,8088,8090,8443,8888,"
+    "9000,9001,9200,9389,27017"
 )
 
 # Default bounded black/gray-box web+network adapter set, used when no plan is given.

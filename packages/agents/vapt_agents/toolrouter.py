@@ -155,7 +155,10 @@ def route_actions(db: Session, scope: RunScope, harness, *, limit: int = 32
             add("certipy_find", {**domain_args})
 
     # --- Kerberos / AD ---------------------------------------------------------------
-    if "88" in ports or "kerberos" in names:
+    # Trigger on port 88 directly, OR when LDAP+SMB+domain creds prove this is a DC
+    # (port 88 is often missed by nmap when not in the scan list).
+    _is_dc = domain_args and ({"389", "636", "3268"} & ports) and ({"445", "139"} & ports)
+    if "88" in ports or "kerberos" in names or _is_dc:
         if domain_args:
             add("impacket_getuserspns", {**domain_args})
             add("impacket_getnpusers", {**domain_args})
