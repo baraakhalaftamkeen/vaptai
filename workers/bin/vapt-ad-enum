@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+"""AD LDAP enumeration — runs targeted queries for common AD misconfigurations.
+
+Checks: password in description field, LAPS readability, gMSA accounts,
+trust relationships, and admin group membership.  Uses impacket's LDAP
+module so it works with the standard -dc-ip / domain/user:pass pattern.
+"""
+import argparse, sys
+
+def _base_dn(domain: str) -> str:
+    return ",".join(f"DC={p}" for p in domain.split("."))
+
+
+def _parse_creds(target: str):
+    """Parse 'domain/user:pass' into (domain, user, password)."""
+    if "/" not in target:
+        return target, "", ""
+    domain, rest = target.split("/", 1)
+    if ":" in rest:
+        user, password = rest.split(":", 1)
+    else:
+        user, password = rest, ""
+    return domain, user, password
+
+
+def main():
+    p = argparse.ArgumentParser(description="AD LDAP misconfiguration enumeration")
+    p.add_argument("-dc-ip", dest="dc_ip", required=True, help="DC IP address")
+    p.add_argument("target", help="domain/user:pass")
+    args = p.parse_args()
+
+    domain, user, password = _parse_creds(args.target)
+    if not domain or not user:
+        print("[-] Need domain/user:pass as positional argument", file=sys.stderr)
+        sys.exit(1)
+
+    base = _base_dn(domain)
+    bind_dn = f"{user}@{domain}"
+
+    try:
+        import ldap3
+        server = ldap3.Server(args.dc_ip, get_info=ldap3.ALL, use_ssl=False)
+        conn = ldap3.Connection(server, user=bind_dn, password=password, auto_bind=True)
+    except ImportError:
+        _ldap3_fallback(args.dc_ip, base, bind_dn, password, domain)
+        return
+    except Exception as e:
+        print(f"[-] LDAP bind failed: {e}", file=sys.stderr)
+        _ldap3_fallback(args.dc_ip, base, bind_dn, password, domain)
+        return
+
+    print(f"[*] Connected to {args.dc_ip} as {bind_dn}")
+    print(f"[*] Base DN: {base}\n")
+
+    # 1. Password in description
+    print("=" * 60)
+    print("[*] CHECK: Password-like strings in user description fields")
+    print("=" * 60)
+    conn.search(base, "(objectClass=user)",
+                attributes=["sAMAccountName", "description", "distinguishedName"],
+                search_scope=ldap3.SUBTREE)
+    found_desc = False
+    for entry in conn.entries:
+        desc = str(entry.description) if entry.description else ""
+        if desc and desc != "[]":
+            print(f"  {entry.sAMAccountName}: description = {desc}")
+            found_desc = True
+    if not found_desc:
+        print("  (no users with description field set)")
+
+    # 2. LAPS
+    print(f"\n{'=' * 60}")
+    print("[*] CHECK: LAPS password readability (ms-Mcs-AdmPwd)")
+    print("=" * 60)
+    try:
+        conn.search(base, "(&(objectClass=computer)(ms-Mcs-AdmPwd=*))",
+                    attributes=["sAMAccountName", "ms-Mcs-AdmPwd", "ms-Mcs-AdmPwdExpirationTime"],
+                    search_scope=ldap3.SUBTREE)
+        if conn.entries:
+            for entry in conn.entries:
+                print(f"  [!] LAPS password readable: {entry.sAMAccountName}")
+                pwd = entry["ms-Mcs-AdmPwd"] if "ms-Mcs-AdmPwd" in entry else "***"
+                print(f"      ms-Mcs-AdmPwd = {pwd}")
+        else:
+            print("  (no LAPS passwords readable with current creds)")
+    except Exception as e:
+        print(f"  (LAPS schema not present or query failed: {e})")
+
+    # 3. gMSA
+    print(f"\n{'=' * 60}")
+    print("[*] CHECK: Group Managed Service Accounts (gMSA)")
+    print("=" * 60)
+    try:
+        conn.search(base, "(objectClass=msDS-GroupManagedServiceAccount)",
+                    attributes=["sAMAccountName", "msDS-ManagedPasswordInterval",
+                                 "msDS-GroupMSAMembership", "distinguishedName"],
+                    search_scope=ldap3.SUBTREE)
+        if conn.entries:
+            for entry in conn.entries:
+                print(f"  gMSA account: {entry.sAMAccountName}")
+                print(f"    DN: {entry.distinguishedName}")
+        else:
+            print("  (no gMSA accounts found)")
+    except Exception as e:
+        print(f"  (gMSA query failed: {e})")
+
+    # 4. Trust relationships
+    print(f"\n{'=' * 60}")
+    print("[*] CHECK: Domain trust relationships")
+    print("=" * 60)
+    trust_base = f"CN=System,{base}"
+    conn.search(trust_base, "(objectClass=trustedDomain)",
+                attributes=["cn", "trustDirection", "trustType",
+                             "trustAttributes", "trustPartner"],
+                search_scope=ldap3.SUBTREE)
+    if conn.entries:
+        _dir_map = {"1": "Inbound", "2": "Outbound", "3": "Bidirectional"}
+        _type_map = {"1": "Windows NT", "2": "Active Directory", "3": "MIT Kerberos"}
+        for entry in conn.entries:
+            td = str(entry.trustDirection) if entry.trustDirection else "?"
+            tt = str(entry.trustType) if entry.trustType else "?"
+            print(f"  Trust: {entry.cn} ({entry.trustPartner})")
+            print(f"    Direction: {_dir_map.get(td, td)}, Type: {_type_map.get(tt, tt)}")
+            ta = str(entry.trustAttributes) if entry.trustAttributes else "0"
+            if ta != "0":
+                flags = []
+                ta_int = int(ta) if ta.isdigit() else 0
+                if ta_int & 0x1: flags.append("NON_TRANSITIVE")
+                if ta_int & 0x2: flags.append("UPLEVEL_ONLY")
+                if ta_int & 0x4: flags.append("QUARANTINED (SID filtering)")
+                if ta_int & 0x8: flags.append("FOREST_TRANSITIVE")
+                if ta_int & 0x20: flags.append("WITHIN_FOREST")
+                if ta_int & 0x40: flags.append("TREAT_AS_EXTERNAL")
+                print(f"    Attributes: {', '.join(flags) if flags else ta}")
+    else:
+        print("  (no trust relationships found)")
+
+    # 5. Admin group members
+    print(f"\n{'=' * 60}")
+    print("[*] CHECK: Domain Admins / Enterprise Admins membership")
+    print("=" * 60)
+    for group in ["Domain Admins", "Enterprise Admins", "Administrators"]:
+        conn.search(base, f"(&(objectClass=group)(cn={group}))",
+                    attributes=["member"], search_scope=ldap3.SUBTREE)
+        if conn.entries:
+            members = conn.entries[0].member if conn.entries[0].member else []
+            print(f"  {group}: {len(members)} member(s)")
+            for m in members:
+                cn = str(m).split(",")[0].replace("CN=", "")
+                print(f"    - {cn}")
+
+    conn.unbind()
+    print(f"\n[*] AD enumeration complete.")
+
+
+def _ldap3_fallback(dc_ip, base, bind_dn, password, domain):
+    """Fall back to ldapsearch CLI if ldap3 is not installed."""
+    import subprocess, shutil
+    ldapsearch = shutil.which("ldapsearch")
+    if not ldapsearch:
+        print("[-] Neither ldap3 nor ldapsearch available", file=sys.stderr)
+        sys.exit(1)
+
+    print("[*] ldap3 not available, falling back to ldapsearch CLI\n")
+    base_args = [ldapsearch, "-x", "-H", f"ldap://{dc_ip}", "-D", bind_dn, "-w", password, "-b", base]
+
+    queries = [
+        ("Password in description", "(objectClass=user)", ["sAMAccountName", "description"]),
+        ("LAPS passwords", "(&(objectClass=computer)(ms-Mcs-AdmPwd=*))", ["sAMAccountName", "ms-Mcs-AdmPwd"]),
+        ("gMSA accounts", "(objectClass=msDS-GroupManagedServiceAccount)", ["sAMAccountName"]),
+        ("Trust relationships", "(objectClass=trustedDomain)", ["cn", "trustDirection", "trustType", "trustPartner"]),
+    ]
+    for label, filt, attrs in queries:
+        print(f"{'=' * 60}")
+        print(f"[*] CHECK: {label}")
+        print("=" * 60)
+        cmd = base_args + [filt] + attrs
+        if label == "Trust relationships":
+            cmd = [ldapsearch, "-x", "-H", f"ldap://{dc_ip}", "-D", bind_dn, "-w", password,
+                   "-b", f"CN=System,{base}", filt] + attrs
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)
+        print(r.stdout[:4000] if r.stdout else "  (no results)")
+        if r.stderr:
+            for line in r.stderr.strip().split("\n")[:3]:
+                if "SASL" not in line:
+                    print(f"  stderr: {line}")
+        print()
+
+
+if __name__ == "__main__":
+    main()

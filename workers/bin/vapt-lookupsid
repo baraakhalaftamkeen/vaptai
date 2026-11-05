@@ -1,0 +1,38 @@
+#!/usr/bin/env python3
+"""SID enumeration wrapper — wraps lookupsid.py with standard -dc-ip args.
+
+Accepts the standard impacket -dc-ip / domain/user:pass pattern and
+internally constructs the target@host connection string lookupsid expects.
+"""
+import os, subprocess, sys
+
+_LOOKUPSID = None
+for candidate in ("lookupsid.py", "impacket-lookupsid"):
+    import shutil
+    if shutil.which(candidate):
+        _LOOKUPSID = candidate
+        break
+if not _LOOKUPSID:
+    _fallback = "/usr/share/doc/python3-impacket/examples/lookupsid.py"
+    if os.path.isfile(_fallback):
+        _LOOKUPSID = _fallback
+    else:
+        print("lookupsid.py not found", file=sys.stderr)
+        sys.exit(127)
+
+def main():
+    import argparse
+    p = argparse.ArgumentParser(description="SID enum via lookupsid.py")
+    p.add_argument("-dc-ip", dest="dc_ip", required=True, help="target IP")
+    p.add_argument("target", nargs="?", help="domain/user:pass")
+    args, extra = p.parse_known_args()
+
+    cred = args.target or ""
+    conn_str = f"{cred}@{args.dc_ip}" if cred and "@" not in cred else args.dc_ip
+    argv = [_LOOKUPSID, "-target-ip", args.dc_ip, conn_str] + extra
+
+    r = subprocess.run(argv, capture_output=False, stdin=subprocess.DEVNULL)
+    sys.exit(r.returncode)
+
+if __name__ == "__main__":
+    main()

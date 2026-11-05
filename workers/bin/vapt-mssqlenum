@@ -1,0 +1,57 @@
+#!/usr/bin/env python3
+"""MSSQL enumeration wrapper — runs read-only queries via mssqlclient.py.
+
+Accepts the standard impacket -dc-ip / domain/user:pass argument pattern
+and internally constructs the connection string mssqlclient.py expects.
+"""
+import os, subprocess, sys
+
+_MSSQLCLIENT = None
+for candidate in ("mssqlclient.py", "impacket-mssqlclient"):
+    import shutil
+    if shutil.which(candidate):
+        _MSSQLCLIENT = candidate
+        break
+if not _MSSQLCLIENT:
+    _fallback = "/usr/share/doc/python3-impacket/examples/mssqlclient.py"
+    if os.path.isfile(_fallback):
+        _MSSQLCLIENT = _fallback
+    else:
+        print("mssqlclient.py not found", file=sys.stderr)
+        sys.exit(127)
+
+_QUERIES = [
+    "SELECT name FROM master.sys.databases",
+    "EXEC sp_linkedservers",
+    "SELECT IS_SRVROLEMEMBER('sysadmin')",
+    "SELECT IS_SRVROLEMEMBER('public')",
+    "SELECT SYSTEM_USER",
+    "SELECT name, type_desc FROM sys.server_principals WHERE type IN ('S','U','G')",
+]
+
+def main():
+    import argparse
+    p = argparse.ArgumentParser(description="MSSQL enum via mssqlclient.py")
+    p.add_argument("-dc-ip", dest="dc_ip", help="DC IP (unused, kept for arg compat)")
+    p.add_argument("-target-ip", dest="target_ip", help="MSSQL server IP")
+    p.add_argument("-windows-auth", action="store_true", default=True)
+    p.add_argument("-port", default="1433")
+    p.add_argument("target", nargs="?", help="domain/user:pass (target IP comes from -target-ip or engagement target)")
+    args, extra = p.parse_known_args()
+
+    target_ip = args.target_ip or args.dc_ip
+    cred = args.target or ""
+    if not target_ip or not cred:
+        p.error("need -target-ip IP and domain/user:pass positional")
+
+    conn_str = f"{cred}@{target_ip}" if "@" not in cred else cred
+    argv = [_MSSQLCLIENT, conn_str, "-windows-auth", "-port", args.port]
+    for q in _QUERIES:
+        argv += ["-command", q]
+    argv += extra
+
+    r = subprocess.run(argv, capture_output=False, stdin=subprocess.DEVNULL)
+    sys.exit(r.returncode)
+
+if __name__ == "__main__":
+    main()

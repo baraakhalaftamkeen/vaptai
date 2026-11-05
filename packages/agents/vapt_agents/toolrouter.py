@@ -87,7 +87,7 @@ def _web_targets(services: list[tuple[str, str]], *, cap: int = 6) -> list[dict]
     return eps
 
 
-def route_actions(db: Session, scope: RunScope, harness, *, limit: int = 32
+def route_actions(db: Session, scope: RunScope, harness, *, limit: int = 48
                   ) -> list[tuple[str, dict, str]]:
     """Choose follow-up tools for the discovered services. Returns [(tool_id, args, task_id)]
     for installed, non-destructive (P0/P1) tools only."""
@@ -143,16 +143,30 @@ def route_actions(db: Session, scope: RunScope, harness, *, limit: int = 32
         add("smbmap", {**domain_args})
         add("enum4linux_ng", {**domain_args})
         add("smbclient_list", {**domain_args})
+        add("nxc_smb_signing", {})
+        add("rpcclient_enum", {})
+
+    # --- RPC endpoints (port 135 / epmapper) -----------------------------------------
+    if "135" in ports or "epmap" in names or "msrpc" in names:
+        add("impacket_rpcdump", {})
 
     # --- SMTP ------------------------------------------------------------------------
     if {"25", "465", "587"} & ports or "smtp" in names:
         add("swaks_relay", {})
+
+    # --- MSSQL -----------------------------------------------------------------------
+    if "1433" in ports or "ms-sql" in names or "mssql" in names:
+        if domain_args:
+            add("impacket_mssqlenum", {**domain_args})
 
     # --- LDAP / AD -------------------------------------------------------------------
     if {"389", "636", "3268"} & ports or "ldap" in names:
         add("ldapsearch_base", {**domain_args})
         if domain_args:
             add("certipy_find", {**domain_args})
+            add("impacket_getadusers", {**domain_args})
+            add("impacket_finddelegation", {**domain_args})
+            add("ad_enum", {**domain_args})
 
     # --- Kerberos / AD ---------------------------------------------------------------
     # Trigger on port 88 directly, OR when LDAP+SMB+domain creds prove this is a DC
@@ -168,9 +182,10 @@ def route_actions(db: Session, scope: RunScope, harness, *, limit: int = 32
         if domain_args:
             add("dig_axfr", {**domain_args})
 
-    # --- AD graph collection (BloodHound) — needs LDAP + SMB + domain creds ----------
+    # --- AD graph + SID enum (BloodHound + lookupsid) — LDAP + SMB + creds ----------
     if domain_args and ({"389", "636", "3268"} & ports) and ({"445", "139"} & ports):
         add("bloodhound_python", {**domain_args})
+        add("impacket_lookupsid", {**domain_args})
 
     # --- Subdomain takeover (named targets only) -------------------------------------
     if scope.domains and not _is_ip(scope.target):
