@@ -144,6 +144,18 @@ def normalize(tool_id: str, result_observations: list[dict]) -> list[Observation
         return _wapiti(text)
     if tool_id == "dalfox":
         return _dalfox(text, result_observations)
+    if tool_id == "impacket_getuserspns":
+        return _getuserspns(text)
+    if tool_id == "impacket_getnpusers":
+        return _getnpusers(text)
+    if tool_id == "impacket_finddelegation":
+        return _finddelegation(text)
+    if tool_id == "impacket_getadusers":
+        return _getadusers(text)
+    if tool_id == "bloodhound_analyzer":
+        return _bloodhound_analyzer(text)
+    if tool_id == "certipy_analyzer":
+        return _certipy_analyzer(text)
     # Generic: if the tool produced any stdout, record one info observation.
     if text.strip():
         return [Observation(tool_id, f"{tool_id} output", "info", {"excerpt": text[:500]})]
@@ -1587,3 +1599,197 @@ def _wapiti(text: str) -> list[Observation]:
             if len(out) >= 100:            # bound a pathological report
                 return out
     return out
+
+
+# ---------------------------------------------------------------------------
+# AD / network tool parsers
+# ---------------------------------------------------------------------------
+
+def _getuserspns(text: str) -> list[Observation]:
+    """Parse GetUserSPNs output for Kerberoastable service accounts and TGS hashes."""
+    cleaned = _clean(text)
+    obs: list[Observation] = []
+    hashes: list[str] = []
+    spn_accounts: list[dict] = []
+    for line in cleaned.splitlines():
+        if line.startswith("$krb5tgs$"):
+            hashes.append(line.strip())
+            m = re.search(r"\$\*([^$*]+)\$", line)
+            if m:
+                hashes[-1] = m.group(1)  # store account name for the title
+        elif line and not line.startswith(("-", "Impacket", "ServicePrincipal", "[")) and "  " in line:
+            parts = line.split()
+            if len(parts) >= 2 and "/" in parts[0]:
+                spn_accounts.append({"spn": parts[0], "account": parts[1]})
+    if hashes:
+        for h in hashes:
+            obs.append(Observation(
+                "impacket_getuserspns",
+                f"Kerberoastable account: {h}",
+                "high",
+                {"account": h, "attack": "Kerberoasting",
+                 "description": f"Service account {h} has an SPN and a TGS ticket was retrieved. "
+                                "The hash can be cracked offline to recover the plaintext password."},
+            ))
+    if not obs and spn_accounts:
+        for s in spn_accounts[:20]:
+            obs.append(Observation(
+                "impacket_getuserspns",
+                f"SPN found: {s['spn']} ({s['account']})",
+                "medium",
+                {"spn": s["spn"], "account": s["account"]},
+            ))
+    if not obs and cleaned.strip():
+        obs.append(Observation("impacket_getuserspns", "GetUserSPNs: no Kerberoastable accounts found", "info",
+                               {"excerpt": cleaned[:500]}))
+    return obs
+
+
+def _getnpusers(text: str) -> list[Observation]:
+    """Parse GetNPUsers output for AS-REP roastable accounts."""
+    cleaned = _clean(text)
+    obs: list[Observation] = []
+    for line in cleaned.splitlines():
+        if line.startswith("$krb5asrep$"):
+            m = re.search(r"\$([^$@]+)@", line)
+            name = m.group(1) if m else "unknown"
+            obs.append(Observation(
+                "impacket_getnpusers",
+                f"AS-REP roastable account: {name}",
+                "high",
+                {"account": name, "attack": "AS-REP Roasting",
+                 "description": f"Account {name} does not require Kerberos pre-authentication. "
+                                "The AS-REP hash can be cracked offline to recover the password."},
+            ))
+        elif "0x410200" in line or "0x400200" in line or "UF_DONT_REQUIRE_PREAUTH" in line:
+            parts = line.split()
+            if parts:
+                name = parts[0]
+                obs.append(Observation(
+                    "impacket_getnpusers",
+                    f"AS-REP roastable account: {name} (pre-auth disabled)",
+                    "high",
+                    {"account": name, "attack": "AS-REP Roasting", "uac": "DONT_REQUIRE_PREAUTH",
+                     "description": f"Account {name} has Kerberos pre-authentication disabled."},
+                ))
+    if not obs and cleaned.strip():
+        obs.append(Observation("impacket_getnpusers", "GetNPUsers: no AS-REP roastable accounts found", "info",
+                               {"excerpt": cleaned[:500]}))
+    return obs
+
+
+def _finddelegation(text: str) -> list[Observation]:
+    """Parse findDelegation output for delegation misconfigurations."""
+    cleaned = _clean(text)
+    obs: list[Observation] = []
+    for line in cleaned.splitlines():
+        if not line or line.startswith(("Impacket", "AccountName", "-")):
+            continue
+        parts = re.split(r"\s{2,}", line.strip())
+        if len(parts) >= 3:
+            account, dtype = parts[0], parts[1]
+            sev = "critical" if "Unconstrained" in dtype else "high"
+            obs.append(Observation(
+                "impacket_finddelegation",
+                f"Delegation: {account} ({dtype})",
+                sev,
+                {"account": account, "delegation_type": dtype,
+                 "targets": parts[2] if len(parts) > 2 else ""},
+            ))
+    if not obs and cleaned.strip():
+        obs.append(Observation("impacket_finddelegation", "findDelegation: no delegation found", "info",
+                               {"excerpt": cleaned[:500]}))
+    return obs
+
+
+def _getadusers(text: str) -> list[Observation]:
+    """Parse GetADUsers output. Flag accounts with passwords in the description field."""
+    cleaned = _clean(text)
+    obs: list[Observation] = []
+    pw_in_desc = re.compile(r"(?i)(pass(?:word)?|pwd|p@ss)\s*[:=]")
+    for line in cleaned.splitlines():
+        if not line or line.startswith(("Impacket", "Name", "-", "[")):
+            continue
+        if pw_in_desc.search(line):
+            parts = re.split(r"\s{2,}", line.strip())
+            name = parts[0] if parts else line[:40]
+            obs.append(Observation(
+                "impacket_getadusers",
+                f"Password in description: {name}",
+                "high",
+                {"account": name, "line": line.strip()[:300]},
+            ))
+    if not obs and cleaned.strip():
+        user_count = sum(1 for l in cleaned.splitlines()
+                         if l.strip() and not l.startswith(("Impacket", "Name", "-", "[")))
+        obs.append(Observation("impacket_getadusers", f"AD users enumerated: {user_count} accounts", "info",
+                               {"user_count": user_count, "excerpt": cleaned[:500]}))
+    return obs
+
+
+_BH_SEV = re.compile(r"\[(CRITICAL|HIGH|MEDIUM|LOW|INFO)\]", re.IGNORECASE)
+
+def _bloodhound_analyzer(text: str) -> list[Observation]:
+    """Parse vapt-bloodhound-analyzer structured output into individual findings."""
+    cleaned = _clean(text)
+    obs: list[Observation] = []
+    for line in cleaned.splitlines():
+        m = _BH_SEV.search(line)
+        if not m:
+            continue
+        sev = m.group(1).lower()
+        rest = line[m.end():].strip().rstrip(":")
+        if not rest:
+            continue
+        # Classify the finding type from the line
+        category = "ad_misconfiguration"
+        if "UNCONSTRAINED" in rest.upper():
+            category = "unconstrained_delegation"
+        elif "CONSTRAINED" in rest.upper():
+            category = "constrained_delegation"
+        elif "GPO" in rest.upper() or "GenericWrite" in rest or "WriteDacl" in rest or "WriteOwner" in rest:
+            category = "gpo_abuse"
+        elif any(k in rest for k in ("GenericAll", "ForceChangePassword", "AllExtendedRights")):
+            category = "acl_abuse"
+        obs.append(Observation(
+            "bloodhound_analyzer",
+            rest[:300],
+            sev,
+            {"category": category, "raw": rest[:500]},
+        ))
+        if len(obs) >= 50:
+            break
+    if not obs and cleaned.strip():
+        obs.append(Observation("bloodhound_analyzer", "BloodHound analysis: no attack paths found", "info",
+                               {"excerpt": cleaned[:500]}))
+    return obs
+
+
+_ESC_SEV = re.compile(r"\[(CRITICAL|HIGH|MEDIUM|LOW|INFO)\]", re.IGNORECASE)
+
+def _certipy_analyzer(text: str) -> list[Observation]:
+    """Parse vapt-certipy-analyzer structured output for ADCS ESC1-8 findings."""
+    cleaned = _clean(text)
+    obs: list[Observation] = []
+    for line in cleaned.splitlines():
+        m = _ESC_SEV.search(line)
+        if not m:
+            continue
+        sev = m.group(1).lower()
+        rest = line[m.end():].strip()
+        if not rest:
+            continue
+        esc_m = re.search(r"(ESC\d+)", rest, re.IGNORECASE)
+        esc_type = esc_m.group(1).upper() if esc_m else "ADCS"
+        obs.append(Observation(
+            "certipy_analyzer",
+            rest[:300],
+            sev,
+            {"esc_type": esc_type, "raw": rest[:500]},
+        ))
+        if len(obs) >= 30:
+            break
+    if not obs and cleaned.strip():
+        obs.append(Observation("certipy_analyzer", "Certipy analysis: no ADCS vulnerabilities found", "info",
+                               {"excerpt": cleaned[:500]}))
+    return obs
