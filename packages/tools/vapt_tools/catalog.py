@@ -300,7 +300,7 @@ CATALOG: list[tuple] = [
     ("feroxbuster", ["feroxbuster"],  ["--silent", "-k", "-n", "-u", "{url}", "-w", "{wordlist}"], _P1, [_SC], "network"),  # --silent+-q conflict → exit 2; -n bounds recursion
     ("dirsearch",   ["dirsearch"],    ["-q", "-u", "{url}"],                         _P1, [_SC], "network"),
     ("arjun",       ["arjun"],        ["-u", "{url}"],                               _P1, [_SC], "network"),  # overridden by the built-in spec (per-endpoint url); kept so the id stays in the SCAN manifest
-    ("smbmap",      ["smbmap"],       ["-H", "{target}", "--no-write-check", "--depth", "1", "--timeout", "30"], _P1, [_SC], "network"),
+    ("smbmap",      ["smbmap"],       ["-H", "{target}", "--no-write-check", "--depth", "1", "--timeout", "30"], _P1, [_SC], "network", (0,), 45),
     ("enum4linux_ng", ["enum4linux-ng", "enum4linux"], ["-A", "{target}"],          _P1, [_SC], "network"),
     ("smbclient_list", ["smbclient"], ["-L", "{target}", "-N"],                      _P1, [_SC], "network", (0, 1)),
     ("ldapsearch_base", ["ldapsearch"], ["-x", "-H", "ldap://{target}", "-s", "base", "-b", ""], _P1, [_SC], "network"),
@@ -501,6 +501,7 @@ def _load() -> None:
     for row in CATALOG:
         tool_id, bins, tmpl, cls, agents, tkind = row[0], row[1], row[2], row[3], row[4], row[5]
         oks = row[6] if len(row) > 6 else (0,)
+        tool_timeout = row[7] if len(row) > 7 else 600
         for ag in agents:
             CATALOG_IDS_BY_AGENT.setdefault(ag, [])
             if tool_id not in CATALOG_IDS_BY_AGENT[ag]:
@@ -510,7 +511,7 @@ def _load() -> None:
         REGISTRY.register(ToolSpec(
             id=tool_id, version="catalog-1", policy_class=cls, allowed_agents=list(agents),
             supported_modes=list(_MODES), build_argv=_mk_build(tool_id, bins, tmpl),
-            timeout_s=600, ok_exit_codes=tuple(oks), target_kind=tkind,
+            timeout_s=tool_timeout, ok_exit_codes=tuple(oks), target_kind=tkind,
             description=_describe(tool_id, cls),
         ))
 
