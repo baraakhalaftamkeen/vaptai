@@ -308,7 +308,7 @@ CATALOG: list[tuple] = [
     ("impacket_getnpusers", ["GetNPUsers.py", "impacket-GetNPUsers", "vapt-getnpusers"], ["-dc-ip", "{target}"], _P1, [_SC], "network"),
     ("impacket_finddelegation", ["findDelegation.py", "impacket-findDelegation"], ["-dc-ip", "{target}"], _P1, [_SC], "network"),
     ("impacket_getadusers", ["GetADUsers.py", "impacket-GetADUsers"], ["-all", "-dc-ip", "{target}"], _P1, [_SC], "network"),
-    ("impacket_lookupsid", ["lookupsid.py", "impacket-lookupsid", "vapt-lookupsid"],  ["-dc-ip", "{target}"],              _P1, [_SC], "network"),
+    ("impacket_lookupsid", ["vapt-lookupsid"],  ["-dc-ip", "{target}"],              _P1, [_SC], "network"),
     ("impacket_rpcdump", ["rpcdump.py", "impacket-rpcdump"], ["{target}"],           _P1, [_SC], "network"),
     ("rpcclient_enum", ["rpcclient"],   ["-U", "", "-N", "{target}", "-c", "enumdomusers;enumdomgroups;querydominfo;getdompwinfo;lsaenumsid"], _P1, [_SC], "network", (0, 1)),
     ("nxc_smb_signing", ["nxc", "netexec"], ["smb", "{target}"],                     _P1, [_SC], "network"),
