@@ -288,6 +288,7 @@ class GovernedHarness:
                 in_scope=in_scope,
                 resolved_addresses=ctx.resolved_addresses,
                 signed_profile=ctx.signed_profile,
+                auto_approve=_run_auto_approve(db, ctx.run_id),
             )
         )
         ledger.record_policy_decision(
@@ -379,17 +380,14 @@ class GovernedHarness:
         )
         ledger.record_event(db, ctx.run_id, "approval.requested",
                             {"digest": digest, "approval_id": appr.id, "forced": True})
-        # Auto-approve path (forced-approval variant for ATTACK). The graph will pause
-        # here on interrupt. We can't bypass the pause from inside the harness because
-        # the LangGraph interrupt mechanism is on the ORCHESTRATOR side — but we CAN
-        # flip the approval to approved AND enqueue the outbox entry the API would have
-        # written, so the normal relay → resume_run path fires without a human click.
+        # Auto-approve path: flip the approval to "approved" so the graph node can
+        # detect it via prior_decision() and skip interrupt() entirely — no Outbox,
+        # no resume race.  The node is responsible for calling execute_approved().
         if _run_auto_approve(db, ctx.run_id) and appr.state == "pending":
             appr.state = "approved"
             ledger.record_event(db, ctx.run_id, "approval.decided",
                                 {"approval_id": appr.id, "digest": digest,
                                  "decision": "approved", "by": "auto-approve"})
-            _enqueue_resume(db, ctx.run_id)
         _ = action  # proposal recorded; execution happens only via execute_approved
         return ActionOutcome(
             PolicyDecision.REQUIRE_APPROVAL, False, reason, digest, key, approval_id=appr.id

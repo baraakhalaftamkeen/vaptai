@@ -286,6 +286,10 @@ def _finalize(db, run: Run, final_state: dict) -> dict:
         run.phase = final_state.get("phase", "scan")
         db.add(RunEvent(run_id=run.id, seq=_next_seq(db, run.id),
                         kind="run.paused", payload={"reason": "approval_required"}))
+        # NOTE: auto-resume is handled by the harness's _enqueue_resume() inside
+        # require_approval() — it writes an Outbox run.resume in the SAME transaction
+        # that records the auto-approve decision, BEFORE interrupt() pauses the graph.
+        # Do NOT also enqueue here; that creates a duplicate resume → race → double PoC.
         return {"status": "awaiting_approval", "run_id": run.id}
 
     if final_state.get("phase") == "failed":

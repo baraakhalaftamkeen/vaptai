@@ -930,7 +930,7 @@ def _idor_probe(text: str) -> list[Observation]:
             continue
         url = str(f.get("url", "")).strip()[:400]
         param = str(f.get("param", "")).strip()
-        evidence = str(f.get("evidence", "")).strip()[:400]
+        evidence = str(f.get("evidence", "")).strip()[:8000]
         sev = str(f.get("severity") or "high").strip().lower()
         if sev not in ("info", "low", "medium", "high", "critical"):
             sev = "high"
@@ -952,8 +952,6 @@ def _idor_probe(text: str) -> list[Observation]:
              "confirmed": verified, "method": method,
              "subtype": ftype},
         ))
-        if len(out) >= 20:
-            break
     # Diagnostic: when zero findings, surface the trace so operators see WHICH URLs
     # were tested and what status codes came back (helps diagnose "no IDOR found but
     # also no coverage" from "no IDOR because truly authz-correct").

@@ -351,7 +351,7 @@ class Report(Base):
     title: Mapped[str] = mapped_column(String(300), default="Assessment report")
     summary: Mapped[str] = mapped_column(Text, default="")             # executive summary
     remediation: Mapped[str] = mapped_column(Text, default="")        # remediation guidance
-    content: Mapped[str] = mapped_column(Text, default="")            # rendered HTML
+    content: Mapped[str] = mapped_column(Text(length=2**24), default="")  # rendered HTML (MEDIUMTEXT)
     stats: Mapped[dict] = mapped_column(JSON, default=dict)           # counts, coverage gaps
     generated_by: Mapped[str] = mapped_column(String(50), default="reporting-agent")
     signed_off_by: Mapped[str | None] = mapped_column(CHAR(36))

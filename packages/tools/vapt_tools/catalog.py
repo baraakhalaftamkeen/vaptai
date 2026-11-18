@@ -31,7 +31,8 @@ from .registry import REGISTRY, ToolSpec, _domain_credentials, _valid_host
 
 _P0, _P1, _P2, _P3 = (PolicyClass.P0_PASSIVE, PolicyClass.P1_LOW_IMPACT,
                       PolicyClass.P2_INTRUSIVE, PolicyClass.P3_EXCLUDED)
-_RE, _SC, _VA, _AT = (AgentRole.RECON, AgentRole.SCAN, AgentRole.VALIDATE, AgentRole.ATTACK)
+_RE, _SC, _VA, _AT, _AN = (AgentRole.RECON, AgentRole.SCAN, AgentRole.VALIDATE,
+                           AgentRole.ATTACK, AgentRole.ANALYSIS)
 _MODES = ["black_box", "gray_box", "white_box"]
 
 _WORDLIST_DEFAULT = "/usr/share/seclists/Discovery/Web-Content/common.txt"
@@ -176,6 +177,25 @@ _DOMAIN_CRED_ARGS: dict[str, object] = {
     "ad_enum":              lambda d, u, p: [f"{d}/{u}:{p}"],
     "bloodhound_python":    lambda d, u, p: ["-u", f"{u}@{d}", "-p", p, "-d", d],
     "dig_axfr":             lambda d, u, p: [d, "AXFR"],
+    "coercer_scan":         lambda d, u, p: ["-u", u, "-p", p, "-d", d],
+    "nxc_petitpotam":       lambda d, u, p: ["-u", u, "-p", p, "-d", d],
+    "nxc_printerbug":       lambda d, u, p: ["-u", u, "-p", p, "-d", d],
+    "nxc_shadowcoerce":     lambda d, u, p: ["-u", u, "-p", p, "-d", d],
+    "nxc_dfscoerce":        lambda d, u, p: ["-u", u, "-p", p, "-d", d],
+    "certipy_req":          lambda d, u, p: ["-u", f"{u}@{d}", "-p", p],
+    "impacket_getst":       lambda d, u, p: [f"{d}/{u}:{p}"],
+    "impacket_gettgt":      lambda d, u, p: [f"{d}/{u}:{p}"],
+    "impacket_ticketer":    lambda d, u, p: [],
+    "impacket_psexec":      lambda d, u, p: [f"{d}/{u}:{p}@"],
+    "impacket_wmiexec":     lambda d, u, p: [f"{d}/{u}:{p}@"],
+    "impacket_smbexec":     lambda d, u, p: [f"{d}/{u}:{p}@"],
+    "impacket_atexec":      lambda d, u, p: [f"{d}/{u}:{p}@"],
+    "impacket_dcomexec":    lambda d, u, p: [f"{d}/{u}:{p}@"],
+    "impacket_rbcd":        lambda d, u, p: [f"{d}/{u}:{p}"],
+    "nxc_laps":             lambda d, u, p: ["-u", u, "-p", p, "-d", d],
+    "nxc_gmsa":             lambda d, u, p: ["-u", u, "-p", p, "-d", d],
+    "impacket_ntlmrelayx":  lambda d, u, p: [],
+    "nxc_trusts":           lambda d, u, p: ["-u", u, "-p", p, "-d", d],
 }
 _DOMAIN_STRIP_FLAGS: dict[str, set[str]] = {
     "smbclient_list": {"-N"},
@@ -300,30 +320,30 @@ CATALOG: list[tuple] = [
     ("feroxbuster", ["feroxbuster"],  ["--silent", "-k", "-n", "-u", "{url}", "-w", "{wordlist}"], _P1, [_SC], "network"),  # --silent+-q conflict → exit 2; -n bounds recursion
     ("dirsearch",   ["dirsearch"],    ["-q", "-u", "{url}"],                         _P1, [_SC], "network"),
     ("arjun",       ["arjun"],        ["-u", "{url}"],                               _P1, [_SC], "network"),  # overridden by the built-in spec (per-endpoint url); kept so the id stays in the SCAN manifest
-    ("smbmap",      ["smbmap"],       ["-H", "{target}", "--no-write-check", "--depth", "1", "--timeout", "30"], _P1, [_SC], "network", (0,), 45),
-    ("enum4linux_ng", ["enum4linux-ng", "enum4linux"], ["-A", "{target}"],          _P1, [_SC], "network"),
-    ("smbclient_list", ["smbclient"], ["-L", "{target}", "-N"],                      _P1, [_SC], "network", (0, 1)),
-    ("ldapsearch_base", ["ldapsearch"], ["-x", "-H", "ldap://{target}", "-s", "base", "-b", ""], _P1, [_SC], "network"),
-    ("impacket_getuserspns", ["GetUserSPNs.py", "impacket-GetUserSPNs", "vapt-getuserspns"], ["-dc-ip", "{target}", "-request"], _P1, [_SC], "network"),
-    ("impacket_getnpusers", ["GetNPUsers.py", "impacket-GetNPUsers", "vapt-getnpusers"], ["-dc-ip", "{target}"], _P1, [_SC], "network"),
-    ("impacket_finddelegation", ["findDelegation.py", "impacket-findDelegation"], ["-dc-ip", "{target}"], _P1, [_SC], "network"),
-    ("impacket_getadusers", ["GetADUsers.py", "impacket-GetADUsers"], ["-all", "-dc-ip", "{target}"], _P1, [_SC], "network"),
-    ("impacket_lookupsid", ["vapt-lookupsid"],  ["-dc-ip", "{target}"],              _P1, [_SC], "network"),
-    ("impacket_rpcdump", ["rpcdump.py", "impacket-rpcdump"], ["{target}"],           _P1, [_SC], "network"),
-    ("rpcclient_enum", ["rpcclient"],   ["-U", "", "-N", "{target}", "-c", "enumdomusers;enumdomgroups;querydominfo;getdompwinfo;lsaenumsid"], _P1, [_SC], "network", (0, 1)),
-    ("nxc_smb_signing", ["nxc", "netexec"], ["smb", "{target}"],                     _P1, [_SC], "network"),
-    ("impacket_mssqlenum", ["vapt-mssqlenum"], ["-target-ip", "{target}"],           _P1, [_SC], "network"),
-    ("ad_enum", ["vapt-ad-enum"],       ["-dc-ip", "{target}"],                       _P1, [_SC], "network"),
-    ("bloodhound_python", ["bloodhound-python", "bloodhound"], ["-ns", "{target}", "-c", "All"], _P1, [_SC], "network"),
-    ("bloodhound_analyzer", ["vapt-bloodhound-analyzer"], ["."],                     _P1, [_SC, _VA], "network"),
-    ("certipy_analyzer", ["vapt-certipy-analyzer"], ["."],                           _P1, [_SC, _VA], "network"),
-    ("dig_axfr",    ["dig"],          ["@{target}"],                                 _P1, [_SC], "network"),
+    ("smbmap",      ["smbmap"],       ["-H", "{target}", "--no-write-check", "--depth", "1", "--timeout", "30"], _P1, [_SC, _AN], "network", (0,), 45),
+    ("enum4linux_ng", ["enum4linux-ng", "enum4linux"], ["-A", "{target}"],          _P1, [_SC, _AN], "network"),
+    ("smbclient_list", ["smbclient"], ["-L", "{target}", "-N"],                      _P1, [_SC, _AN], "network", (0, 1)),
+    ("ldapsearch_base", ["ldapsearch"], ["-x", "-H", "ldap://{target}", "-s", "base", "-b", ""], _P1, [_SC, _AN], "network"),
+    ("impacket_getuserspns", ["GetUserSPNs.py", "impacket-GetUserSPNs", "vapt-getuserspns"], ["-dc-ip", "{target}", "-request"], _P1, [_SC, _AN], "network"),
+    ("impacket_getnpusers", ["GetNPUsers.py", "impacket-GetNPUsers", "vapt-getnpusers"], ["-dc-ip", "{target}"], _P1, [_SC, _AN], "network"),
+    ("impacket_finddelegation", ["findDelegation.py", "impacket-findDelegation"], ["-dc-ip", "{target}"], _P1, [_SC, _AN], "network"),
+    ("impacket_getadusers", ["GetADUsers.py", "impacket-GetADUsers"], ["-all", "-dc-ip", "{target}"], _P1, [_SC, _AN], "network"),
+    ("impacket_lookupsid", ["vapt-lookupsid"],  ["-dc-ip", "{target}"],              _P1, [_SC, _AN], "network"),
+    ("impacket_rpcdump", ["rpcdump.py", "impacket-rpcdump"], ["{target}"],           _P1, [_SC, _AN], "network"),
+    ("rpcclient_enum", ["rpcclient"],   ["-U", "", "-N", "{target}", "-c", "enumdomusers;enumdomgroups;querydominfo;getdompwinfo;lsaenumsid"], _P1, [_SC, _AN], "network", (0, 1)),
+    ("nxc_smb_signing", ["nxc", "netexec"], ["smb", "{target}"],                     _P1, [_SC, _AN], "network"),
+    ("impacket_mssqlenum", ["vapt-mssqlenum"], ["-target-ip", "{target}"],           _P1, [_SC, _AN], "network"),
+    ("ad_enum", ["vapt-ad-enum"],       ["-dc-ip", "{target}"],                       _P1, [_SC, _AN], "network"),
+    ("bloodhound_python", ["bloodhound-python", "bloodhound"], ["-ns", "{target}", "-c", "All"], _P1, [_SC, _AN], "network"),
+    ("bloodhound_analyzer", ["vapt-bloodhound-analyzer"], ["."],                     _P1, [_SC, _VA, _AN], "network"),
+    ("certipy_analyzer", ["vapt-certipy-analyzer"], ["."],                           _P1, [_SC, _VA, _AN], "network"),
+    ("dig_axfr",    ["dig"],          ["@{target}"],                                 _P1, [_SC, _AN], "network"),
     ("cewl",        ["cewl"],         ["-d", "1", "{url}"],                          _P1, [_SC], "network"),
     ("onesixtyone", ["onesixtyone"],  ["{target}"],                                  _P2, [_SC], "network"),  # SNMP community brute → gated
     ("smtp_user_enum", ["smtp-user-enum"], ["-M", "VRFY", "-U", "{wordlist}", "-t", "{target}"], _P2, [_SC], "network"),
 
     # --- 3. Vulnerability assessment --------------------------------------------------
-    ("nikto",       ["nikto"],        ["-ask", "no", "-nointeractive", "-maxtime", "180", "-host", "{url}"], _P1, [_SC, _VA], "network", (0, 1)),  # self-cap at 3m (nikto on IIS can run until the tool timeout otherwise)
+    ("nikto",       ["nikto"],        ["-ask", "no", "-nointeractive", "-maxtime", "180", "-host", "{url}"], _P1, [_SC, _VA, _AN], "network", (0, 1)),  # self-cap at 3m (nikto on IIS can run until the tool timeout otherwise)
     ("wpscan",      ["wpscan"],       ["--url", "{url}", "--no-banner", "--format", "cli-no-color"], _P1, [_SC, _VA], "network", (0, 1, 4, 5)),
     ("joomscan",    ["joomscan"],     ["--url", "{url}"],                            _P1, [_SC, _VA], "network"),
     ("droopescan",  ["droopescan"],   ["scan", "drupal", "-u", "{url}"],             _P1, [_SC, _VA], "network"),
@@ -369,7 +389,8 @@ CATALOG: list[tuple] = [
     ("nosqlmap",    ["nosqlmap", "NoSQLMap"], ["--url", "{url}"],                    _P2, [_AT], "network"),
     ("hydra",       ["hydra"],        ["-L", "{wordlist}", "-P", "{wordlist}", "-f", "{target}"], _P2, [_AT], "network"),
     ("medusa",      ["medusa"],       ["-U", "{wordlist}", "-P", "{wordlist}", "-h", "{target}"], _P2, [_AT], "network"),
-    # P3 — registered but policy-denied (MITM / C2): catalogued, never auto-runs.
+    # P3 — registered but policy-denied (MITM / C2): catalogued, never auto-runs
+    # (but WILL run under auto-approve since policy now downgrades P3→REQUIRE_APPROVAL).
     ("responder",   ["responder", "Responder.py"], ["-I", "eth0"],                  _P3, [_AT], "network"),
     ("mitm6",       ["mitm6"],        ["-d", "{domain}"],                            _P3, [_AT], "network"),
     ("bettercap",   ["bettercap"],    [],                                            _P3, [_AT], "network"),
@@ -382,10 +403,91 @@ CATALOG: list[tuple] = [
     ("impacket_secretsdump", ["impacket-secretsdump", "secretsdump.py"], ["{target}"], _P2, [_AT], "network"),
     ("lsassy",      ["lsassy"],       ["{target}"],                                  _P2, [_AT], "network"),
     ("bloodyad",    ["bloodyAD", "bloodyad"], ["--host", "{target}", "get", "search"], _P2, [_AT], "network"),
-    ("certipy_find", ["certipy", "certipy-ad"], ["find", "-target", "{target}"],     _P1, [_SC, _AT], "network"),
+    ("certipy_find", ["certipy", "certipy-ad"], ["find", "-target", "{target}"],     _P1, [_SC, _AT, _AN], "network"),
     ("chisel",      ["chisel"],       ["client"],                                    _P2, [_AT], "network"),
     ("ligolo_proxy", ["ligolo-proxy"], ["-selfcert"],                               _P2, [_AT], "local"),
     ("krbrelayx",   ["krbrelayx", "krbrelayx.py"], [],                               _P3, [_AT], "network"),
+
+    # --- 6. Hash cracking (offline, local-only) ----------------------------------------
+    ("hashcat_kerberoast", ["hashcat"], ["-m", "13100", "-a", "0", "--potfile-disable",
+                                         "--force", "{target}", "{wordlist}"],
+                           _P0, [_AT, _AN], "local", (0, 1), 300),
+    ("hashcat_asrep",      ["hashcat"], ["-m", "18200", "-a", "0", "--potfile-disable",
+                                         "--force", "{target}", "{wordlist}"],
+                           _P0, [_AT, _AN], "local", (0, 1), 300),
+    ("john_kerberoast",    ["john"],    ["--format=krb5tgs", "--wordlist={wordlist}", "{target}"],
+                           _P0, [_AT, _AN], "local", (0, 1), 300),
+    ("john_asrep",         ["john"],    ["--format=krb5asrep", "--wordlist={wordlist}", "{target}"],
+                           _P0, [_AT, _AN], "local", (0, 1), 300),
+
+    # --- 7. Coercion checks (authentication coercion / relay trigger) ------------------
+    ("coercer_scan",       ["coercer"], ["scan", "-t", "{target}", "-u", "{target}", "-d", "{domain}"],
+                           _P1, [_SC, _AT, _AN], "network", (0,), 60),
+    ("nxc_petitpotam",     ["nxc", "netexec"], ["smb", "{target}", "-M", "petitpotam"],
+                           _P2, [_AT, _AN], "network"),
+    ("nxc_printerbug",     ["nxc", "netexec"], ["smb", "{target}", "-M", "printerbug"],
+                           _P2, [_AT, _AN], "network"),
+    ("nxc_shadowcoerce",   ["nxc", "netexec"], ["smb", "{target}", "-M", "shadowcoerce"],
+                           _P2, [_AT, _AN], "network"),
+    ("nxc_dfscoerce",      ["nxc", "netexec"], ["smb", "{target}", "-M", "dfscoerce"],
+                           _P2, [_AT, _AN], "network"),
+
+    # --- 8. ADCS exploitation ----------------------------------------------------------
+    ("certipy_req",        ["certipy", "certipy-ad"], ["req", "-target", "{target}", "-ca", "{target}"],
+                           _P2, [_AT], "network"),
+    ("certipy_auth",       ["certipy", "certipy-ad"], ["auth", "-pfx", "{target}"],
+                           _P2, [_AT], "local"),
+
+    # --- 9. Kerberos ticket & delegation exploitation ----------------------------------
+    ("impacket_getst",     ["getST.py", "impacket-getST"],
+                           ["-dc-ip", "{target}", "-spn", "cifs/{target}"],
+                           _P2, [_AT], "network"),
+    ("impacket_gettgt",    ["getTGT.py", "impacket-getTGT"],
+                           ["-dc-ip", "{target}"],
+                           _P2, [_AT], "network"),
+    ("impacket_ticketer",  ["ticketer.py", "impacket-ticketer"],
+                           ["-domain", "{domain}", "-dc-ip", "{target}"],
+                           _P2, [_AT], "network"),
+    ("impacket_describeticket", ["describeTicket.py", "impacket-describeTicket"],
+                                ["{target}"],
+                                _P0, [_AT, _AN], "local"),
+
+    # --- 10. Lateral movement / remote execution (P2, human-gated) ---------------------
+    ("impacket_psexec",    ["psexec.py", "impacket-psexec"],
+                           ["{target}"],
+                           _P2, [_AT], "network"),
+    ("impacket_wmiexec",   ["wmiexec.py", "impacket-wmiexec"],
+                           ["{target}"],
+                           _P2, [_AT], "network"),
+    ("impacket_smbexec",   ["smbexec.py", "impacket-smbexec"],
+                           ["{target}"],
+                           _P2, [_AT], "network"),
+    ("impacket_atexec",    ["atexec.py", "impacket-atexec"],
+                           ["{target}"],
+                           _P2, [_AT], "network"),
+    ("impacket_dcomexec",  ["dcomexec.py", "impacket-dcomexec"],
+                           ["{target}"],
+                           _P2, [_AT], "network"),
+
+    # --- 11. RBCD / delegation abuse ---------------------------------------------------
+    ("impacket_rbcd",      ["rbcd.py"],
+                           ["-dc-ip", "{target}", "-action", "read", "-delegate-to", "{target}"],
+                           _P2, [_AT, _AN], "network"),
+
+    # --- 12. LAPS / gMSA password reading ----------------------------------------------
+    ("nxc_laps",           ["nxc", "netexec"], ["ldap", "{target}", "--laps"],
+                           _P2, [_AT, _AN], "network"),
+    ("nxc_gmsa",           ["nxc", "netexec"], ["ldap", "{target}", "--gmsa"],
+                           _P2, [_AT, _AN], "network"),
+
+    # --- 13. NTLM relay (P3 — MITM, runs only under auto-approve) ---------------------
+    ("impacket_ntlmrelayx", ["ntlmrelayx.py", "impacket-ntlmrelayx"],
+                            ["-t", "{target}", "--no-http-server"],
+                            _P3, [_AT], "network"),
+
+    # --- 14. Cross-domain trust enumeration --------------------------------------------
+    ("nxc_trusts",         ["nxc", "netexec"], ["ldap", "{target}", "-M", "enum_trusts"],
+                           _P1, [_SC, _AT, _AN], "network"),
 ]
 
 
@@ -482,6 +584,40 @@ _PURPOSE: dict[str, str] = {
     "chisel": "TCP/UDP tunnel for pivoting. ATTACK only, human-gated.",
     "ligolo_proxy": "Reverse tunnel/pivot proxy. ATTACK only, human-gated.",
     "krbrelayx": "Kerberos relay/unconstrained-delegation abuse. Policy-DENIED — never auto-runs.",
+    # hash cracking (offline, local)
+    "hashcat_kerberoast": "Offline crack of Kerberoast TGS hashes (mode 13100). Run after impacket_getuserspns finds service accounts with SPNs. P0 local-only.",
+    "hashcat_asrep": "Offline crack of AS-REP hashes (mode 18200). Run after impacket_getnpusers finds accounts without pre-auth. P0 local-only.",
+    "john_kerberoast": "Offline crack of Kerberoast TGS hashes (krb5tgs format). Alternative to hashcat_kerberoast when no GPU available. P0 local-only.",
+    "john_asrep": "Offline crack of AS-REP hashes (krb5asrep format). Alternative to hashcat_asrep when no GPU available. P0 local-only.",
+    # coercion checks
+    "coercer_scan": "Scan for authentication coercion vectors (PetitPotam, PrinterBug, DFSCoerce, ShadowCoerce, MS-EFSRPC) on a target. Identifies which coercion methods the DC is vulnerable to. Use when SMB/RPC is open and domain creds available.",
+    "nxc_petitpotam": "Check if target is vulnerable to PetitPotam (MS-EFSRPC) coercion. Enables NTLM relay to ADCS for domain compromise. P2 human-gated.",
+    "nxc_printerbug": "Check if target has the Print Spooler service enabled (PrinterBug/SpoolSample). Enables NTLM relay via forced authentication. P2 human-gated.",
+    "nxc_shadowcoerce": "Check if target is vulnerable to ShadowCoerce (MS-FSRVP) coercion. Another NTLM relay trigger vector. P2 human-gated.",
+    "nxc_dfscoerce": "Check if target is vulnerable to DFSCoerce (MS-DFSNM) coercion. Another NTLM relay trigger vector. P2 human-gated.",
+    # ADCS exploitation
+    "certipy_req": "Request a certificate from an ADCS CA — used to exploit ESC1-ESC8 template vulnerabilities found by certipy_find/certipy_analyzer. ATTACK only, human-gated.",
+    "certipy_auth": "Authenticate with a PFX certificate obtained via certipy_req. Converts cert to NTLM hash for pass-the-hash. ATTACK only, human-gated.",
+    # Kerberos ticket / delegation exploitation
+    "impacket_getst": "Request a service ticket (S4U2Self/S4U2Proxy) — used for constrained delegation and RBCD exploitation. ATTACK only, human-gated.",
+    "impacket_gettgt": "Request a TGT with known credentials or NTLM hash. First step for Kerberos-based attacks (pass-the-hash, overpass-the-hash). ATTACK only, human-gated.",
+    "impacket_ticketer": "Forge Kerberos tickets (golden/silver). ATTACK only, human-gated.",
+    "impacket_describeticket": "Parse and describe a Kerberos ticket (.ccache/.kirbi). Useful for analyzing captured/forged tickets. P0 local-only.",
+    # lateral movement / remote execution
+    "impacket_psexec": "Remote command execution via SMB service creation (creates a service, drops a binary). Noisiest but most reliable. ATTACK only, human-gated.",
+    "impacket_wmiexec": "Remote command execution via WMI (semi-interactive shell). Stealthier than psexec. ATTACK only, human-gated.",
+    "impacket_smbexec": "Remote command execution via SMB (similar to psexec but uses a batch file). ATTACK only, human-gated.",
+    "impacket_atexec": "Remote command execution via Windows Task Scheduler (AT protocol). ATTACK only, human-gated.",
+    "impacket_dcomexec": "Remote command execution via DCOM (MMC20, ShellWindows, ShellBrowserWindow). ATTACK only, human-gated.",
+    # RBCD / delegation abuse
+    "impacket_rbcd": "Read/write Resource-Based Constrained Delegation (msDS-AllowedToActOnBehalfOfOtherIdentity). Use to check or exploit RBCD delegation paths found by bloodhound_analyzer. ATTACK only, human-gated.",
+    # LAPS / gMSA
+    "nxc_laps": "Read LAPS (Local Administrator Password Solution) passwords from AD. Retrieves local admin passwords if the authenticated user has read access. ATTACK only, human-gated.",
+    "nxc_gmsa": "Read gMSA (Group Managed Service Account) passwords from AD. Retrieves service account NTLM hashes if the authenticated user has read access. ATTACK only, human-gated.",
+    # NTLM relay
+    "impacket_ntlmrelayx": "NTLM relay server — relays captured NTLM authentication to a target. Used with coercion tools (PetitPotam/PrinterBug) for ADCS relay (ESC8), RBCD write, or shadow credentials. Policy-DENIED — runs only under auto-approve.",
+    # cross-domain trust
+    "nxc_trusts": "Enumerate AD trust relationships (forest, external, parent-child trusts) and their properties (direction, transitivity, SID filtering). Use when LDAP is open and domain creds available.",
 }
 
 
@@ -489,7 +625,7 @@ _PURPOSE: dict[str, str] = {
 # Register every catalog row that isn't already a built-in tool, and index the ids by agent
 # so the manifests can offer them to the right phase.
 # --------------------------------------------------------------------------- #
-CATALOG_IDS_BY_AGENT: dict[AgentRole, list[str]] = {_RE: [], _SC: [], _VA: [], _AT: []}
+CATALOG_IDS_BY_AGENT: dict[AgentRole, list[str]] = {_RE: [], _SC: [], _VA: [], _AT: [], _AN: []}
 
 
 def _describe(tool_id: str, cls: PolicyClass) -> str:

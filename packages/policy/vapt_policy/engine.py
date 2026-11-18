@@ -22,6 +22,7 @@ class PolicyInput:
     in_scope: bool
     resolved_addresses: list[str] = field(default_factory=list)
     signed_profile: bool = False       # engagement profile pre-approves P1
+    auto_approve: bool = False          # operator opted into full auto-approve
     policy_version: str = "v1"
 
 
@@ -49,8 +50,14 @@ class PolicyEngine:
                     PolicyDecision.DENY, f"forbidden address {addr}", pi.policy_version
                 )
 
-        # 3. P3 is excluded in beta; no ordinary approval bypass.
+        # 3. P3 is excluded in beta unless operator opted into auto-approve.
         if pi.policy_class == PolicyClass.P3_EXCLUDED:
+            if pi.auto_approve:
+                return PolicyResult(
+                    PolicyDecision.REQUIRE_APPROVAL,
+                    "P3 permitted under auto-approve (operator accepted risk)",
+                    pi.policy_version,
+                )
             return PolicyResult(
                 PolicyDecision.DENY, "P3 excluded action class", pi.policy_version
             )

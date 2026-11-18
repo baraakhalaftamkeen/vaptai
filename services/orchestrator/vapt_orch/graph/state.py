@@ -73,8 +73,12 @@ class EngagementState(TypedDict, total=False):
 
     cancellation_requested: bool
     report_ref: str | None
-    # Drafted narrative carried between the remediate and report nodes (bounded summaries,
-    # not raw captures or secrets) so the report node can assemble both.
+    # Deep-analysis iteration counter (self-looping LLM-driven phase).
+    analysis_iters: int
+
+    # Drafted narratives carried between analysis/remediate/report nodes (bounded
+    # summaries, not raw captures or secrets) so the report node can assemble all.
+    attack_paths_text: str
     remediation_text: str
     report_summary: str
     log: Annotated[list[str], operator.add]

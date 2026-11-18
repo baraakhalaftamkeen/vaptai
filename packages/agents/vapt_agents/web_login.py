@@ -123,6 +123,37 @@ def obtain_session_cookie(login_url: str, username: str, password: str,
         # Stay in-scope: the login must not redirect us off-host (a safety guard, not auth proof).
         if urlparse(resp.url).hostname != host_before:
             return None
+
+        # Two-step login support: if the first POST redirected to a page that
+        # contains a password field (but we haven't set a session cookie yet),
+        # the app uses a username-first flow (like XBEN-001-24, Microsoft,
+        # Google). POST the password to this second form to complete login.
+        if not sess.cookies or not any(c.value for c in sess.cookies):
+            step2_html = resp.text or ""
+            step2_pass_fields = [
+                m for m in _INPUT_RE.finditer(step2_html)
+                if (m.group(2) or m.group(3) or "").lower() == "password"
+            ]
+            if step2_pass_fields and resp.url != effective_login_url:
+                s2_user_f, s2_pass_f = _detect_form_fields(step2_html)
+                s2_action = _detect_form_action(step2_html, resp.url)
+                s2_hidden = {}
+                for m in _INPUT_RE.finditer(step2_html):
+                    name = (m.group(1) or m.group(4) or "").strip()
+                    itype = (m.group(2) or m.group(3) or "").lower().strip()
+                    if name and itype == "hidden":
+                        vm = re.search(
+                            rf"""<input\b[^>]*?\bname\s*=\s*["']{re.escape(name)}["'][^>]*?\bvalue\s*=\s*["']([^"']*)["']""",
+                            step2_html, re.IGNORECASE)
+                        s2_hidden[name] = vm.group(1) if vm else ""
+                s2_data = {s2_pass_f: password, **s2_hidden}
+                if s2_user_f and s2_user_f != s2_pass_f:
+                    s2_data[s2_user_f] = username
+                resp = sess.post(s2_action, data=s2_data, timeout=timeout_s,
+                                 allow_redirects=True)
+                if urlparse(resp.url).hostname != host_before:
+                    return None
+
         # Cookies exist on any POST (server always sets a session cookie), so cookie-presence
         # alone is not auth proof — a bad-creds response that re-renders the login form would
         # also carry a fresh session cookie.

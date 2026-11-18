@@ -264,6 +264,23 @@ ATTACK = AgentManifest(
     escalation_conditions=("approval_required", "always_escalate"),
 )
 
+ANALYSIS = AgentManifest(
+    agent_id="analysis@1",
+    role=AgentRole.ANALYSIS,
+    prompt_version="analysis-v1",
+    description="LLM-driven deep analysis: reviews findings, proposes follow-up tools, "
+                "chains results into attack paths. Runs P0/P1 tools via the governed harness.",
+    allowed_tool_ids=(*_cat_ids(AgentRole.ANALYSIS),),
+    risk_ceiling=PolicyClass.P2_INTRUSIVE,
+    state_reads=("scope_ref", "validated_finding_refs", "candidate_finding_refs"),
+    state_writes=("phase", "log"),
+    model_profile="reporting",
+    max_iterations=12,
+    max_wall_seconds=300,
+    max_tokens=4096,
+    max_cost_usd=0.30,
+)
+
 REMEDIATION = AgentManifest(
     agent_id="remediation@1",
     role=AgentRole.REMEDIATION,
@@ -302,6 +319,7 @@ MANIFESTS: dict[AgentRole, AgentManifest] = {
     AgentRole.SCAN: SCAN,
     AgentRole.VALIDATE: VALIDATE,
     AgentRole.ATTACK: ATTACK,
+    AgentRole.ANALYSIS: ANALYSIS,
     AgentRole.REMEDIATION: REMEDIATION,
     AgentRole.REPORTING: REPORTING,
 }

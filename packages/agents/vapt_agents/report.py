@@ -168,6 +168,36 @@ def findings_brief(db: Session, run_id: str, *, limit: int = 60) -> str:
     return "\n".join(lines)
 
 
+def findings_detail_brief(db: Session, run_id: str, *, limit: int = 60) -> str:
+    """A richer findings list for the deep-analysis LLM — includes observation details
+    (tool names, accounts, delegation types, certificate info) so the LLM can reason
+    about chaining and decide what follow-up tools to run."""
+    data = gather(db, run_id)
+    lines: list[str] = []
+    for sev in SEVERITY_ORDER:
+        for f in data.findings_by_sev.get(sev, []):
+            if f["status"] not in ("confirmed", "candidate"):
+                continue
+            parts = [f"- [{sev}] {f['title']}"]
+            for obs in f.get("observations", [])[:3]:
+                tool = obs.get("source_tool", "")
+                detail = obs.get("detail", {}) or {}
+                extras = []
+                for k in ("account", "delegation_type", "target_host",
+                          "template", "esc_type", "hash_type", "port"):
+                    if detail.get(k):
+                        extras.append(f"{k}={detail[k]}")
+                excerpt = detail.get("excerpt", "")
+                if excerpt and not extras:
+                    extras.append(excerpt[:150])
+                if tool or extras:
+                    parts.append(f"  source={tool} {' '.join(extras)}".rstrip())
+            lines.append("\n".join(parts))
+            if len(lines) >= limit:
+                return "\n".join(lines)
+    return "\n".join(lines)
+
+
 def _e(s) -> str:
     return html.escape(str(s), quote=True)
 
@@ -211,6 +241,27 @@ def _group_key(title: str) -> str:
     key = _re.sub(r"\s+on\s+parameter\s+'[^']*'", "", key, flags=_re.IGNORECASE)
     key = _re.sub(r"\s*\([^)]*\)\s*$", "", key)
     return key.strip() or title
+
+
+def _parse_attack_paths(raw: str) -> str:
+    if not raw or not raw.strip():
+        return "<p class='muted'>No attack-path analysis was generated.</p>"
+    paragraphs = [p.strip() for p in raw.split("\n\n") if p.strip()]
+    if not paragraphs:
+        paragraphs = [p.strip() for p in raw.split("\n") if p.strip()]
+    parts: list[str] = []
+    for p in paragraphs:
+        escaped = _e(p)
+        if p.startswith("##") or p.startswith("**Path"):
+            parts.append(f"<h3>{_e(p.lstrip('#* '))}</h3>")
+        elif p.startswith("- ") or p.startswith("* "):
+            items = [_e(line.lstrip("-* ").strip()) for line in p.split("\n") if line.strip()]
+            parts.append("<ul>" + "".join(f"<li>{i}</li>" for i in items) + "</ul>")
+        elif " → " in p or " -> " in p:
+            parts.append(f"<p class='attack-chain'>{escaped}</p>")
+        else:
+            parts.append(f"<p>{escaped}</p>")
+    return "\n".join(parts)
 
 
 def _parse_remediation(raw: str) -> str:
@@ -272,8 +323,8 @@ def _parse_remediation(raw: str) -> str:
     return "".join(parts) if parts else f"<p>{_e(raw)}</p>"
 
 
-def render_html(data: ReportData, *, summary: str = "", remediation: str = "",
-                title: str = "Assessment report",
+def render_html(data: ReportData, *, summary: str = "", attack_paths: str = "",
+                remediation: str = "", title: str = "Assessment report",
                 report_status: str = "draft") -> str:
     c = data.counts
     sev_cards = "".join(
@@ -330,6 +381,7 @@ def render_html(data: ReportData, *, summary: str = "", remediation: str = "",
 
     summary_html = f"<p>{_e(summary)}</p>" if summary else \
         "<p class='muted'>No executive summary was generated (model offline).</p>"
+    attack_paths_html = _parse_attack_paths(attack_paths)
     remediation_html = _parse_remediation(remediation)
 
     return f"""<!doctype html>
@@ -436,6 +488,17 @@ def render_html(data: ReportData, *, summary: str = "", remediation: str = "",
                   print-color-adjust:exact; -webkit-print-color-adjust:exact; }}
   .rem-summary p {{ margin:0; color:#92400e; font-size:12px; }}
 
+  .attack-paths {{ background:#f0f9ff; border:1px solid #bae6fd; border-radius:6px;
+                   padding:10px 14px; margin:10px 0;
+                   print-color-adjust:exact; -webkit-print-color-adjust:exact; }}
+  .attack-paths p {{ margin:0 0 6px; color:#0c4a6e; font-size:12px; }}
+  .attack-paths h3 {{ font-size:12px; font-weight:600; color:#075985; margin:8px 0 4px; }}
+  .attack-paths ul {{ padding-left:18px; margin:4px 0; }}
+  .attack-paths li {{ margin:3px 0; color:#0c4a6e; font-size:12px; }}
+  .attack-chain {{ font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+                   font-size:11px; background:#e0f2fe; padding:4px 8px; border-radius:4px;
+                   word-break:break-all; color:#0369a1; }}
+
   footer {{ margin-top:24px; padding:10px 0; border-top:1.5px solid #cbd5e1;
             color:#94a3b8; font-size:10px; display:flex; align-items:center;
             justify-content:space-between; }}
@@ -474,6 +537,9 @@ def render_html(data: ReportData, *, summary: str = "", remediation: str = "",
 
     <h2>Executive Summary</h2>
     <div class="summary-box">{summary_html}</div>
+
+    <h2>Attack Paths &amp; Kill Chains</h2>
+    <div class="attack-paths">{attack_paths_html}</div>
 
     <h2>Remediation Guidance</h2>
     {remediation_html}
@@ -514,7 +580,8 @@ def _render_finding(f: dict, nested: bool = False) -> str:
     )
 
 
-def build_and_store(db: Session, run_id: str, *, summary: str = "", remediation: str = "",
+def build_and_store(db: Session, run_id: str, *, summary: str = "",
+                    attack_paths: str = "", remediation: str = "",
                     generated_by: str = "reporting-agent", title: str = "Assessment report"):
     """Gather the run's findings, render the HTML report, and persist a new draft Report
     row. Returns the Report. A re-run creates a new draft; a reviewer signs off a specific
@@ -522,7 +589,8 @@ def build_and_store(db: Session, run_id: str, *, summary: str = "", remediation:
     from vapt_persistence.models import Report
 
     data = gather(db, run_id)
-    content = render_html(data, summary=summary, remediation=remediation, title=title)
+    content = render_html(data, summary=summary, attack_paths=attack_paths,
+                          remediation=remediation, title=title)
     report = Report(
         run_id=run_id, fmt="html", status="draft", title=title,
         summary=summary or "", remediation=remediation or "", content=content,

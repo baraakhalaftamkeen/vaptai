@@ -2,7 +2,7 @@
 
 A LangGraph StateGraph with one node per agent role:
 
-    START → intake →(reachable?)→ plan → recon → scan → validate → attack → remediate → report → END
+    START → intake →(reachable?)→ plan → recon → scan → validate → attack → deep_analysis → remediate → report → END
                      └(unreachable)→ END  [status=failed]
 
 Each node runs under its agent manifest and drives the GovernedHarness, so policy,
@@ -34,6 +34,7 @@ closures; the durable checkpointer makes a paused run resumable after a restart.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 from collections.abc import Callable
@@ -44,6 +45,7 @@ from sqlalchemy.orm import Session
 from vapt_domain.enums import PolicyClass, TestingMode
 from vapt_agents import phases, toolrouter, web_login
 from vapt_agents.manifests import (
+    ANALYSIS,
     ATTACK,
     PLANNING,
     REMEDIATION,
@@ -58,11 +60,12 @@ from vapt_agents.manifests import (
 from vapt_agents.planner import plan_scan
 from vapt_agents.playbooks import get_playbook
 from vapt_agents.report import build_and_store as build_report
-from vapt_agents.report import findings_brief
+from vapt_agents.report import findings_brief, findings_detail_brief
 from vapt_agents.runscope import RunScope
 from vapt_harness import GovernedHarness
 from vapt_persistence import ledger, web_credentials
 from vapt_tools import REGISTRY
+from vapt_tools.catalog import _PURPOSE as TOOL_PURPOSE
 
 from .state import EngagementState
 
@@ -1505,6 +1508,21 @@ def build_engagement_graph(
             return {**base, "coverage_gaps": [f"attack-{idx}: {outcome.reason}"],
                     "log": [f"attack: {playbook.id} PoC {idx} blocked ({outcome.reason})"]}
 
+        # If the harness already auto-approved this action, execute immediately
+        # without pausing the graph — avoids the Outbox race that caused duplicate
+        # PoCs and stuck runs.
+        auto_decided = phases.prior_decision(db, scope, task_id=task_id,
+                                              tool_id=tool_id, args=poc_args)
+        if auto_decided in ("approved", "approve_batch", "approved_batch"):
+            ex = phases.execute_attack_after_approval(db, scope, harness, task_id=task_id,
+                                                      tool_id=tool_id, args=poc_args)
+            if ex.executed:
+                phases.record_poc_evidence(db, fid, playbook_id=playbook.id,
+                                           tool_id=tool_id, outcome=ex)
+            ledger.record_event(db, scope.run_id, "poc.executed",
+                                {"playbook": playbook.id, "tool": tool_id, "finding_id": fid})
+            return {**base, "log": [f"attack: {playbook.id} PoC {idx} auto-approved and executed"]}
+
         verdict = interrupt({
             "kind": "poc_approval_required",
             "playbook": playbook.id,
@@ -1529,7 +1547,7 @@ def build_engagement_graph(
                 "log": [f"attack: {playbook.id} PoC {idx} not approved ({decision})"]}
 
     def _attack_router(state: EngagementState) -> str:
-        return "remediate" if state.get("phase") == "remediate" else "attack"
+        return "deep_analysis" if state.get("phase") in ("remediate", "deep_analysis") else "attack"
 
     # LLM-webvuln-planner cache. The planner call runs ONCE per run (not per webvuln
     # iteration): `_webvuln_plan()` rebuilds every visit, but we don't want to invoke
@@ -2959,7 +2977,18 @@ def build_engagement_graph(
             steps looks identical to one that just exits cleanly — both end with
             `.end turns_cap_hit proposals=0` and no explanation. We cap the stored
             step payload at 400 chars (enough to see the shape, not the full
-            rationale) to keep ledger rows small."""
+            rationale) to keep ledger rows small.
+
+            Also tracks consecutive identical errors for the circuit breaker."""
+            nonlocal _last_error_key, _consec_errors
+            # Build a dedup key: reason + tool_id (if present). This catches a
+            # model stuck on the same malformed proposal shape.
+            _err_key = reason + ":" + str((step_obj or {}).get("tool_id", ""))
+            if _err_key == _last_error_key:
+                _consec_errors += 1
+            else:
+                _last_error_key = _err_key
+                _consec_errors = 1
             try:
                 _step_short = {k: str(v)[:200]
                                for k, v in (step_obj or {}).items() if v}
@@ -3064,7 +3093,26 @@ def build_engagement_graph(
         except Exception:
             pass
 
+        # Circuit breaker: if the model emits the same rejected step shape N times
+        # in a row, force-terminate instead of wasting all remaining turns on the
+        # same error (XBEN-001-24 2026-11-17: dom_xss_probe without url × 10).
+        _CONSEC_ERROR_CAP = 3
+        _last_error_key: str | None = None
+        _consec_errors = 0
+
         for turn in range(MAX_TURNS):
+            # Circuit breaker: abort if the model keeps repeating the same error.
+            if _consec_errors >= _CONSEC_ERROR_CAP:
+                try:
+                    ledger.record_event(db, scope.run_id, "webvuln.recon_agent.end",
+                                        {"turn": turn, "reason": "consec_error_breaker",
+                                         "error_key": _last_error_key,
+                                         "proposals": len(proposals),
+                                         "note": f"model repeated the same error "
+                                                 f"{_consec_errors}× — aborting"})
+                except Exception:
+                    pass
+                break
             # Compact BEFORE each LLM call — keeps the sent context under the
             # soft threshold (and absolutely under the hard threshold) without
             # losing the signal the model needs (recent turns + system + user0
@@ -3154,6 +3202,7 @@ def build_engagement_graph(
                                      "content": f"fetch failed: {type(e).__name__}"})
                     continue
                 fetches += 1
+                _consec_errors = 0  # successful fetch resets the breaker
                 # Record each fetch WITH a body excerpt (first 4 KB of the JSON
                 # the agent actually read) so operators can see WHAT the model
                 # reasoned over at this turn. Essential for debugging a later
@@ -3384,6 +3433,7 @@ def build_engagement_graph(
                         continue
                     args["param"] = _p
                 proposals.append((tid, args, f"webvuln-llm-ag-{len(proposals)}"))
+                _consec_errors = 0  # successful proposal resets the breaker
                 try:
                     # Full proposal record for debugging: tool + ALL validated
                     # args + full rationale (bumped from 160 to 1000 chars so an
@@ -4904,10 +4954,13 @@ def build_engagement_graph(
         # web_param_probe loop and 20+ dalfox probes; on DineHub (2026-10-23 run) the whole
         # webvuln phase hit the 3600s budget around plan item ~65 and IDOR (item ~100) was
         # starved. Cheap (one subprocess, two cookies, bounded URL list) and high-value, so
-        # moving it up is the right trade. Still gated on creds_b being provided — no
-        # second account, no IDOR plan item.
+        # moving it up is the right trade.
+        # v3.1: runs with a single account too (numeric-ID enumeration) — the probe
+        # checks if the user can access objects NOT in their own listing. Only the
+        # delete mode still requires two accounts.
         creds_b = web_credentials.get_web_credentials_b(scope.run_id)
-        if creds_b:
+        _has_any_cookie = bool(web_credentials.get_web_cookie(scope.run_id))
+        if creds_b or _has_any_cookie:
             idor_urls: list[str] = []
             # Build bases list inline — bases_for_probe isn't defined yet at this point in
             # the plan (we moved IDOR up ahead of it).
@@ -5011,12 +5064,14 @@ def build_engagement_graph(
                 # same seed URLs (the probe needs owned objects to extract IDs
                 # from) but sends POST/DELETE to /order/delete, /order/cancel
                 # etc. as a non-owner. Catches #8 (IDOR Delete) from the
-                # scoreboard.
-                plan.append(("idor_probe",
-                             {"target": scope.target,
-                              "urls": ",".join(idor_urls[:100]),
-                              "mode": "delete"},
-                             "webvuln-idor-delete-0"))
+                # scoreboard. Requires two accounts (can't test destructive
+                # actions in single-account mode).
+                if creds_b:
+                    plan.append(("idor_probe",
+                                 {"target": scope.target,
+                                  "urls": ",".join(idor_urls[:100]),
+                                  "mode": "delete"},
+                                 "webvuln-idor-delete-0"))
 
         # (D) NoSQL injection probe — tests login endpoints for MongoDB $gt/$ne
         # operator injection. Highest-impact on MEAN-stack apps (NodeGoat, etc).
@@ -5641,16 +5696,17 @@ def build_engagement_graph(
             # at phase start explaining why the idor_probe plan item was (or wasn't)
             # produced. Mirrors the plan builder's decision logic exactly.
             if not any(t == "idor_probe" for t, _, _ in plan_items):
-                if not web_credentials.get_web_credentials_b(scope.run_id):
+                if not web_credentials.get_web_cookie(scope.run_id):
                     ledger.record_event(db, scope.run_id, "idor.gated",
-                                        {"reason": "no_second_account",
-                                         "note": "supply web_credentials_b at run "
-                                                 "creation to enable IDOR"})
+                                        {"reason": "no_authenticated_session",
+                                         "note": "no web session cookie available; "
+                                                 "IDOR probe requires at least one "
+                                                 "authenticated account"})
                 else:
                     ledger.record_event(db, scope.run_id, "idor.gated",
                                         {"reason": "no_numeric_id_urls",
                                          "note": "discovery found no /<N>/ routes to "
-                                                 "rewrite across accounts; nothing to test"})
+                                                 "rewrite; nothing to test"})
         if not plan_items:
             return {"phase": "attack", "log": ["webvuln: no web endpoint to actively test"]}
         if idx >= len(plan_items) or iters > SCAN.max_iterations:
@@ -6069,6 +6125,235 @@ def build_engagement_graph(
     def _webvuln_router(state: EngagementState) -> str:
         return "webvuln" if state.get("phase") == "webvuln" else "attack"
 
+    # -- deep_analysis (ANALYSIS agent; LLM-driven follow-up tool loop) ------
+    _MAX_ANALYSIS_ITERS = 3
+
+    def _domain_cred_context(db_sess, sc) -> tuple[str, str]:
+        """Return (domain, 'domain/user') from domain credentials, or ('', '').
+        Used to tell the LLM that authenticated AD tools will work."""
+        try:
+            creds = web_credentials.get_domain_credentials(sc.run_id)
+            if creds and creds[0] and creds[1]:
+                return creds[0], f"{creds[0]}/{creds[1]}"
+            return "", ""
+        except Exception:
+            return "", ""
+
+    def _build_tool_catalog_prompt(exclude: set[str] | None = None) -> str:
+        """Build a compact catalog of tools available to the analysis agent,
+        with one-line descriptions from _PURPOSE. Excludes already-ran tools
+        and P3 to reduce noise."""
+        allowed = set(ANALYSIS.allowed_tool_ids)
+        skip = exclude or set()
+        lines: list[str] = []
+        for tid in sorted(allowed):
+            if tid in skip:
+                continue
+            spec = REGISTRY.get(tid)
+            if spec is None:
+                continue
+            if spec.policy_class == PolicyClass.P3_EXCLUDED:
+                continue
+            tag = spec.policy_class.value.upper()
+            desc = TOOL_PURPOSE.get(tid, spec.description or "")
+            lines.append(f"  {tid} [{tag}]: {desc}")
+        return "\n".join(lines) if lines else "(no additional tools available)"
+
+    def deep_analysis(state: EngagementState) -> dict:
+        iters = state.get("analysis_iters", 0)
+        guard = ManifestGuard(ANALYSIS)
+        try:
+            guard.step()
+        except ManifestError:
+            pass
+
+        detail_brief = findings_detail_brief(db, scope.run_id)
+        if not detail_brief.strip():
+            ledger.record_event(db, scope.run_id, "analysis.skip",
+                                {"reason": "no_findings"})
+            return {"phase": "remediate",
+                    "log": ["deep_analysis: no findings to analyze, skipping"]}
+
+        from vapt_persistence.models import ToolActionRecord
+        from sqlalchemy import select as sa_select
+        already_ran: set[str] = set(
+            db.execute(
+                sa_select(ToolActionRecord.tool_id)
+                .where(ToolActionRecord.run_id == scope.run_id,
+                       ToolActionRecord.state == "executed")
+            ).scalars().all()
+        )
+        tool_catalog = _build_tool_catalog_prompt(exclude=already_ran)
+
+        cred_domain, cred_identity = _domain_cred_context(db, scope)
+        domain_str = (getattr(scope, 'domain_name', '')
+                      or ', '.join(scope.domains)
+                      or cred_domain)
+        open_ports = phases.open_ports_from_findings(db, scope.run_id)
+
+        if iters < _MAX_ANALYSIS_ITERS:
+            cred_block = ""
+            if cred_identity:
+                cred_block = (
+                    f"- DOMAIN CREDENTIALS ARE AVAILABLE: {cred_identity} "
+                    "(injected automatically — you do NOT need to pass them in args). "
+                    "This means ALL authenticated AD tools will work: Kerberoasting, "
+                    "AS-REP roasting, BloodHound, Certipy, delegation checks, etc.\n"
+                )
+            dc_block = (
+                f"- CRITICAL: Always use \"{scope.target}\" as the target value — NEVER a domain "
+                "name like essos.local or north.sevenkingdoms.local. The tool layer auto-resolves "
+                "the correct Domain Controller via DNS from the IP. Domain names will be REJECTED "
+                "by scope validation.\n"
+            )
+            port_block = ""
+            if open_ports:
+                port_block = f"Open ports on target: {', '.join(sorted(open_ports, key=int))}\n"
+
+            propose_text, used, diag = _draft(ANALYSIS, [
+                {"role": "system", "content": (
+                    "You are an expert penetration tester analyzing findings from an automated "
+                    "security assessment. Your job is to think like a REAL ATTACKER: look at "
+                    "what was found, identify what additional tools could reveal MORE based on "
+                    "those findings, and propose follow-up actions.\n\n"
+                    "You MUST be aggressive about proposing tools. An empty array means you "
+                    "are satisfied that every possible attack path has been explored — this "
+                    "should be RARE. If the target has AD services and domain creds are "
+                    "available, there is almost always more to enumerate.\n\n"
+                    "TOOL CHAINING PATTERNS (propose when applicable):\n"
+                    "- Domain creds + LDAP/Kerberos → certipy_find, bloodhound_python, "
+                    "impacket_getuserspns, impacket_getnpusers, impacket_finddelegation, "
+                    "ad_enum, impacket_getadusers\n"
+                    "- certipy_find output → certipy_analyzer (finds ESC1-ESC8)\n"
+                    "- bloodhound_python output → bloodhound_analyzer (finds ACL abuse paths)\n"
+                    "- Kerberoast hashes found → hashcat_kerberoast or john_kerberoast\n"
+                    "- AS-REP hashes found → hashcat_asrep or john_asrep\n"
+                    "- SMB/RPC open → coercer_scan (PetitPotam, PrinterBug, DFSCoerce)\n"
+                    "- MSSQL open + domain creds → impacket_mssqlenum (linked servers, xp_cmdshell)\n"
+                    "- Trust relationships found → nxc_trusts\n\n"
+                    "RULES:\n"
+                    "- Only propose tools from the catalog below.\n"
+                    "- Only propose tools NOT already run (see already-ran list).\n"
+                    f"{cred_block}"
+                    f"{dc_block}"
+                    "- Each proposal needs {\"tool_id\": \"...\", \"args\": {\"target\": \"...\"}, "
+                    "\"rationale\": \"...\"}.\n"
+                    "- Return ONLY a JSON array. Max 5 tools per iteration.\n"
+                    "- Prefer tools that CHAIN from existing findings over generic enumeration."
+                )},
+                {"role": "user", "content": (
+                    f"Target: {scope.target}\n"
+                    f"Domain: {domain_str}\n"
+                    f"{port_block}"
+                    f"Credentials available: {'YES (' + cred_identity + ')' if cred_identity else 'NO'}\n"
+                    f"Iteration: {iters + 1}/{_MAX_ANALYSIS_ITERS}\n\n"
+                    f"=== Current findings ===\n{detail_brief}\n\n"
+                    f"=== Already ran ===\n{', '.join(sorted(already_ran)) or '(none)'}\n\n"
+                    f"=== Available tools (not already ran) ===\n{tool_catalog}\n\n"
+                    "Based on the findings and available tools, what should we run next? "
+                    "Think about:\n"
+                    "1. Which findings can be CHAINED into deeper attacks?\n"
+                    "2. Are there authenticated AD tools we haven't run yet?\n"
+                    "3. Can we crack any captured hashes offline?\n"
+                    "4. Are there analyzers to run on collected data (BloodHound JSON, Certipy JSON)?\n"
+                    "5. Are there coercion/relay vectors to check?\n\n"
+                    "Return your JSON array:"
+                )},
+            ])
+
+            ledger.record_event(db, scope.run_id, "analysis.propose",
+                                {"iteration": iters + 1, "used_model": used, **diag})
+
+            proposed: list[dict] = []
+            if used and propose_text.strip():
+                try:
+                    raw = propose_text.strip()
+                    start = raw.find("[")
+                    end = raw.rfind("]")
+                    if start >= 0 and end > start:
+                        raw = raw[start:end + 1]
+                    proposed = json.loads(raw)
+                    if not isinstance(proposed, list):
+                        proposed = []
+                except (json.JSONDecodeError, ValueError):
+                    proposed = []
+
+            proposed = [p for p in proposed
+                        if isinstance(p, dict)
+                        and p.get("tool_id") in set(ANALYSIS.allowed_tool_ids)
+                        and p.get("tool_id") not in already_ran][:5]
+
+            run_log: list[str] = []
+            new_candidates = 0
+
+            if not proposed:
+                ledger.record_event(db, scope.run_id, "analysis.no_proposals",
+                                    {"iteration": iters + 1})
+            else:
+                for idx, action in enumerate(proposed):
+                    tool_id = action["tool_id"]
+                    args = action.get("args", {})
+                    args["target"] = scope.target
+                    rationale = action.get("rationale", "")
+
+                    task_id = f"analysis-{iters + 1}-{idx}"
+                    step = phases.analysis_action(
+                        db, scope, harness,
+                        tool_id=tool_id, args=args, task_id=task_id,
+                    )
+                    n_cands = len(step.candidate_ids) if step.candidate_ids else 0
+                    new_candidates += n_cands
+                    run_log.append(f"deep_analysis: ran {tool_id} → {n_cands} candidate(s)"
+                                   + (f" [{rationale[:80]}]" if rationale else ""))
+                    ledger.record_event(db, scope.run_id, "analysis.tool_executed", {
+                        "iteration": iters + 1, "tool_id": tool_id,
+                        "executed": step.outcome.executed,
+                        "candidates": n_cands, "rationale": rationale[:200],
+                    })
+
+            if proposed and iters + 1 < _MAX_ANALYSIS_ITERS:
+                return {"phase": "deep_analysis",
+                        "analysis_iters": iters + 1,
+                        "log": run_log + [
+                            f"deep_analysis: iter {iters + 1} ran {len(proposed)} tool(s), "
+                            f"{new_candidates} new candidate(s), looping"]}
+
+        narrative_brief = findings_detail_brief(db, scope.run_id)
+        narrative_text, n_used, n_diag = _draft(ANALYSIS, [
+            {"role": "system", "content": (
+                "You are an expert penetration tester writing the 'Attack Paths & Kill Chains' "
+                "section of a security assessment report. Synthesize ALL findings into coherent "
+                "attack narratives — show how an attacker would chain vulnerabilities together "
+                "to achieve objectives (domain admin, data exfiltration, lateral movement).\n\n"
+                "RULES:\n"
+                "- Only reference findings that actually exist (listed below).\n"
+                "- Use chain arrows (→) to show attack progression.\n"
+                "- Group by attack objective (e.g. 'Path to Domain Admin').\n"
+                "- Rate each path's feasibility (High/Medium/Low).\n"
+                "- Be concise but specific — name accounts, services, templates."
+            )},
+            {"role": "user", "content": (
+                f"Target: {scope.target}\n\n"
+                f"=== All findings ===\n{narrative_brief}\n\n"
+                "Synthesize these findings into attack paths and kill chains. "
+                "Show how they connect and what an attacker could achieve."
+            )},
+        ])
+
+        ledger.record_event(db, scope.run_id, "analysis.narrative",
+                            {"used_model": n_used, **n_diag})
+
+        return {"phase": "remediate",
+                "analysis_iters": iters,
+                "attack_paths_text": narrative_text if n_used else "",
+                "log": [f"deep_analysis: narrative drafted ({'model' if n_used else 'deterministic'}), "
+                        f"moving to remediate"]}
+
+    def _deep_analysis_router(state: EngagementState) -> str:
+        if state.get("phase") == "deep_analysis":
+            return "deep_analysis"
+        return "remediate"
+
     # -- remediate (REMEDIATION agent; no tools) -----------------------------
     def remediate(state: EngagementState) -> dict:
         guard = ManifestGuard(REMEDIATION)
@@ -6128,6 +6413,7 @@ def build_engagement_graph(
             )},
         ])
         report = build_report(db, scope.run_id, summary=summary,
+                              attack_paths=state.get("attack_paths_text", ""),
                               remediation=state.get("remediation_text", ""),
                               title=f"Assessment report — {scope.target}")
         ledger.record_event(
@@ -6147,6 +6433,7 @@ def build_engagement_graph(
     graph.add_node("validate", validate)
     graph.add_node("attack", attack)
     graph.add_node("webvuln", webvuln)
+    graph.add_node("deep_analysis", deep_analysis)
     graph.add_node("remediate", remediate)
     graph.add_node("report", report)
 
@@ -6168,8 +6455,12 @@ def build_engagement_graph(
     # Webvuln loops back to itself (one gated active web-vuln scan per visit); when the pass
     # is complete (or P2 intrusive is not enabled) it routes to attack.
     graph.add_conditional_edges("webvuln", _webvuln_router, {"webvuln": "webvuln", "attack": "attack"})
-    # Attack loops back to itself (one gated PoC per visit) until confirmed findings exhausted.
-    graph.add_conditional_edges("attack", _attack_router, {"attack": "attack", "remediate": "remediate"})
+    # Attack loops back to itself (one gated PoC per visit); when done routes to deep_analysis.
+    graph.add_conditional_edges("attack", _attack_router,
+                                {"attack": "attack", "deep_analysis": "deep_analysis"})
+    # Deep analysis loops (LLM proposes follow-up tools, executes, loops) then routes to remediate.
+    graph.add_conditional_edges("deep_analysis", _deep_analysis_router,
+                                {"deep_analysis": "deep_analysis", "remediate": "remediate"})
     graph.add_edge("remediate", "report")
     graph.add_edge("report", END)
 

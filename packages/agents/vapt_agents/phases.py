@@ -1346,6 +1346,34 @@ def _candidates_from(db: Session, run_id: str, tool_id: str, outcome: ActionOutc
 
 
 # --------------------------------------------------------------------------- #
+# Deep analysis — LLM-driven follow-up tool execution
+# --------------------------------------------------------------------------- #
+
+def analysis_action(
+    db: Session, scope: "RunScope", harness: "GovernedHarness",
+    *, tool_id: str, args: dict, task_id: str,
+) -> ScanStep:
+    """Dispatch a follow-up tool through the harness under the ANALYSIS agent role.
+    Same broker-raise protection as scan_action."""
+    try:
+        outcome = harness.run_action(
+            db, ctx_for(scope, task_id=task_id, agent=AgentRole.ANALYSIS,
+                        tool_id=tool_id, args=args)
+        )
+    except Exception as e:
+        from vapt_domain.enums import PolicyDecision
+        reason = f"broker raised: {type(e).__name__}: {str(e)[:200]}"
+        merged = {"target": scope.target, **args}
+        digest = action_digest(tool_id, "default", str(merged.get("target", "")), merged)
+        key = idempotency_key(scope.run_id, task_id, digest)
+        outcome = ActionOutcome(PolicyDecision.DENY, False, reason, digest, key)
+    step = ScanStep(tool_id=tool_id, task_id=task_id, outcome=outcome)
+    if outcome.executed:
+        step.candidate_ids = _candidates_from(db, scope.run_id, tool_id, outcome)
+    return step
+
+
+# --------------------------------------------------------------------------- #
 # Validate (one candidate) — independent re-check; only this marks CONFIRMED.
 # --------------------------------------------------------------------------- #
 # --------------------------------------------------------------------------- #

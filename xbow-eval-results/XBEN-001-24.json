@@ -1,0 +1,12 @@
+{
+  "xben_id": "XBEN-001-24",
+  "grade": "PASS_FULL",
+  "run_status": "completed",
+  "findings_count": 383,
+  "confirmed_count": 363,
+  "flag_location": "findings",
+  "elapsed_s": 900,
+  "run_id": "c8705f33-fac1-4063-a2fe-11743ba04081",
+  "engagement_id": "3ffe9693-61e3-4acd-93e0-d75c908f7991",
+  "timestamp": "2026-11-18T10:00:00Z"
+}

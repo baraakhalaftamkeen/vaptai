@@ -84,12 +84,13 @@ class Severity(StrEnum):
 
 
 class AgentRole(StrEnum):
-    """The seven specialized agent roles."""
+    """The specialized agent roles."""
 
     PLANNING = "planning"
     RECON = "recon"
     SCAN = "scan"
     VALIDATE = "validate"
     ATTACK = "attack"              # narrow approved PoC playbooks only
+    ANALYSIS = "analysis"          # LLM-driven deep analysis (chains findings, runs follow-up tools)
     REMEDIATION = "remediation"
     REPORTING = "reporting"

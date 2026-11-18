@@ -56,6 +56,7 @@ import json
 import os
 import re
 import sys
+from itertools import zip_longest
 from urllib.parse import urljoin, urlparse, parse_qsl, urlencode, urlunparse
 
 try:
@@ -66,7 +67,7 @@ except Exception as e:
 
 _UA = "vapt-idor-probe/3.1 (authorized assessment)"
 _TIMEOUT = 10
-_BUDGET = 160
+_BUDGET = 1500
 _MIN_BODY = 400          # a real object page is substantial; below this is a stub/denied
 _SIM_HIT = 0.90          # non-owner body this similar to owner's = same object served
 
@@ -97,6 +98,85 @@ _OBJECT_PATH_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Action-verb suffix in a path: /<noun>/<id>/<ACTION>.  When an IDOR is
+# confirmed on an action URL, the probe follows up on sibling view endpoints
+# (e.g. /order/<id>/receipt) that may now be accessible after the state change.
+_ACTION_SUFFIX_RE = re.compile(
+    r"/(?:archive|claim|transfer|assign|approve|accept|activate|"
+    r"cancel|close|complete|confirm|delete|disable|dismiss|enable|"
+    r"escalate|finalize|flag|grant|lock|merge|move|publish|"
+    r"redeem|reject|release|remove|resolve|restore|revoke|"
+    r"submit|suspend|unlock|update|verify|withdraw)/?$",
+    re.IGNORECASE,
+)
+
+# Common view/detail suffixes to try as siblings after an action IDOR.
+_VIEW_SUFFIXES = (
+    "receipt", "detail", "details", "view", "show", "info",
+    "summary", "invoice", "report", "data", "content", "download",
+    "export", "preview", "print", "pdf", "status", "history",
+)
+
+
+def _sibling_urls(action_url: str, seed_urls: list[str], target: str) -> list[str]:
+    """Given an action URL like /order/300198/archive, return sibling view URLs
+    for the same object ID, derived from seed URLs and common suffixes.
+
+    General strategy:
+      1. Parse the base pattern: /order/300198/ (strip the action suffix)
+      2. Find other known suffixes from seed URLs with the same noun prefix
+      3. Add common view suffixes as fallback candidates
+    """
+    try:
+        parsed = urlparse(action_url)
+        path = parsed.path.rstrip("/")
+    except Exception:
+        return []
+
+    # Strip the action suffix to get /<noun>/<id>
+    parts = path.rsplit("/", 1)
+    if len(parts) < 2:
+        return []
+    base_path = parts[0]  # e.g. /order/300198
+
+    # Extract the noun prefix (e.g. "order" from /order/300198)
+    base_parts = base_path.strip("/").split("/")
+    if len(base_parts) < 2:
+        return []
+    noun = base_parts[0].lower()
+
+    # Collect known suffixes from seed URLs with the same noun
+    known_suffixes: set[str] = set()
+    for u in seed_urls:
+        try:
+            sp = urlparse(u).path.rstrip("/")
+        except Exception:
+            continue
+        sp_parts = sp.strip("/").split("/")
+        if len(sp_parts) >= 3 and sp_parts[0].lower() == noun:
+            suffix = sp_parts[-1].lower()
+            if suffix and not re.fullmatch(r"\d+|[0-9a-f-]{8,}", suffix):
+                known_suffixes.add(suffix)
+
+    # Merge with common view suffixes (seed-discovered first)
+    all_suffixes = list(known_suffixes) + [s for s in _VIEW_SUFFIXES
+                                            if s not in known_suffixes]
+
+    base = f"{parsed.scheme}://{parsed.netloc}"
+    siblings: list[str] = []
+    for suffix in all_suffixes:
+        url = f"{base}{base_path}/{suffix}"
+        if _in_scope(target, url) and url != action_url:
+            siblings.append(url)
+
+    # Also try the bare base path (e.g. /order/300198) as a detail page
+    bare = f"{base}{base_path}"
+    if _in_scope(target, bare) and bare != action_url and bare not in siblings:
+        siblings.insert(0, bare)
+
+    return siblings
+
+
 # Fallback listing paths when seed URLs don't provide enough collection prefixes.
 _FALLBACK_LISTING_PATHS = (
     "/account", "/dashboard", "/profile", "/history",
@@ -104,9 +184,12 @@ _FALLBACK_LISTING_PATHS = (
 
 def _listing_paths_from_seeds(seed_urls: list[str]) -> tuple[str, ...]:
     """Derive listing (collection) paths from discovered seed URLs dynamically.
-    E.g. /allocations/2 → /allocations, /order/track/abc → /order."""
+    E.g. /allocations/2 → /allocations, /order/track/abc → /order.
+    Also treats bare collection URLs (/orders, /invoices) as listing paths."""
     collections: list[str] = []
     seen: set[str] = set()
+    _bare_collection_re = re.compile(
+        r"^/[a-zA-Z][a-zA-Z0-9_-]{1,30}/?$", re.IGNORECASE)
     for u in seed_urls:
         try:
             path = urlparse(u).path or ""
@@ -119,6 +202,11 @@ def _listing_paths_from_seeds(seed_urls: list[str]) -> tuple[str, ...]:
             if low not in seen:
                 seen.add(low)
                 collections.append(prefix)
+        elif _bare_collection_re.match(path):
+            low = path.rstrip("/").lower()
+            if low not in seen:
+                seen.add(low)
+                collections.append(path.rstrip("/"))
     for p in _FALLBACK_LISTING_PATHS:
         if p.lower() not in seen:
             seen.add(p.lower())
@@ -277,7 +365,13 @@ def _bases_from_urls(target: str, urls: list[str]) -> list[str]:
 
 
 def _extract_object_urls(html: str, base: str, target: str) -> list[str]:
-    """Pull object-reference URLs (href/action) out of a listing page."""
+    """Pull object-reference URLs (href/action) out of a listing page.
+
+    Also extracts data-*-id attributes (e.g. data-order-id="300123") and
+    derives object URLs from the page's JavaScript AJAX patterns. This catches
+    SPA-style apps where receipt/detail endpoints are loaded via JS, not hrefs
+    (XBEN-001-24 Trading Platform: data-order-id + $.ajax /order/<id>/receipt).
+    """
     out: list[str] = []
     for m in re.finditer(r"""(?:href|action)\s*=\s*["']([^"']+)["']""", html or "",
                          re.IGNORECASE):
@@ -290,6 +384,47 @@ def _extract_object_urls(html: str, base: str, target: str) -> list[str]:
             continue
         if _looks_like_object_url(url) and url not in out:
             out.append(url)
+
+    # Extract data-*-id attributes and try to derive object URLs from JS patterns.
+    # Pattern: data-order-id="300123" → look for AJAX url patterns like /order/<id>/receipt
+    _data_id_re = re.compile(
+        r"""data-([a-zA-Z][\w-]*)-id\s*=\s*["'](\d{1,10}|[0-9a-f]{8,}|[0-9a-f-]{32,})["']""",
+        re.IGNORECASE,
+    )
+    _ajax_url_re = re.compile(
+        r"""["'](/[a-zA-Z][\w-]*/\s*['"]\s*\+|url:\s*["']/([a-zA-Z][\w-]*)/)|"""
+        r"""['"]/([\w-]+)/['"]\s*\+\s*\w+Id""",
+        re.IGNORECASE,
+    )
+    data_ids: list[tuple[str, str]] = []  # (noun, id)
+    for m in _data_id_re.finditer(html or ""):
+        noun = m.group(1).replace("-", "").lower()
+        obj_id = m.group(2)
+        data_ids.append((noun, obj_id))
+
+    if data_ids:
+        # Try to find AJAX URL patterns in scripts to build full URLs.
+        # Common patterns: '/order/' + orderId + '/receipt'
+        _js_path_re = re.compile(
+            r"""["'](/(\w+)/["']\s*\+\s*\w+\s*\+\s*["']/(\w+))""",
+        )
+        js_paths: list[tuple[str, str]] = []  # (noun_prefix, suffix)
+        for m in _js_path_re.finditer(html or ""):
+            js_paths.append((m.group(2).lower(), m.group(3)))
+
+        for noun, obj_id in data_ids:
+            # Direct: /<noun>/<id> (e.g. /order/300123)
+            direct = urljoin(base + "/", f"{noun}/{obj_id}")
+            if _in_scope(target, direct) and direct not in out:
+                if _looks_like_object_url(direct):
+                    out.append(direct)
+            # With JS-discovered suffixes (e.g. /order/300123/receipt)
+            for js_noun, suffix in js_paths:
+                if js_noun == noun or js_noun in noun or noun in js_noun:
+                    full = urljoin(base + "/", f"{js_noun}/{obj_id}/{suffix}")
+                    if _in_scope(target, full) and full not in out:
+                        out.append(full)
+
     return out
 
 
@@ -321,7 +456,7 @@ def _harvest(users, bases, target, budget_box, trace, listing_paths):
     return owned
 
 
-def _cross_access(users, owned, budget_box, trace):
+def _cross_access(users, owned, budget_box, trace, seed_urls=(), target=""):
     """For each owned object URL, check whether a NON-owner can read it."""
     findings: list[dict] = []
     # Unauthenticated baseline session (no cookie) to rule out public objects.
@@ -343,7 +478,8 @@ def _cross_access(users, owned, budget_box, trace):
         for ylabel, ycookie in users:
             if ylabel == owner:
                 continue
-            yr = _get(_session(ycookie), url, budget_box)
+            ysess = _session(ycookie)
+            yr = _get(ysess, url, budget_box)
             if not _is_real_content(yr):
                 trace.append({"url": url, "status": getattr(yr, "status_code", None),
                               "note": f"{ylabel} denied/empty (good)"})
@@ -352,18 +488,36 @@ def _cross_access(users, owned, budget_box, trace):
             trace.append({"url": url, "status": yr.status_code,
                           "note": f"{ylabel} 200 sim={sim:.2f} vs owner {owner}"})
             if sim >= _SIM_HIT:
-                # A non-owner read the owner's object — that is the IDOR. If the
-                # object is ALSO reachable with no cookie at all, that is an
-                # aggravating factor (missing auth entirely), not a different bug,
-                # so we fold it into the evidence and bump severity to critical.
+                body_snippet = (yr.text or "")[:2000]
                 evidence = (f"non-owner '{ylabel}' retrieved object owned by "
                             f"'{owner}' (HTTP 200, body sim={sim:.2f} to owner's "
-                            f"view) — cross-tenant object access")
+                            f"view) — cross-tenant object access"
+                            f"\n\nResponse body (first 2000 chars):\n{body_snippet}")
                 severity = "high"
                 if anon_same:
                     evidence += ("; object is ALSO readable with NO authentication "
                                  "(leaks to anonymous clients) — missing access control")
                     severity = "critical"
+
+                # Post-action sibling probing (same as single-account mode)
+                parsed_path = urlparse(url).path.rstrip("/")
+                if _ACTION_SUFFIX_RE.search(parsed_path):
+                    siblings = _sibling_urls(url, list(seed_urls), target)
+                    for sib_url in siblings[:10]:
+                        if budget_box[0] <= 0:
+                            break
+                        sr = _get(ysess, sib_url, budget_box)
+                        if sr is None:
+                            continue
+                        if sr.status_code == 200 and len(sr.text or "") >= _MIN_BODY \
+                                and not _DENIED_RE.search(sr.text or ""):
+                            sib_body = (sr.text or "")[:2000]
+                            evidence += (f"\n\n--- sibling endpoint unlocked after action ---"
+                                         f"\nURL: {sib_url} (HTTP 200, {len(sr.text)} bytes)"
+                                         f"\nResponse body (first 2000 chars):\n{sib_body}")
+                            trace.append({"url": sib_url, "status": 200,
+                                          "note": f"sibling view after cross-tenant action IDOR"})
+
                 findings.append({
                     "type": "idor", "severity": severity,
                     "url": url, "param": "object-token",
@@ -429,14 +583,215 @@ def _enumerate(users, seed_urls, budget_box, trace):
         if not _is_real_content(r_other):
             continue
         if _similar(r_owner.text, r_other.text) >= _SIM_HIT:
+            body_snippet = (r_other.text or "")[:2000]
             findings.append({
                 "type": "idor", "severity": "high",
                 "url": alt, "param": (f"path-id→{neighbour}" if kind == "path"
                                       else f"?{loc}={neighbour}"),
                 "evidence": (f"two accounts both read object id {neighbour} with "
-                             f"identical content (enumerable IDOR)"),
+                             f"identical content (enumerable IDOR)"
+                             f"\n\nResponse body (first 2000 chars):\n{body_snippet}"),
                 "confirmed": True,
             })
+    return findings
+
+
+def _single_account_enumerate(user_label, user_cookie, seed_urls, bases, target,
+                              budget_box, trace, listing_paths):
+    """Single-account IDOR enumeration: with only ONE account, fetch the user's
+    listing pages to discover which object IDs belong to them, then probe nearby
+    numeric IDs. If the user gets a 200 with real content on an ID that is NOT
+    in their own listing, that's an IDOR (the app served someone else's object
+    without checking ownership).
+
+    This catches the common pattern where /order/<id>/receipt has auth (login
+    required) but no authz (any logged-in user can read any order).
+    """
+    findings: list[dict] = []
+    sess = _session(user_cookie)
+    anon = _session("")
+
+    # Harvest this user's own object URLs from listing pages.
+    own_urls: set[str] = set()
+    for base in bases:
+        for path in listing_paths:
+            if budget_box[0] <= 0:
+                break
+            r = _get(sess, base + path, budget_box)
+            if r is None or r.status_code != 200 or not r.text:
+                continue
+            found = _extract_object_urls(r.text, base, target)
+            own_urls.update(found)
+            if found:
+                trace.append({"url": base + path, "status": 200,
+                              "note": f"{user_label} owns {len(found)} object url(s)"})
+
+    # Also add seeded URLs that look like object references.
+    for u in seed_urls:
+        if _looks_like_object_url(u):
+            own_urls.add(u)
+
+    # For each owned URL with a numeric ID, probe nearby IDs (id-1, id+1, ...).
+    # If we get a 200 with real content on an ID NOT in our listing, it's IDOR.
+    own_ids_by_pattern: dict[str, set[int]] = {}  # {url_pattern: {known_int_ids}}
+    probed: set[str] = set()
+
+    for url in own_urls:
+        targets = _numeric_targets(url)
+        if not targets:
+            continue
+        kind, loc, cur_id = targets[0]
+        if kind == "path":
+            pattern = _PATH_ID_RE.sub("/{ID}", url, count=1)
+        else:
+            pattern = url
+        try:
+            own_ids_by_pattern.setdefault(pattern, set()).add(int(cur_id))
+        except (ValueError, TypeError):
+            pass
+
+    def _probe_id(url, kind, loc, probe_int, pattern):
+        """Probe a single numeric ID. Returns a finding dict or None."""
+        probe_id = str(probe_int)
+        if kind == "path":
+            probe_url = _rewrite_path_id(url, probe_id)
+        else:
+            probe_url = _rewrite_query_id(url, loc, probe_id)
+        if probe_url in probed:
+            return None
+        probed.add(probe_url)
+        if probe_int in own_ids_by_pattern.get(pattern, set()):
+            return None
+        r_auth = _get(sess, probe_url, budget_box)
+        if not _is_real_content(r_auth):
+            return None
+        r_anon = _get(anon, probe_url, budget_box)
+        anon_sees = (_is_real_content(r_anon)
+                     and _similar(r_auth.text, r_anon.text) >= _SIM_HIT)
+        body_snippet = (r_auth.text or "")[:2000]
+        evidence = (f"user '{user_label}' accessed object id {probe_id} at "
+                    f"{probe_url} (HTTP 200, {len(r_auth.text)} bytes) — "
+                    f"this object is NOT in the user's own listing, "
+                    f"indicating missing authorization check"
+                    f"\n\nResponse body (first 2000 chars):\n{body_snippet}")
+        severity = "high"
+        if anon_sees:
+            evidence += ("; object is ALSO readable with NO authentication "
+                         "— missing access control entirely")
+            severity = "critical"
+
+        # Post-action sibling probing: when an IDOR is confirmed on a
+        # state-changing action URL (e.g. /order/<id>/archive), the action may
+        # grant the caller access to sibling view endpoints for the same object
+        # (e.g. /order/<id>/receipt). Probe those siblings and capture any data
+        # the action unlocked — this is a general pattern across many apps.
+        parsed_path = urlparse(probe_url).path.rstrip("/")
+        if _ACTION_SUFFIX_RE.search(parsed_path):
+            siblings = _sibling_urls(probe_url, list(own_urls) + seed_urls, target)
+            sibling_cap = 10  # max sibling requests per confirmed action IDOR
+            for sib_url in siblings[:sibling_cap]:
+                if budget_box[0] <= 0:
+                    break
+                sr = _get(sess, sib_url, budget_box)
+                if sr is None:
+                    continue
+                if sr.status_code == 200 and len(sr.text or "") >= _MIN_BODY \
+                        and not _DENIED_RE.search(sr.text or ""):
+                    sib_body = (sr.text or "")[:2000]
+                    evidence += (f"\n\n--- sibling endpoint unlocked after action ---"
+                                 f"\nURL: {sib_url} (HTTP 200, {len(sr.text)} bytes)"
+                                 f"\nResponse body (first 2000 chars):\n{sib_body}")
+                    trace.append({"url": sib_url, "status": 200,
+                                  "note": f"sibling view after action IDOR on id {probe_id}"})
+
+        trace.append({"url": probe_url, "status": 200,
+                      "note": f"IDOR: {user_label} read non-owned id {probe_id}"})
+        return {"type": "idor", "severity": severity,
+                "url": probe_url,
+                "param": (f"path-id→{probe_id}" if kind == "path"
+                          else f"?{loc}={probe_id}"),
+                "evidence": evidence, "confirmed": True,
+                "_body": body_snippet}
+
+    # Strategy 1 (gap enumeration): probe IDs IN BETWEEN known owned IDs.
+    # Probes are interleaved round-robin across all gaps so budget is spent
+    # evenly — this reaches deep into EVERY gap instead of exhausting budget
+    # on the first one.
+    _gap_probes = []
+    _gap_meta = []
+    for pattern, known_ids in own_ids_by_pattern.items():
+        sorted_ids = sorted(known_ids)
+        if len(sorted_ids) < 2:
+            continue
+        ref_url = ref_kind = ref_loc = None
+        for url in own_urls:
+            targets = _numeric_targets(url)
+            if not targets:
+                continue
+            k, l, c = targets[0]
+            p = _PATH_ID_RE.sub("/{ID}", url, count=1) if k == "path" else url
+            if p == pattern:
+                ref_url, ref_kind, ref_loc = url, k, l
+                break
+        if not ref_url:
+            continue
+        for i in range(len(sorted_ids) - 1):
+            lo, hi = sorted_ids[i], sorted_ids[i + 1]
+            gap = hi - lo
+            if gap <= 1:
+                continue
+            if gap <= 200:
+                probes = list(range(lo + 1, hi))
+            else:
+                step = max(1, gap // 50)
+                probes = list(range(lo + 1, hi, step))
+                probes += [lo + 1, lo + 2, hi - 1, hi - 2]
+                probes = sorted(set(probes))
+            probes = [p for p in probes if p not in known_ids]
+            if probes:
+                _gap_probes.append(probes)
+                _gap_meta.append((ref_url, ref_kind, ref_loc, pattern))
+
+    _stop_enum = False
+    for round_ids in zip_longest(*_gap_probes):
+        if budget_box[0] <= 0 or _stop_enum:
+            break
+        for gi, pid in enumerate(round_ids):
+            if pid is None:
+                continue
+            if budget_box[0] <= 0:
+                _stop_enum = True
+                break
+            ref_url, ref_kind, ref_loc, pat = _gap_meta[gi]
+            f = _probe_id(ref_url, ref_kind, ref_loc, pid, pat)
+            if f:
+                f.pop("_body", None)
+                findings.append(f)
+
+    # Strategy 2 (fixed offsets): probe nearby IDs around each known ID.
+    # Fallback when gap enumeration didn't find anything.
+    if not findings:
+        _OFFSETS = [-1, 1, -2, 2, -5, 5, -10, 10, -50, 50, -100, 100, -200, 200]
+        for url in list(own_urls):
+            if budget_box[0] <= 0:
+                break
+            targets = _numeric_targets(url)
+            if not targets:
+                continue
+            kind, loc, cur_id = targets[0]
+            try:
+                cur_int = int(cur_id)
+            except (ValueError, TypeError):
+                continue
+            pattern = _PATH_ID_RE.sub("/{ID}", url, count=1) if kind == "path" else url
+            for offset in _OFFSETS:
+                if budget_box[0] <= 0:
+                    break
+                f = _probe_id(url, kind, loc, cur_int + offset, pattern)
+                if f:
+                    f.pop("_body", None)
+                    findings.append(f)
+
     return findings
 
 
@@ -453,9 +808,9 @@ def main() -> int:
     run_id = os.environ.get("VAPT_RUN_ID", "").strip()
     cookies = _redis_cookies(run_id)
     users = _users(cookies)
-    if len(users) < 2:
-        print(json.dumps({"error": "need at least two account cookies in redis "
-                                   "(:B and :C, or :A and :B)", "findings": []}))
+    if len(users) < 1:
+        print(json.dumps({"error": "need at least one account cookie in redis",
+                          "findings": []}))
         return 0
 
     seed_urls = [u.strip() for u in args.urls.split(",")
@@ -479,9 +834,14 @@ def main() -> int:
                   "note": "derived from seed URLs"})
 
     if args.mode == "delete":
+        if len(users) < 2:
+            print(json.dumps({"error": "delete mode needs at least two accounts",
+                              "findings": []}))
+            return 0
         findings = _delete_probe(users, bases, target, seed_urls,
                                  budget_box, trace, listing_paths)
-    else:
+    elif len(users) >= 2:
+        # Multi-account mode: cross-tenant comparison.
         # 1) Harvest each user's own object URLs from their listing pages (establishes ownership).
         owned = _harvest(users, bases, target, budget_box, trace, listing_paths)
         # 2) Also treat any seeded URL that already points at a specific object as a
@@ -492,11 +852,20 @@ def main() -> int:
 
         owned = {u: o for u, o in owned.items() if o}  # keep only owner-attributed URLs
 
-        findings = _cross_access(users, owned, budget_box, trace)
+        findings = _cross_access(users, owned, budget_box, trace,
+                                  seed_urls=seed_urls, target=target)
 
         # 3) Secondary: numeric enumeration on seeded numeric URLs (non-public).
         enum_seeds = [u for u in seed_urls if not _is_public_data(u) and _numeric_targets(u)]
         findings += _enumerate(users, enum_seeds, budget_box, trace)
+    else:
+        # Single-account mode: enumerate numeric IDs to find objects NOT in
+        # the user's own listing (missing authorization check).
+        label, cookie = users[0]
+        trace.append({"note": f"single-account mode: {label} only"})
+        findings = _single_account_enumerate(
+            label, cookie, seed_urls, bases, target,
+            budget_box, trace, listing_paths)
 
     # De-dup findings by (type, url).
     seen = set()
@@ -506,8 +875,6 @@ def main() -> int:
         if key not in seen:
             seen.add(key)
             uniq.append(f)
-        if len(uniq) >= 25:
-            break
 
     print(json.dumps({"findings": uniq, "trace": trace[:60]}))
     return 0
