@@ -191,6 +191,9 @@ SCAN = AgentManifest(
         # leaked /etc/passwd / win.ini / <?php content in the response.
         # P2 approval-gated.
         "xxe_probe",
+        # Auth bypass probe — tests login forms for PHP type juggling
+        # (magic hashes), tautology bypasses, and forced browsing. P2.
+        "auth_bypass_probe",
         *_cat_ids(AgentRole.SCAN),
     ),
     risk_ceiling=PolicyClass.P2_INTRUSIVE,   # may PROPOSE intrusive; policy + human still gate it

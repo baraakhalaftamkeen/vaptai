@@ -44,23 +44,25 @@ TIMEOUT = 8
 # because HTML defaults it to "text" when omitted (and real forms do omit it).
 # We'll pull the type out separately from the same opening tag if present.
 _INPUT_RE = re.compile(
-    r"""<input\b([^>]*?)\bname\s*=\s*["']([^"']+)["']([^>]*)>""",
+    r"""<input\b([^>]*?)\bname\s*=\s*(?:["']([^"']+)["']|([^\s>"'/]+))([^>]*)>""",
     re.IGNORECASE,
 )
 _TYPE_IN_TAG_RE = re.compile(
     r"""\btype\s*=\s*["']([^"']+)["']""", re.IGNORECASE,
 )
 _TEXTAREA_RE = re.compile(
-    r"""<textarea\b[^>]*?\bname\s*=\s*["']([^"']+)["']""", re.IGNORECASE
+    r"""<textarea\b[^>]*?\bname\s*=\s*(?:["']([^"']+)["']|([^\s>"'/]+))""",
+    re.IGNORECASE,
 )
 _SELECT_RE = re.compile(
-    r"""<select\b[^>]*?\bname\s*=\s*["']([^"']+)["']""", re.IGNORECASE
+    r"""<select\b[^>]*?\bname\s*=\s*(?:["']([^"']+)["']|([^\s>"'/]+))""",
+    re.IGNORECASE,
 )
 _FORM_RE = re.compile(
     r"""<form\b([^>]*)>(.*?)</form>""", re.IGNORECASE | re.DOTALL
 )
 _ATTR_RE = re.compile(
-    r"""(\w[\w-]*)\s*=\s*["']([^"']*)["']""", re.IGNORECASE
+    r"""(\w[\w-]*)\s*=\s*(?:["']([^"']*)["']|([^\s>"']+))""", re.IGNORECASE
 )
 _VALUE_RE_TEMPLATE = (
     r"""<input\b[^>]*?\bname\s*=\s*["']{name}["'][^>]*?\bvalue\s*=\s*["']([^"']*)["']"""
@@ -121,7 +123,7 @@ def _parse_forms(html: str, page_url: str) -> list[FormSpec]:
         return out
     for m in _FORM_RE.finditer(html):
         attrs_raw, body = m.group(1) or "", m.group(2) or ""
-        attrs = {k.lower(): v for k, v in _ATTR_RE.findall(attrs_raw)}
+        attrs = {k.lower(): (v1 or v2) for k, v1, v2 in _ATTR_RE.findall(attrs_raw)}
         action = attrs.get("action", "").strip()
         if action:
             action = urljoin(page_url, action)
@@ -135,8 +137,8 @@ def _parse_forms(html: str, page_url: str) -> list[FormSpec]:
         # <input ...> — type is OPTIONAL (HTML defaults to "text" when omitted,
         # and plenty of real admin forms use <input name="…"> bare).
         for im in _INPUT_RE.finditer(body):
-            attrs = (im.group(1) or "") + (im.group(3) or "")
-            name = (im.group(2) or "").strip()
+            attrs = (im.group(1) or "") + (im.group(4) or "")
+            name = (im.group(2) or im.group(3) or "").strip()
             if not name or name in _seen_names:
                 continue
             tm = _TYPE_IN_TAG_RE.search(attrs)
@@ -148,13 +150,13 @@ def _parse_forms(html: str, page_url: str) -> list[FormSpec]:
             fields.append(FormField(name=name, type=itype, value=value))
         # <textarea ...>
         for tm in _TEXTAREA_RE.finditer(body):
-            name = (tm.group(1) or "").strip()
+            name = (tm.group(1) or tm.group(2) or "").strip()
             if name and name not in _seen_names:
                 _seen_names.add(name)
                 fields.append(FormField(name=name, type="textarea"))
         # <select ...>
         for sm in _SELECT_RE.finditer(body):
-            name = (sm.group(1) or "").strip()
+            name = (sm.group(1) or sm.group(2) or "").strip()
             if name and name not in _seen_names:
                 _seen_names.add(name)
                 fields.append(FormField(name=name, type="select"))

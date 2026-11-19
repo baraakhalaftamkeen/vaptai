@@ -450,10 +450,55 @@ def build_engagement_graph(
         is_black_box = scope.testing_mode == TestingMode.BLACK_BOX
 
         if is_black_box:
-            ledger.record_event(db, scope.run_id, "intake.auth",
-                                {"ok": False, "reason": "black_box_mode",
-                                 "note": "black-box engagement — auth skipped"})
-            log.append("intake: black-box mode — skipping auth")
+            # Black-box: no operator-supplied credentials. Attempt self-registration
+            # on web targets — many apps expose /register or /signup that lets us
+            # create a test account and test authenticated surfaces.
+            _bb_cookie = None
+            if not is_network:
+                try:
+                    _bb_bases: list[str] = []
+                    _t = scope.target
+                    from urllib.parse import urlparse as _up_bb
+                    _p_bb = _up_bb(_t) if "://" in _t else None
+                    if _p_bb and _p_bb.scheme:
+                        _bb_bases = [_t.rstrip("/")]
+                    else:
+                        _bb_bases = [f"http://{_t}", f"https://{_t}"]
+                        if scope.allowed_ports:
+                            for _ap in scope.allowed_ports.split(","):
+                                _ap = _ap.strip()
+                                if _ap and _ap not in ("80", "443"):
+                                    _bb_bases.append(f"http://{_t}:{_ap}")
+                    for _bb_base in _bb_bases:
+                        reg_result = web_login.try_self_register(_bb_base, timeout_s=10)
+                        if reg_result:
+                            _login_url, _reg_user, _reg_pw = reg_result
+                            _bb_cookie = web_login.obtain_session_cookie(
+                                _login_url, _reg_user, _reg_pw, timeout_s=10)
+                            if _bb_cookie:
+                                auth_status = "ok"
+                                login_url_used = _login_url
+                                web_credentials.set_web_cookie(scope.run_id, _bb_cookie)
+                                web_credentials.set_web_cookie_a(scope.run_id, _bb_cookie)
+                                ledger.record_event(db, scope.run_id, "intake.auth",
+                                                    {"ok": True, "reason": "self_registration",
+                                                     "login_url": _login_url,
+                                                     "username": _reg_user,
+                                                     "note": "black-box self-registration succeeded"})
+                                log.append(f"intake: black-box self-registration OK "
+                                           f"via {_login_url} (user: {_reg_user})")
+                                break
+                        if _bb_cookie:
+                            break
+                except Exception as _reg_exc:
+                    ledger.record_event(db, scope.run_id, "intake.auth",
+                                        {"ok": False, "reason": "self_registration_error",
+                                         "error": str(_reg_exc)[:200]})
+            if not _bb_cookie:
+                ledger.record_event(db, scope.run_id, "intake.auth",
+                                    {"ok": False, "reason": "black_box_mode",
+                                     "note": "black-box engagement — no registration found or auth skipped"})
+                log.append("intake: black-box mode — no self-registration available")
         elif is_network:
             # --- Network gray/white-box: validate domain credentials via SMB ---
             domain_creds = web_credentials.get_domain_credentials(scope.run_id)
@@ -1325,7 +1370,8 @@ def build_engagement_graph(
 
     # -- validate -------------------------------------------------------------
     _SEV_RANK = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
-    _CVE_CONFIRM_BUDGET = 12   # bound nuclei/searchsploit runs on busy hosts
+    _CVE_CONFIRM_BUDGET = 6    # per-pass cap; shared counter below enforces global limit
+    _cve_validated_total = [0]  # shared across both validation passes (validate + post-webvuln)
 
     def _run_validation() -> dict:
         """Independently validate every STILL-CANDIDATE finding. CVE candidates go through
@@ -1390,12 +1436,15 @@ def build_engagement_graph(
             reverse=True,
         )
         tiers = {"confirmed": 0, "exploit_available": 0, "inconclusive": 0}
-        for fid in cve_cands[:_CVE_CONFIRM_BUDGET]:
+        _global_remaining = _CVE_CONFIRM_BUDGET * 2 - _cve_validated_total[0]
+        _pass_cap = min(_CVE_CONFIRM_BUDGET, max(0, _global_remaining))
+        for fid in cve_cands[:_pass_cap]:
             try:
                 guard.step()
             except ManifestError:
                 break
             tiers[phases.validate_cve_candidate(db, scope, harness, fid)] += 1
+            _cve_validated_total[0] += 1
 
         tiers["scanner_reverified"] = scanner_confirmed
         return tiers
@@ -1959,8 +2008,9 @@ def build_engagement_graph(
         _is_black_box = scope.testing_mode == TestingMode.BLACK_BOX
         # 1. Perform admin login (idempotent — if a cookie is already cached from a
         #    prior iteration, skip the login call and reuse).
+        # Black-box mode may have a cookie from self-registration during intake.
         login_url = None  # set when A login succeeds; B/C reuse it
-        cookie = None if _is_black_box else web_credentials.get_web_cookie(scope.run_id)
+        cookie = web_credentials.get_web_cookie(scope.run_id)
         if not cookie and not _is_black_box:
             creds = web_credentials.get_web_credentials(scope.run_id)
             if creds:
@@ -3895,6 +3945,106 @@ def build_engagement_graph(
                 sqli_idx += 1
                 time_budget -= 1
 
+        # (D) sqli_detect on form_map params — covers non-auth, non-search
+        # endpoints that have injectable params: select dropdowns like
+        # ?category=, GET params like ?id=, ?page=, ?sort= etc. These are
+        # the classic SQLi surface that (A)/(B)/(C) don't reach because
+        # they aren't auth or search paths. Only fires on GET forms and
+        # endpoints with discovered params; POST auth forms already covered
+        # by (A). Budget-capped to avoid blowup on large apps.
+        _fm_sqli = _form_map_by_run.get(scope.run_id, []) or []
+        _sqli_fm_seen: set[tuple] = set()
+        _sqli_fm_budget = 8
+        for _em in _fm_sqli:
+            if _sqli_fm_budget <= 0 or sqli_idx >= 16:
+                break
+            for _form in _em.forms:
+                if _sqli_fm_budget <= 0 or sqli_idx >= 16:
+                    break
+                # GET forms with query params (select, text, hidden)
+                if _form.method.lower() == "get":
+                    for _f in _form.fields:
+                        if _sqli_fm_budget <= 0 or sqli_idx >= 16:
+                            break
+                        if _f.type in ("submit", "button", "image", "file"):
+                            continue
+                        _action = _form.action or _em.url
+                        _k = (_action, _f.name)
+                        if _k in _sqli_fm_seen or _k in _seen_auth:
+                            continue
+                        _sqli_fm_seen.add(_k)
+                        _sep = "&" if "?" in _action else "?"
+                        plan.append((
+                            "sqli_detect",
+                            {"target": scope.target,
+                             "url": f"{_action}{_sep}{_f.name}=1",
+                             "param": _f.name,
+                             "method": "get"},
+                            f"webvuln-sqli-fm-{sqli_idx}",
+                        ))
+                        sqli_idx += 1
+                        _sqli_fm_budget -= 1
+                elif _form.method.lower() == "post":
+                    # POST forms with non-password text fields (not auth)
+                    _pw = [f for f in _form.fields if f.type == "password"]
+                    if _pw:
+                        continue  # auth form, already covered by (A)
+                    for _f in _form.fields:
+                        if _sqli_fm_budget <= 0 or sqli_idx >= 16:
+                            break
+                        if _f.type in ("submit", "button", "image", "file", "hidden"):
+                            continue
+                        _action = _form.action or _em.url
+                        _k = (_action, _f.name)
+                        if _k in _sqli_fm_seen or _k in _seen_auth:
+                            continue
+                        _sqli_fm_seen.add(_k)
+                        _all_fields = [ff.name for ff in _form.fields
+                                       if ff.type not in ("submit", "button", "image", "file")]
+                        _body = "&".join(f"{p}=1" for p in _all_fields) or f"{_f.name}=1"
+                        plan.append((
+                            "sqli_detect",
+                            {"target": scope.target,
+                             "url": _action,
+                             "param": _f.name,
+                             "method": "post",
+                             "data": _body},
+                            f"webvuln-sqli-fm-{sqli_idx}",
+                        ))
+                        sqli_idx += 1
+                        _sqli_fm_budget -= 1
+
+        # Also dispatch sqli_detect for arjun-discovered params on non-auth
+        # endpoints. Arjun discovers hidden params that forms don't expose.
+        for _base in _auth_bases[:3]:
+            if _sqli_fm_budget <= 0 or sqli_idx >= 16:
+                break
+            for _ep in phases.discovered_endpoint_urls(
+                    db, scope, base_url=_base, cap=30):
+                if _sqli_fm_budget <= 0 or sqli_idx >= 16:
+                    break
+                if _AUTH_PATHS_RE.search(_ep):
+                    continue
+                _ap = phases.arjun_params_for_url(db, scope.run_id, _ep)
+                for _p in _ap[:2]:
+                    if _sqli_fm_budget <= 0 or sqli_idx >= 16:
+                        break
+                    _k = (_ep, _p)
+                    if _k in _sqli_fm_seen or _k in _seen_auth:
+                        continue
+                    _sqli_fm_seen.add(_k)
+                    _sep = "&" if "?" in _ep else "?"
+                    plan.append((
+                        "sqli_detect",
+                        {"target": scope.target,
+                         "url": f"{_ep}{_sep}{_p}=1",
+                         "param": _p,
+                         "method": "get"},
+                        f"webvuln-sqli-fm-{sqli_idx}",
+                    ))
+                    sqli_idx += 1
+                    _sqli_fm_budget -= 1
+
         # (B) dalfox on FORM endpoints — iterate form_map FIRST (so admin
         # textarea forms like /admin/announcement + /admin/offer get hit
         # even when the budget is tight), then fall back to the
@@ -4575,6 +4725,62 @@ def build_engagement_graph(
                      "sample_forms": sorted(_wcp_seen)[:4]})
             except Exception:
                 pass
+
+        # (C''') Auth bypass probe on login forms — tests for PHP type juggling
+        # (magic hashes), tautology bypasses, and forced browsing. Dispatched
+        # alongside weak_cred_probe on the same forms but catches different
+        # vuln classes (logic bugs vs default creds). Bounded at 3 forms.
+        _abp_seen: set[str] = set()
+        _abp_dispatched = 0
+        _abp_budget = 3
+        for _em in _fm:
+            if _abp_dispatched >= _abp_budget:
+                break
+            for _form in _em.forms:
+                if _abp_dispatched >= _abp_budget:
+                    break
+                if _form.method.lower() != "post":
+                    continue
+                _pw_fields = [f for f in _form.fields if f.type == "password"]
+                if not _pw_fields:
+                    continue
+                _pw_name = _pw_fields[0].name
+                _user_fields = [f for f in _form.fields
+                                if f.type in ("text", "email", "search", "url", "tel")
+                                and f.name != _pw_name]
+                _user_name = _user_fields[0].name if _user_fields else ""
+                _extras_pairs_abp: list[str] = []
+                for _f in _form.fields:
+                    if _f.name in (_pw_name, _user_name):
+                        continue
+                    if _f.type in ("submit", "button"):
+                        _extras_pairs_abp.append(f"{_f.name}={_f.value or 'Submit'}")
+                    elif _f.type == "hidden":
+                        _extras_pairs_abp.append(f"{_f.name}={_f.value or ''}")
+                _extras_abp = ",".join(_extras_pairs_abp[:6])
+                _action = _form.action or _em.url
+                if _action in _abp_seen:
+                    continue
+                from urllib.parse import urlparse as _up_abp
+                _path = (_up_abp(_action).path or "").lower()
+                _SIGNUP_HINTS_ABP = (
+                    "/register", "/signup", "/sign-up", "/sign_up",
+                    "/create-account", "/create_account", "/join",
+                )
+                if any(h in _path for h in _SIGNUP_HINTS_ABP):
+                    _abp_seen.add(_action)
+                    continue
+                _abp_seen.add(_action)
+                _abp_args: dict = {
+                    "target": scope.target,
+                    "url": _action,
+                    "username_field": _user_name,
+                    "password_field": _pw_name,
+                    "extra_fields": _extras_abp,
+                }
+                plan.append(("auth_bypass_probe", _abp_args,
+                             f"webvuln-authbypass-{_abp_dispatched}"))
+                _abp_dispatched += 1
 
         # (C-param) Param spray on 500-status endpoints. When an endpoint
         # returns 500 bare (no query params), it often means it REQUIRES a
@@ -5950,7 +6156,7 @@ def build_engagement_graph(
             # the fuzzers would still only see the unauthenticated route list.
             run_args = dict(args) if isinstance(args, dict) else {}
             if tool_id in ("wapiti", "nuclei_dast") and isinstance(args, dict):
-                base_url = f"{args['scheme']}://{scope.target}" + (
+                base_url = f"{args.get('scheme', 'http')}://{scope.target}" + (
                     f":{args['port']}" if args.get('port') else "")
                 run_args["seeds"] = phases.webvuln_seed_urls(db, scope, base_url=base_url)
 
@@ -5983,7 +6189,7 @@ def build_engagement_graph(
                 # arjun pattern. A wedged dev server (common after wapiti hammers it) stops
                 # the sweep rather than eating a full budget of 90s hangs.
                 if cookie and task_id.startswith("webvuln-authcrawl-") and isinstance(args, dict):
-                    base_url = f"{args['scheme']}://{scope.target}" + (
+                    base_url = f"{args.get('scheme', 'http')}://{scope.target}" + (
                         f":{args['port']}" if args.get('port') else "")
                     probed = 0
                     auth_arjun_timeouts = 0
@@ -6074,7 +6280,7 @@ def build_engagement_graph(
         # (plan args were frozen pre-auth). Mirrors _execute()'s run_args logic.
         run_args = dict(args) if isinstance(args, dict) else {}
         if tool_id in ("wapiti", "nuclei_dast") and isinstance(args, dict):
-            base_url = f"{args['scheme']}://{scope.target}" + (
+            base_url = f"{args.get('scheme', 'http')}://{scope.target}" + (
                 f":{args['port']}" if args.get('port') else "")
             run_args["seeds"] = phases.webvuln_seed_urls(db, scope, base_url=base_url)
 
@@ -6119,6 +6325,94 @@ def build_engagement_graph(
         if res is not None and res.outcome != "ok":
             return {**base, "coverage_gaps": [f"{tool_id}: tool {res.outcome}"],
                     "log": [f"webvuln: {tool_id} ran but produced no results"]}
+
+        # Post-dalfox response capture: when dalfox confirms XSS via POST,
+        # replay confirmed payloads AND custom bypass payloads through
+        # recon_fetch POST so the FULL response body is stored as a finding
+        # observation (up to 8 KB). Dalfox detects reflection but can miss
+        # server-side effects (flags, tokens) — especially when the payload
+        # triggers actual JS execution and the app returns a different
+        # response (e.g. a flag page instead of the reflected form).
+        if (tool_id == "dalfox"
+                and isinstance(args, dict)
+                and str(args.get("method", "")).lower() == "post"
+                and step.candidate_ids):
+            try:
+                ledger.record_event(db, scope.run_id, "webvuln.dalfox_capture",
+                                    {"candidates": len(step.candidate_ids),
+                                     "ids": [str(c)[:12] for c in step.candidate_ids[:5]],
+                                     "url": str(args.get("url", ""))[:100]})
+                from urllib.parse import quote as _url_q
+                from vapt_persistence.models import FindingObservation as _FO
+                from sqlalchemy import select as _sel
+                _replay_url = str(args.get("url", "")).strip()
+                _replay_cap = 0
+                _confirmed_param = None
+                for _fid in step.candidate_ids[:5]:
+                    _obs_rows = db.execute(
+                        _sel(_FO).where(_FO.finding_id == _fid)
+                        .order_by(_FO.created_at.desc())
+                    ).scalars().all()
+                    if not _obs_rows:
+                        ledger.record_event(db, scope.run_id, "webvuln.dalfox_capture.skip",
+                                            {"finding_id": str(_fid)[:12], "reason": "no_observations"})
+                        continue
+                    for fo in _obs_rows:
+                        _det = json.loads(fo.detail) if isinstance(fo.detail, str) else (fo.detail or {})
+                        if not (_det.get("kind") in ("verified", "reflected")
+                                and _det.get("param") and _det.get("payload")):
+                            continue
+                        if not _confirmed_param:
+                            _confirmed_param = _det["param"]
+                        _rp = _det["param"]
+                        _rv = _url_q(str(_det["payload"]), safe="")
+                        _rdata = f"{_rp}={_rv}"
+                        _rargs = {"target": scope.target, "url": _replay_url,
+                                  "method": "post", "data": _rdata}
+                        _rtask = f"webvuln-dalfox-capture-{_replay_cap}"
+                        if not phases.already_executed(
+                                db, scope, task_id=_rtask, tool_id="recon_fetch", args=_rargs):
+                            ledger.record_event(db, scope.run_id, "webvuln.dalfox_capture.replay",
+                                                {"task": _rtask, "data": _rdata[:100], "source": "confirmed"})
+                            phases.scan_action(
+                                db, scope, harness,
+                                tool_id="recon_fetch", args=_rargs, task_id=_rtask)
+                        _replay_cap += 1
+                        if _replay_cap >= 3:
+                            break
+                    if _replay_cap >= 3:
+                        break
+                if _confirmed_param and _replay_cap < 8:
+                    _payload_file = os.path.join(
+                        os.path.dirname(os.path.dirname(os.path.dirname(
+                            os.path.dirname(os.path.dirname(__file__))))),
+                        "packages", "tools", "vapt_tools", "data",
+                        "xss_bypass.txt")
+                    if os.path.isfile(_payload_file):
+                        with open(_payload_file) as _pf:
+                            _custom = [l.strip() for l in _pf if l.strip()]
+                        for _cp in _custom[:8]:
+                            if _replay_cap >= 8:
+                                break
+                            _rv = _url_q(_cp, safe="")
+                            _rdata = f"{_confirmed_param}={_rv}"
+                            _rargs = {"target": scope.target, "url": _replay_url,
+                                      "method": "post", "data": _rdata}
+                            _rtask = f"webvuln-dalfox-capture-{_replay_cap}"
+                            if not phases.already_executed(
+                                    db, scope, task_id=_rtask, tool_id="recon_fetch", args=_rargs):
+                                ledger.record_event(db, scope.run_id, "webvuln.dalfox_capture.replay",
+                                                    {"task": _rtask, "data": _rdata[:100], "source": "bypass"})
+                                phases.scan_action(
+                                    db, scope, harness,
+                                    tool_id="recon_fetch", args=_rargs, task_id=_rtask)
+                            _replay_cap += 1
+            except Exception as _cap_exc:
+                import traceback as _tb
+                ledger.record_event(db, scope.run_id, "webvuln.dalfox_capture.error",
+                                    {"error": f"{type(_cap_exc).__name__}: {str(_cap_exc)[:300]}",
+                                     "tb": _tb.format_exc()[-500:]})
+
         return {**base,
                 "log": [f"webvuln: {tool_id} executed ({len(step.candidate_ids)} candidate(s))"]}
 

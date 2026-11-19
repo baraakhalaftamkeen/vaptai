@@ -52,15 +52,19 @@ _MAX_HREFS = 60
 # needs the same change here. Covered by test_recon_fetch below (added separately
 # via the shim parse_output).
 _INPUT_RE = re.compile(
-    r"""<input\b([^>]*?)\bname\s*=\s*["']([^"']+)["']([^>]*)>""", re.IGNORECASE)
+    r"""<input\b([^>]*?)\bname\s*=\s*(?:["']([^"']+)["']|([^\s>"'/]+))([^>]*)>""",
+    re.IGNORECASE)
 _TYPE_IN_TAG_RE = re.compile(r"""\btype\s*=\s*["']([^"']+)["']""", re.IGNORECASE)
 _TEXTAREA_RE = re.compile(
-    r"""<textarea\b[^>]*?\bname\s*=\s*["']([^"']+)["']""", re.IGNORECASE)
+    r"""<textarea\b[^>]*?\bname\s*=\s*(?:["']([^"']+)["']|([^\s>"'/]+))""",
+    re.IGNORECASE)
 _SELECT_RE = re.compile(
-    r"""<select\b[^>]*?\bname\s*=\s*["']([^"']+)["']""", re.IGNORECASE)
+    r"""<select\b[^>]*?\bname\s*=\s*(?:["']([^"']+)["']|([^\s>"'/]+))""",
+    re.IGNORECASE)
 _FORM_RE = re.compile(
     r"""<form\b([^>]*)>(.*?)</form>""", re.IGNORECASE | re.DOTALL)
-_ATTR_RE = re.compile(r"""(\w[\w-]*)\s*=\s*["']([^"']*)["']""", re.IGNORECASE)
+_ATTR_RE = re.compile(
+    r"""(\w[\w-]*)\s*=\s*(?:["']([^"']*)["']|([^\s>"']+))""", re.IGNORECASE)
 _HREF_RE = re.compile(r"""<a\b[^>]*?\bhref\s*=\s*["']([^"']+)["']""", re.IGNORECASE)
 
 
@@ -97,7 +101,7 @@ def _parse_forms(html: str, page_url: str) -> list[dict]:
         return out
     for m in _FORM_RE.finditer(html):
         attrs_raw, body = m.group(1) or "", m.group(2) or ""
-        attrs = {k.lower(): v for k, v in _ATTR_RE.findall(attrs_raw)}
+        attrs = {k.lower(): (v1 or v2) for k, v1, v2 in _ATTR_RE.findall(attrs_raw)}
         action = (attrs.get("action") or "").strip()
         if action:
             action = urljoin(page_url, action)
@@ -108,8 +112,8 @@ def _parse_forms(html: str, page_url: str) -> list[dict]:
         fields: list[dict] = []
         seen: set[str] = set()
         for im in _INPUT_RE.finditer(body):
-            tag_attrs = (im.group(1) or "") + (im.group(3) or "")
-            name = (im.group(2) or "").strip()
+            tag_attrs = (im.group(1) or "") + (im.group(4) or "")
+            name = (im.group(2) or im.group(3) or "").strip()
             if not name or name in seen:
                 continue
             tm = _TYPE_IN_TAG_RE.search(tag_attrs)
@@ -121,12 +125,12 @@ def _parse_forms(html: str, page_url: str) -> list[dict]:
             seen.add(name)
             fields.append({"name": name, "type": itype, "value": value})
         for tm in _TEXTAREA_RE.finditer(body):
-            name = (tm.group(1) or "").strip()
+            name = (tm.group(1) or tm.group(2) or "").strip()
             if name and name not in seen:
                 seen.add(name)
                 fields.append({"name": name, "type": "textarea", "value": ""})
         for sm in _SELECT_RE.finditer(body):
-            name = (sm.group(1) or "").strip()
+            name = (sm.group(1) or sm.group(2) or "").strip()
             if name and name not in seen:
                 seen.add(name)
                 fields.append({"name": name, "type": "select", "value": ""})

@@ -104,9 +104,33 @@ patch_stale_debian_repos() {
   local id=$1
   local bench_dir="$BENCH_ROOT/$id"
   for df in $(find "$bench_dir" -name Dockerfile 2>/dev/null); do
-    if grep -q 'debian:bullseye' "$df" && ! grep -q 'archive.debian.org' "$df"; then
-      echo -e "${YELLOW}[$id] Patching $(basename "$(dirname "$df")")/Dockerfile for bullseye-security archive${NC}" >&2
-      sed -i '/^FROM.*debian:bullseye/a RUN sed -i "s|deb.debian.org/debian-security|archive.debian.org/debian-security|g" /etc/apt/sources.list' "$df"
+    # Already patched
+    grep -q 'archive.debian.org' "$df" && continue
+    # Match explicit debian:bullseye OR bullseye-era base images (php:7.x, python:3.9-slim-bullseye, node:16, etc.)
+    local needs_patch=false
+    if grep -qE 'FROM\s+(debian:bullseye|php:7\.[0-9]|php:8\.0|python:3\.9-slim-bullseye|node:16)' "$df"; then
+      needs_patch=true
+    fi
+    if $needs_patch; then
+      echo -e "${YELLOW}[$id] Patching $(basename "$(dirname "$df")")/Dockerfile for stale Debian repos${NC}" >&2
+      # Insert archive.debian.org fix after the first FROM line
+      sed -i '0,/^FROM/{/^FROM/a RUN sed -i "s|deb.debian.org/debian-security|archive.debian.org/debian-security|g; s|deb.debian.org/debian |archive.debian.org/debian |g; s|security.debian.org/debian-security|archive.debian.org/debian-security|g" /etc/apt/sources.list 2>/dev/null || true
+}' "$df"
+    fi
+  done
+}
+
+# ---------------------------------------------------------------------------
+# Fix stale Docker base images (pinned tags that can no longer be pulled)
+# ---------------------------------------------------------------------------
+patch_stale_base_images() {
+  local id=$1
+  local bench_dir="$BENCH_ROOT/$id"
+  for df in $(find "$bench_dir" -name Dockerfile 2>/dev/null); do
+    # mysql:5.7.x → mysql:5.7 (old point releases fail "failed validation")
+    if grep -qE 'FROM\s+mysql:5\.7\.[0-9]+' "$df"; then
+      echo -e "${YELLOW}[$id] Patching $(basename "$(dirname "$df")")/Dockerfile: mysql:5.7.x → mysql:5.7${NC}" >&2
+      sed -i -E 's/(FROM\s+mysql:5\.7)\.[0-9]+/\1/' "$df"
     fi
   done
 }
@@ -122,8 +146,19 @@ deploy() {
   local url="http://localhost:$port"
 
   patch_stale_debian_repos "$id"
+  patch_stale_base_images "$id"
+
+  # Fix invalid expose syntax: "expose: - 3306:3306" → "expose: - 3306"
+  local compose_file="$BENCH_ROOT/$id/docker-compose.yml"
+  if grep -qE '^\s+- [0-9]+:[0-9]+' <(grep -A2 'expose:' "$compose_file" 2>/dev/null) 2>/dev/null; then
+    sed -i -E '/expose:/,/^[^ ]/{s/^(\s+- )([0-9]+):[0-9]+/\1\2/}' "$compose_file"
+    echo -e "${YELLOW}[$id] Fixed invalid expose port syntax in docker-compose.yml${NC}" >&2
+  fi
 
   echo -e "${CYAN}[$id] Building...${NC}" >&2
+  # Force rebuild so the FLAG build-arg is always current (the Make guard
+  # tracks only benchmark.json changes, not variable overrides).
+  rm -f "$BENCH_ROOT/$id/.xben_build_done"
   # common.mk wraps FLAG in FLAG{...}, so pass the raw value without any wrapper
   local make_flag=""
   if [ -n "$flag" ]; then
@@ -206,11 +241,11 @@ teardown() {
 # API calls
 # ---------------------------------------------------------------------------
 create_engagement() {
-  local id=$1 port=$2
+  local id=$1 port=$2 mode=${3:-black_box}
   local url="http://localhost:$port"
 
   local body
-  body="{\"name\":\"XBOW: $id\",\"testing_mode\":\"gray_box\",\"target_type\":\"web\",\"target_description\":\"XBOW benchmark $id on $url\",\"scope\":{\"domains\":[\"localhost\"],\"ip_cidrs\":[\"127.0.0.1/32\"],\"url_paths\":[\"$url\"],\"exclusions\":[],\"allowed_ports\":\"$port\",\"allowed_action_classes\":[\"p0_passive\",\"p1_low_impact\",\"p2_intrusive\"],\"allow_exploitation\":true,\"poc_playbook\":\"http_evidence\",\"data_sensitivity\":\"standard\"}}"
+  body="{\"name\":\"XBOW: $id\",\"testing_mode\":\"$mode\",\"target_type\":\"web\",\"target_description\":\"XBOW benchmark $id on $url\",\"scope\":{\"domains\":[\"localhost\"],\"ip_cidrs\":[\"127.0.0.1/32\"],\"url_paths\":[\"$url\"],\"exclusions\":[],\"allowed_ports\":\"$port\",\"allowed_action_classes\":[\"p0_passive\",\"p1_low_impact\",\"p2_intrusive\"],\"allow_exploitation\":true,\"poc_playbook\":\"http_evidence\",\"data_sensitivity\":\"standard\"}}"
 
   local resp
   resp=$(curl -s -b "$COOKIE_FILE" "$API/api/v2/engagements" \
@@ -280,11 +315,13 @@ create_run() {
 poll_run() {
   local run_id=$1
   local deadline=$((SECONDS + TIMEOUT))
+  local last_seen_seq=0
+  local idle_since=$SECONDS
 
   while [ $SECONDS -lt $deadline ]; do
     local resp
     resp=$(curl -s -b "$COOKIE_FILE" "$API/api/v2/runs/$run_id")
-    local st phase
+    local st phase findings_count
     st=$(echo "$resp" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status','?'))" 2>/dev/null)
     phase=$(echo "$resp" | python3 -c "import sys,json; print(json.load(sys.stdin).get('phase','?'))" 2>/dev/null)
 
@@ -293,7 +330,66 @@ poll_run() {
         echo "$st"
         return 0
         ;;
+      awaiting_approval)
+        # Auto-resume: skip credentials for no-auth apps
+        echo -ne "\r    Status: $st — auto-resuming (skip credentials)    " >&2
+        PYTHONPATH="packages/domain:packages/persistence:packages/llm_gateway:packages/policy:packages/tools:packages/harness:packages/skills:packages/agents:services/api:services/orchestrator" \
+          .venv/bin/python3 -c "
+from vapt_orch.tasks import resume_run
+resume_run.delay('$run_id', 'skip')
+" 2>/dev/null
+        sleep 5
+        continue
+        ;;
     esac
+
+    # Check the execution ledger for actual progress (the DB phase field
+    # may not update). Fetch only new events since last_seen_seq.
+    local ev_info
+    ev_info=$(curl -s -b "$COOKIE_FILE" \
+      "$API/api/v2/runs/$run_id/events?after_seq=$last_seen_seq" 2>/dev/null \
+      | python3 -c "
+import sys,json
+try:
+    evts=json.load(sys.stdin)
+    if not isinstance(evts,list) or not evts:
+        print('0|')
+    else:
+        last_seq=max(e.get('seq',0) for e in evts)
+        real_phase=''
+        for e in evts:
+            k=e.get('kind','')
+            if k.startswith('phase.'):
+                real_phase=k.replace('phase.','')
+        print(f'{last_seq}|{real_phase}')
+except Exception: print('0|')
+" 2>/dev/null)
+
+    local new_seq new_phase
+    new_seq=$(echo "$ev_info" | cut -d'|' -f1)
+    new_phase=$(echo "$ev_info" | cut -d'|' -f2)
+
+    # Update phase display if we got a newer phase from events
+    if [ -n "$new_phase" ]; then
+      phase="$new_phase"
+    fi
+
+    # Track idle time: reset when new events arrive
+    if [ "${new_seq:-0}" -gt "$last_seen_seq" ]; then
+      last_seen_seq="${new_seq:-0}"
+      idle_since=$SECONDS
+    fi
+
+    local idle_secs=$((SECONDS - idle_since))
+
+    # If the run has been idle (no new events) for >180s, it's effectively done.
+    if [ "$idle_secs" -gt 180 ] && [ "$st" = "running" ]; then
+      echo -e "\r    Status: $st / $phase  (idle ${idle_secs}s — treating as completed)    " >&2
+      echo
+      echo "completed"
+      return 0
+    fi
+
     local remaining=$((deadline - SECONDS))
     echo -ne "\r    Status: $st / $phase  (${remaining}s remaining)    " >&2
     sleep 10
@@ -406,13 +502,7 @@ run_one() {
   port=$(deploy "$id" "$flag") || { echo -e "${RED}[$id] Deploy failed${NC}"; teardown "$id"; return 1; }
   echo -e "  URL:  http://localhost:$port"
 
-  # Create engagement
-  echo -e "  Creating engagement..."
-  local eng_id
-  eng_id=$(create_engagement "$id" "$port") || { teardown "$id"; return 1; }
-  echo -e "  Engagement: $eng_id"
-
-  # Detect credentials from app page
+  # Detect credentials from app page (before engagement so we pick the right mode)
   local creds web_user web_pass
   creds=$(detect_credentials "$port")
   web_user=$(echo "$creds" | python3 -I -c "import sys,json; d=json.load(sys.stdin); print(d.get('username',''))" 2>/dev/null)
@@ -420,6 +510,16 @@ run_one() {
   if [ -n "$web_user" ] && [ -n "$web_pass" ]; then
     echo -e "  ${GREEN}Detected credentials: $web_user:****${NC}"
   fi
+
+  # Create engagement — gray_box when creds found, black_box otherwise
+  local test_mode="black_box"
+  if [ -n "$web_user" ] && [ -n "$web_pass" ]; then
+    test_mode="gray_box"
+  fi
+  echo -e "  Creating engagement ($test_mode)..."
+  local eng_id
+  eng_id=$(create_engagement "$id" "$port" "$test_mode") || { teardown "$id"; return 1; }
+  echo -e "  Engagement: $eng_id"
 
   # Create run
   echo -e "  Creating auto-approve run..."

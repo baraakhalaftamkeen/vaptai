@@ -248,3 +248,160 @@ def obtain_session_cookie(login_url: str, username: str, password: str,
         return "; ".join(parts) if parts else None
     except Exception:
         return None
+
+
+_REG_PATH_HINTS = (
+    "/register", "/signup", "/sign-up", "/sign_up",
+    "/auth/register", "/auth/signup", "/account/register",
+    "/accounts/register", "/user/register", "/users/register",
+    "/api/register", "/api/signup", "/api/auth/register",
+    "/create-account", "/join",
+)
+
+_REG_FIELD_RE = re.compile(
+    r"""<input\b[^>]*?\bname\s*=\s*["']([^"']+)["'][^>]*?\btype\s*=\s*["']([^"']+)["']"""
+    r"""|<input\b[^>]*?\btype\s*=\s*["']([^"']+)["'][^>]*?\bname\s*=\s*["']([^"']+)["']""",
+    re.IGNORECASE,
+)
+
+
+def _detect_register_form(html: str, page_url: str
+                          ) -> tuple[str, dict[str, str]] | None:
+    """Parse a registration page for form action + field names.
+    Returns (action_url, {field_name: field_type}) or None."""
+    if not html:
+        return None
+    fields: dict[str, str] = {}
+    has_password = False
+    for m in _REG_FIELD_RE.finditer(html):
+        name = (m.group(1) or m.group(4) or "").strip()
+        itype = (m.group(2) or m.group(3) or "").lower().strip()
+        if not name or itype in ("hidden", "submit", "button", "image"):
+            continue
+        fields[name] = itype
+        if itype == "password":
+            has_password = True
+    if not has_password or len(fields) < 2:
+        return None
+    action = _detect_form_action(html, page_url)
+    hidden = {}
+    for m in _REG_FIELD_RE.finditer(html):
+        name = (m.group(1) or m.group(4) or "").strip()
+        itype = (m.group(2) or m.group(3) or "").lower().strip()
+        if name and itype == "hidden":
+            vm = re.search(
+                rf"""<input\b[^>]*?\bname\s*=\s*["']{re.escape(name)}["'][^>]*?\bvalue\s*=\s*["']([^"']*)["']""",
+                html, re.IGNORECASE)
+            hidden[name] = vm.group(1) if vm else ""
+    fields.update({k: "hidden" for k in hidden})
+    return action, fields
+
+
+def _guess_field_values(fields: dict[str, str], username: str, password: str
+                        ) -> dict[str, str]:
+    """Map detected field names to plausible registration values."""
+    data: dict[str, str] = {}
+    _user_names = {"username", "user", "login", "name", "user_name", "uname"}
+    _email_names = {"email", "e-mail", "mail", "email_address", "user_email"}
+    _pass_names = {"password", "pass", "pwd", "passwd", "user_password"}
+    _confirm_names = {"password2", "confirm_password", "password_confirm",
+                      "confirm", "pass2", "re_password", "password_confirmation",
+                      "confirmPassword", "repassword"}
+    _fname_names = {"first_name", "firstname", "fname", "first"}
+    _lname_names = {"last_name", "lastname", "lname", "last"}
+    for name, ftype in fields.items():
+        low = name.lower().replace("-", "_")
+        if ftype == "hidden":
+            continue
+        if low in _user_names or ftype == "text" and "user" in low:
+            data[name] = username
+        elif low in _email_names or ftype == "email":
+            data[name] = f"{username}@test.local"
+        elif low in _confirm_names:
+            data[name] = password
+        elif low in _pass_names or ftype == "password":
+            data[name] = password
+        elif low in _fname_names:
+            data[name] = "Test"
+        elif low in _lname_names:
+            data[name] = "User"
+        elif ftype in ("text", "tel"):
+            data[name] = username
+    return data
+
+
+def try_self_register(base_url: str, *, timeout_s: int = 15
+                      ) -> tuple[str, str, str] | None:
+    """Attempt to self-register on the target app.
+    Returns (login_url, username, password) on success, None on failure."""
+    import secrets
+    try:
+        import requests  # type: ignore
+    except Exception:
+        return None
+
+    username = f"vapttest{secrets.token_hex(4)}"
+    password = f"VaptT3st!{secrets.token_hex(4)}"
+    base = base_url.rstrip("/")
+
+    try:
+        sess = requests.Session()
+        for path in _REG_PATH_HINTS:
+            reg_url = base + path
+            try:
+                r = sess.get(reg_url, timeout=timeout_s, allow_redirects=True)
+            except Exception:
+                continue
+            if r.status_code != 200:
+                continue
+            result = _detect_register_form(r.text, r.url)
+            if not result:
+                continue
+            action, fields = result
+            # Pull hidden field values from the actual page
+            hidden_vals: dict[str, str] = {}
+            for m in _REG_FIELD_RE.finditer(r.text):
+                nm = (m.group(1) or m.group(4) or "").strip()
+                tp = (m.group(2) or m.group(3) or "").lower().strip()
+                if nm and tp == "hidden":
+                    vm = re.search(
+                        rf"""<input\b[^>]*?\bname\s*=\s*["']{re.escape(nm)}["'][^>]*?\bvalue\s*=\s*["']([^"']*)["']""",
+                        r.text, re.IGNORECASE)
+                    hidden_vals[nm] = vm.group(1) if vm else ""
+            data = _guess_field_values(fields, username, password)
+            data.update(hidden_vals)
+            if not data:
+                continue
+            # POST the registration
+            try:
+                resp = sess.post(action, data=data, timeout=timeout_s,
+                                 allow_redirects=True)
+            except Exception:
+                continue
+            # Registration succeeded if: redirect to non-register page, or
+            # 200/201 without error messages
+            _ERR_RE = re.compile(
+                r"already\s+exists|already\s+taken|already\s+registered"
+                r"|invalid|error|failed|please\s+try\s+again",
+                re.IGNORECASE)
+            if resp.status_code in (200, 201, 302, 303):
+                if _ERR_RE.search(resp.text or ""):
+                    continue
+                # Try to find the login URL from the same base
+                _login_paths = ("/auth/login", "/login", "/signin",
+                                "/sign-in", "/account/login", "/users/sign_in")
+                for lp in _login_paths:
+                    login_url = base + lp
+                    cookie = obtain_session_cookie(login_url, username, password,
+                                                   timeout_s=timeout_s)
+                    if cookie:
+                        return login_url, username, password
+                # Also try email-based login
+                cookie = obtain_session_cookie(
+                    login_url, f"{username}@test.local", password,
+                    timeout_s=timeout_s)
+                if cookie:
+                    return login_url, f"{username}@test.local", password
+    except Exception:
+        pass
+    return None

@@ -1937,6 +1937,7 @@ _PROOF_SOURCE_TOOLS = {"sstimap", "web_param_probe", "dalfox", "idor_probe",
                        "weak_cred_probe",
                        "xxe_probe",
                        "nosqli_probe", "session_probe", "csrf_probe", "pii_probe",
+                       "auth_bypass_probe",
                        "recon_agent.body_scanner"}
 
 # ---------------------------------------------------------------------------

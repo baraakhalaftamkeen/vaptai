@@ -313,7 +313,10 @@ def _build_nuclei_dast(args: dict) -> list[str]:
     # Only in-scope http(s) seed URLs for THIS host; reject option-like tokens. Bounded so the
     # argv (and the scan) stays sane on a large discovered surface.
     targets: list[str] = []
-    for s in (args.get("seeds") or []):
+    _raw_seeds = args.get("seeds") or []
+    if isinstance(_raw_seeds, str):
+        _raw_seeds = [u.strip() for u in _raw_seeds.split(",") if u.strip()]
+    for s in _raw_seeds:
         s = str(s).strip()
         if not s.lower().startswith(("http://", "https://")):
             continue
@@ -375,7 +378,11 @@ def _build_wapiti(args: dict) -> list[str]:
         argv += ["-d", str(depth)]
     # Seed extra entry-point URLs. Each must be an in-scope http(s) URL for THIS base host;
     # anything option-like or off-host is rejected (the caller also pre-filters by host).
-    for s in (args.get("seeds") or []):
+    # The LLM sometimes passes seeds as a comma-separated string instead of a list.
+    _raw_seeds = args.get("seeds") or []
+    if isinstance(_raw_seeds, str):
+        _raw_seeds = [u.strip() for u in _raw_seeds.split(",") if u.strip()]
+    for s in _raw_seeds:
         s = str(s).strip()
         if not s.lower().startswith(("http://", "https://")):
             continue
@@ -928,6 +935,56 @@ _SHIPPED_SSJS_PROBE_BIN = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))),
     "workers", "bin", "vapt-ssjs-probe",
 )
+_SHIPPED_AUTH_BYPASS_PROBE_BIN = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))),
+    "workers", "bin", "vapt-auth-bypass-probe",
+)
+
+
+def _build_auth_bypass_probe(args: dict) -> list[str]:
+    binary = os.environ.get("VAPT_AUTH_BYPASS_PROBE_BIN", _SHIPPED_AUTH_BYPASS_PROBE_BIN)
+    target = _valid_host(str(args["target"]))
+    url = str(args.get("url", "")).strip()
+    if not url.lower().startswith(("http://", "https://")):
+        raise ValueError(f"auth_bypass_probe needs full http(s) url: {url!r}")
+    _reject_option_like(url)
+    if urlparse(url).hostname != target:
+        raise ValueError(f"auth_bypass_probe url off-scope: {url!r}")
+    argv = [binary, "--target", target, "--url", url]
+    uf = str(args.get("username_field", "")).strip()
+    if uf:
+        _reject_option_like(uf)
+        if not re.fullmatch(r"[A-Za-z0-9_.\-\[\]]{1,64}", uf):
+            raise ValueError(f"invalid auth_bypass_probe username_field: {uf!r}")
+        argv += ["--username-field", uf]
+    pf = str(args.get("password_field", "")).strip()
+    if pf:
+        _reject_option_like(pf)
+        if not re.fullmatch(r"[A-Za-z0-9_.\-\[\]]{1,64}", pf):
+            raise ValueError(f"invalid auth_bypass_probe password_field: {pf!r}")
+        argv += ["--password-field", pf]
+    extras = str(args.get("extra_fields", "")).strip()
+    if extras:
+        _reject_option_like(extras)
+        for _pair in extras.split(","):
+            _pair = _pair.strip()
+            if not _pair:
+                continue
+            if "=" not in _pair:
+                raise ValueError(f"invalid auth_bypass_probe extras: {extras!r}")
+            _k, _, _v = _pair.partition("=")
+            if not re.fullmatch(r"[A-Za-z0-9_.\-\[\]]{1,64}", _k.strip()):
+                raise ValueError(f"invalid auth_bypass_probe extras key: {_k!r}")
+        argv += ["--extra-fields", extras]
+    authed = str(args.get("authed_endpoints", "")).strip()
+    if authed:
+        _reject_option_like(authed)
+        for _ep in authed.split(","):
+            _ep = _ep.strip()
+            if _ep and not _ep.lower().startswith(("http://", "https://")):
+                raise ValueError(f"auth_bypass_probe authed endpoint not http(s): {_ep!r}")
+        argv += ["--authed-endpoints", authed]
+    return argv
 
 
 def _build_nosqli_probe(args: dict) -> list[str]:
@@ -1504,6 +1561,7 @@ def _build_dalfox(args: dict) -> list[str]:
     _reject_option_like(url)
     if urlparse(url).hostname != target:
         raise ValueError(f"dalfox url off-scope: {url!r}")
+    _payload_file = os.path.join(os.path.dirname(__file__), "data", "xss_bypass.txt")
     argv = [binary, "url", url, "--format", "json", "--no-color",
             # NOTE: `--silence` was removed in v1.1 — in dalfox 2.13.0 it suppresses the
             # per-request progress AND can suppress JSON output on fast exits (verified
@@ -1513,7 +1571,10 @@ def _build_dalfox(args: dict) -> list[str]:
             # Keep output focused: PoCs for verified + reflected hits only. Dalfox's "grep"
             # tier is lower-signal noise (regex matches in response bodies) and would
             # overload the normalizer with ambiguous observations.
-            "--only-poc", "r,v",
+            "--only-poc", "r,v",]
+    if os.path.isfile(_payload_file):
+        argv += ["--custom-payload", _payload_file]
+    argv += [
             # Follow redirects — DineHub routes return 302 to /auth/login on a logged-out
             # session; the login-cookie path below makes it unnecessary, but following them
             # also catches reflected sinks in the redirect target.
@@ -1897,6 +1958,21 @@ REGISTRY.register(
                     "phpLiteAdmin admin/admin) against a known HTTP "
                     "login form. Confirms a default-cred bug without "
                     "a full brute-force sweep. Bounded, argv-only, P2.",
+    )
+)
+REGISTRY.register(
+    ToolSpec(
+        id="auth_bypass_probe",
+        version="1.0",
+        policy_class=PolicyClass.P2_INTRUSIVE,
+        allowed_agents=[AgentRole.SCAN, AgentRole.ATTACK],
+        supported_modes=["black_box", "gray_box", "white_box"],
+        build_argv=_build_auth_bypass_probe,
+        timeout_s=150,
+        description="Authentication bypass probe — tests login forms for "
+                    "PHP type juggling (magic hashes), tautology bypasses, "
+                    "and forced browsing to auth-gated endpoints. Catches "
+                    "logic-layer auth bugs that SQLi and default-cred probes miss.",
     )
 )
 REGISTRY.register(

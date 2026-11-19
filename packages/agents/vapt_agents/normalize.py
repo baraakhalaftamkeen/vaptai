@@ -40,7 +40,7 @@ def normalize(tool_id: str, result_observations: list[dict]) -> list[Observation
         return _nmap(text)
     if tool_id in ("http_probe",):
         return _httpx(text)
-    if tool_id in ("nuclei_safe", "nuclei_intrusive"):
+    if tool_id in ("nuclei_safe", "nuclei_intrusive", "nuclei_dast"):
         return _nuclei(text)
     if tool_id == "tls_check":
         return _tls(text)
@@ -132,7 +132,7 @@ def normalize(tool_id: str, result_observations: list[dict]) -> list[Observation
         return _xxe_probe(text)
     if tool_id == "dom_xss_probe":
         return _dom_xss_probe(text)
-    if tool_id in ("nosqli_probe", "session_probe", "csrf_probe", "pii_probe", "ssjs_probe"):
+    if tool_id in ("nosqli_probe", "session_probe", "csrf_probe", "pii_probe", "ssjs_probe", "auth_bypass_probe"):
         return _json_findings_probe(text, tool_id)
     if tool_id == "wafw00f":
         return _wafw00f_scan(text)
