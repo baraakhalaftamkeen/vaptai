@@ -1402,13 +1402,21 @@ def poc_args_for(db: Session, finding_id: str) -> dict:
     return {"scheme": "http"}  # non-HTTP finding: evidence against the base web service
 
 
+_HTTP_SOURCE_TOOLS = frozenset({
+    "http_probe", "nuclei_dast", "nuclei_cve", "wapiti_scan", "feroxbuster",
+    "katana_crawl", "arjun", "sqli_detect", "auth_bypass_probe", "nikto",
+    "whatweb", "curl_probe", "xss_detect", "ssrf_detect", "ssti_detect",
+})
+
+
 def _is_http_finding(db: Session, finding_id: str) -> bool:
-    """A finding that represents an HTTP service (probed by http_probe) — the only kind
-    the HTTP evidence / screenshot playbooks can meaningfully act on."""
+    """A finding that relates to an HTTP service — discovered or confirmed by any
+    web-scanning tool, not only http_probe. The HTTP evidence / screenshot playbooks
+    can meaningfully act on these."""
     obs = db.execute(
         select(FindingObservation).where(FindingObservation.finding_id == finding_id)
     ).scalars().all()
-    return any(o.source_tool == "http_probe" for o in obs)
+    return any(o.source_tool in _HTTP_SOURCE_TOOLS for o in obs)
 
 
 # Playbooks whose PoC only makes sense against an HTTP service.

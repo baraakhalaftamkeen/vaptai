@@ -470,7 +470,8 @@ def build_engagement_graph(
                                 if _ap and _ap not in ("80", "443"):
                                     _bb_bases.append(f"http://{_t}:{_ap}")
                     for _bb_base in _bb_bases:
-                        reg_result = web_login.try_self_register(_bb_base, timeout_s=10)
+                        reg_result = web_login.try_self_register(
+                            _bb_base, timeout_s=10, gateway=gateway)
                         if reg_result:
                             _login_url, _reg_user, _reg_pw = reg_result
                             _bb_cookie = web_login.obtain_session_cookie(
@@ -5959,9 +5960,10 @@ def build_engagement_graph(
             discovered login_url), cache the resulting session cookie in Redis, and return
             it. Idempotent — subsequent calls return the cached value until it expires or
             the webvuln phase ends. None → unauthenticated scan (same as today).
-            Black-box engagements always return None."""
+            Black-box engagements return the self-registered cookie if one was
+            cached during intake, but skip the credential-based login flow."""
             if scope.testing_mode == TestingMode.BLACK_BOX:
-                return None
+                return web_credentials.get_web_cookie(scope.run_id)
             cached = web_credentials.get_web_cookie(scope.run_id)
             if cached:
                 import time as _time_ck

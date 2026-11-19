@@ -258,17 +258,100 @@ _REG_PATH_HINTS = (
     "/create-account", "/join",
 )
 
+_LOGIN_PATH_HINTS = (
+    "/auth/login", "/login", "/signin", "/sign-in",
+    "/account/login", "/users/sign_in", "/",
+)
+
 _REG_FIELD_RE = re.compile(
     r"""<input\b[^>]*?\bname\s*=\s*["']([^"']+)["'][^>]*?\btype\s*=\s*["']([^"']+)["']"""
     r"""|<input\b[^>]*?\btype\s*=\s*["']([^"']+)["'][^>]*?\bname\s*=\s*["']([^"']+)["']""",
     re.IGNORECASE,
 )
 
+_REG_KEYWORDS = frozenset({
+    "register", "signup", "sign-up", "sign_up", "create-account",
+    "create_account", "join", "new-account", "new_account", "enroll",
+})
+
+_REG_ERR_RE = re.compile(
+    r"already\s+exists|already\s+taken|already\s+registered"
+    r"|invalid|error|failed|please\s+try\s+again",
+    re.IGNORECASE,
+)
+
+_SELECT_RE = re.compile(
+    r'<select\b[^>]*?\bname\s*=\s*["\']([^"\']+)["\'][^>]*>(.*?)</select>',
+    re.IGNORECASE | re.DOTALL,
+)
+_OPTION_VAL_RE = re.compile(
+    r'<option\b[^>]*?\bvalue\s*=\s*["\']([^"\']*)["\']', re.IGNORECASE,
+)
+
+
+def _discover_registration_urls(sess, base_url: str, timeout_s: int) -> list[str]:
+    """Crawl the target's homepage and login page to discover registration links.
+    Looks for <a href="..."> where the href or the anchor text contains registration
+    keywords. Returns a de-duplicated list of absolute URLs in discovery order."""
+    urls: list[str] = []
+    seen: set[str] = set()
+    base_host = urlparse(base_url).hostname
+
+    _ANCHOR_RE = re.compile(
+        r'<a\b[^>]*\bhref\s*=\s*["\']([^"\']*)["\'][^>]*>(.*?)</a>',
+        re.IGNORECASE | re.DOTALL,
+    )
+
+    pages = [base_url + "/"]
+    for lp in ("/login", "/auth/login", "/signin"):
+        pages.append(base_url + lp)
+
+    for page_url in pages:
+        try:
+            r = sess.get(page_url, timeout=timeout_s, allow_redirects=True)
+            if r.status_code != 200:
+                continue
+        except Exception:
+            continue
+        for m in _ANCHOR_RE.finditer(r.text):
+            href = m.group(1).strip()
+            text = re.sub(r'<[^>]+>', '', m.group(2)).strip().lower()
+            if not href or href.startswith(('#', 'javascript:')):
+                continue
+            href_low = href.lower()
+            hit = (any(kw in href_low for kw in _REG_KEYWORDS)
+                   or any(kw.replace('-', ' ').replace('_', ' ') in text
+                          for kw in _REG_KEYWORDS))
+            if not hit:
+                continue
+            full = urljoin(r.url, href)
+            if urlparse(full).hostname != base_host:
+                continue
+            if full not in seen:
+                urls.append(full)
+                seen.add(full)
+    return urls
+
 
 def _detect_register_form(html: str, page_url: str
                           ) -> tuple[str, dict[str, str]] | None:
     """Parse a registration page for form action + field names.
+    Requires at least one password field and 2+ visible fields.
     Returns (action_url, {field_name: field_type}) or None."""
+    return _detect_form(html, page_url, require_password=True, min_fields=2)
+
+
+def _detect_any_form(html: str, page_url: str
+                     ) -> tuple[str, dict[str, str]] | None:
+    """Relaxed form detector for multi-step registration (later steps may lack
+    a password field). Requires at least 1 visible field."""
+    return _detect_form(html, page_url, require_password=False, min_fields=1)
+
+
+def _detect_form(html: str, page_url: str, *,
+                 require_password: bool, min_fields: int
+                 ) -> tuple[str, dict[str, str]] | None:
+    """Core form parser shared by the strict and relaxed detectors."""
     if not html:
         return None
     fields: dict[str, str] = {}
@@ -281,10 +364,18 @@ def _detect_register_form(html: str, page_url: str
         fields[name] = itype
         if itype == "password":
             has_password = True
-    if not has_password or len(fields) < 2:
+    # Also pick up <select> elements (dropdowns like "is_premium", "role", etc.)
+    for sm in _SELECT_RE.finditer(html):
+        sel_name = sm.group(1).strip()
+        if sel_name and sel_name not in fields:
+            fields[sel_name] = "select"
+    if require_password and not has_password:
+        return None
+    visible = {k: v for k, v in fields.items() if v != "hidden"}
+    if len(visible) < min_fields:
         return None
     action = _detect_form_action(html, page_url)
-    hidden = {}
+    hidden: dict[str, str] = {}
     for m in _REG_FIELD_RE.finditer(html):
         name = (m.group(1) or m.group(4) or "").strip()
         itype = (m.group(2) or m.group(3) or "").lower().strip()
@@ -297,9 +388,10 @@ def _detect_register_form(html: str, page_url: str
     return action, fields
 
 
-def _guess_field_values(fields: dict[str, str], username: str, password: str
-                        ) -> dict[str, str]:
-    """Map detected field names to plausible registration values."""
+def _guess_field_values(fields: dict[str, str], username: str, password: str,
+                        html: str = "") -> dict[str, str]:
+    """Map detected field names to plausible registration values.
+    Handles inputs, selects, checkboxes, and radio buttons."""
     data: dict[str, str] = {}
     _user_names = {"username", "user", "login", "name", "user_name", "uname"}
     _email_names = {"email", "e-mail", "mail", "email_address", "user_email"}
@@ -313,7 +405,7 @@ def _guess_field_values(fields: dict[str, str], username: str, password: str
         low = name.lower().replace("-", "_")
         if ftype == "hidden":
             continue
-        if low in _user_names or ftype == "text" and "user" in low:
+        if low in _user_names or (ftype == "text" and "user" in low):
             data[name] = username
         elif low in _email_names or ftype == "email":
             data[name] = f"{username}@test.local"
@@ -325,15 +417,181 @@ def _guess_field_values(fields: dict[str, str], username: str, password: str
             data[name] = "Test"
         elif low in _lname_names:
             data[name] = "User"
+        elif ftype == "checkbox":
+            data[name] = "on"
+        elif ftype == "select":
+            # Pick first non-empty option value from the HTML
+            first_val = _first_select_option(html, name)
+            data[name] = first_val if first_val else "1"
         elif ftype in ("text", "tel"):
             data[name] = username
+        elif ftype == "number":
+            data[name] = "1"
     return data
 
 
-def try_self_register(base_url: str, *, timeout_s: int = 15
-                      ) -> tuple[str, str, str] | None:
-    """Attempt to self-register on the target app.
+def _first_select_option(html: str, field_name: str) -> str:
+    """Extract the first non-empty <option value> for a <select name=field_name>."""
+    for sm in _SELECT_RE.finditer(html):
+        if sm.group(1).strip() == field_name:
+            for om in _OPTION_VAL_RE.finditer(sm.group(2)):
+                val = om.group(1).strip()
+                if val:
+                    return val
+    return ""
+
+
+def _llm_map_fields(gateway, html: str, fields: dict[str, str],
+                     username: str, password: str) -> dict[str, str] | None:
+    """Use the LLM gateway to map form fields to registration values when
+    heuristic mapping covers fewer than half the visible fields. Returns a
+    field→value dict or None on failure. The gateway parameter is optional —
+    callers that don't have an LLM gateway pass None and this is never called."""
+    import json as _json
+    try:
+        visible = {k: v for k, v in fields.items() if v != "hidden"}
+        form_area = html[:3000] if html else ""
+
+        prompt = (
+            "You are helping fill a web registration form to create a test account.\n"
+            f"Form fields (name → type): {_json.dumps(visible)}\n\n"
+            f"HTML context (first 3000 chars):\n{form_area}\n\n"
+            "Map each field to a value for a test account:\n"
+            f"- Username/login → \"{username}\"\n"
+            f"- Email → \"{username}@test.local\"\n"
+            f"- Password → \"{password}\"\n"
+            "- First name → \"Test\", Last name → \"User\"\n"
+            "- Phone → \"5551234567\"\n"
+            "- Checkbox/boolean → \"on\" or \"true\"\n"
+            "- Select/dropdown → first non-empty option value\n"
+            "- Other → reasonable test value\n\n"
+            "Return ONLY a JSON object mapping field names to string values."
+        )
+        resp = gateway.invoke(
+            "fast",
+            [{"role": "user", "content": prompt}],
+            output_schema={
+                "type": "object",
+                "additionalProperties": {"type": "string"},
+            },
+        )
+        if resp.parsed and isinstance(resp.parsed, dict):
+            return {k: str(v) for k, v in resp.parsed.items()}
+    except Exception:
+        pass
+    return None
+
+
+def _try_register_at_url(sess, reg_url: str, base: str,
+                          username: str, password: str, timeout_s: int,
+                          gateway=None, max_steps: int = 5
+                          ) -> tuple[str, str, str] | None:
+    """Attempt registration at a single URL, handling multi-step flows.
     Returns (login_url, username, password) on success, None on failure."""
+    try:
+        r = sess.get(reg_url, timeout=timeout_s, allow_redirects=True)
+    except Exception:
+        return None
+    if r.status_code != 200:
+        return None
+
+    current_url = r.url
+    current_html = r.text
+
+    for step in range(max_steps):
+        if step == 0:
+            form_result = _detect_register_form(current_html, current_url)
+        else:
+            form_result = _detect_any_form(current_html, current_url)
+        if not form_result:
+            if step > 0:
+                break
+            return None
+
+        action, fields = form_result
+        data = _guess_field_values(fields, username, password, html=current_html)
+
+        # LLM fallback: when heuristics mapped fewer than half the visible fields
+        visible_count = sum(1 for v in fields.values() if v != "hidden")
+        if gateway and visible_count > 0 and len(data) < (visible_count + 1) // 2:
+            llm_data = _llm_map_fields(gateway, current_html, fields,
+                                        username, password)
+            if llm_data:
+                for k, v in llm_data.items():
+                    if k not in data and k in fields:
+                        data[k] = v
+
+        # Merge hidden fields
+        for m in _REG_FIELD_RE.finditer(current_html):
+            nm = (m.group(1) or m.group(4) or "").strip()
+            tp = (m.group(2) or m.group(3) or "").lower().strip()
+            if nm and tp == "hidden":
+                vm = re.search(
+                    rf"""<input\b[^>]*?\bname\s*=\s*["']{re.escape(nm)}["'][^>]*?\bvalue\s*=\s*["']([^"']*)["']""",
+                    current_html, re.IGNORECASE)
+                data[nm] = vm.group(1) if vm else ""
+
+        if not data:
+            break
+
+        try:
+            resp = sess.post(action, data=data, timeout=timeout_s,
+                             allow_redirects=True)
+        except Exception:
+            break
+
+        if resp.status_code not in (200, 201, 302, 303):
+            break
+        if _REG_ERR_RE.search(resp.text or ""):
+            break
+
+        # Multi-step: if the response has another form on a different URL, continue
+        if resp.url != current_url:
+            next_form = (_detect_register_form(resp.text, resp.url)
+                         or _detect_any_form(resp.text, resp.url))
+            if next_form:
+                current_url = resp.url
+                current_html = resp.text
+                continue
+
+        # Registration appears complete — try to log in
+        return _try_login_after_register(base, username, password, timeout_s)
+
+    # Exhausted steps but may still have registered — try login
+    return _try_login_after_register(base, username, password, timeout_s)
+
+
+def _try_login_after_register(base: str, username: str, password: str,
+                               timeout_s: int) -> tuple[str, str, str] | None:
+    """After a registration attempt, try logging in with common login paths."""
+    for lp in _LOGIN_PATH_HINTS:
+        login_url = base + lp
+        cookie = obtain_session_cookie(login_url, username, password,
+                                       timeout_s=timeout_s)
+        if cookie:
+            return login_url, username, password
+    # Also try email-based login
+    for lp in _LOGIN_PATH_HINTS:
+        login_url = base + lp
+        cookie = obtain_session_cookie(login_url, f"{username}@test.local",
+                                       password, timeout_s=timeout_s)
+        if cookie:
+            return login_url, f"{username}@test.local", password
+    return None
+
+
+def try_self_register(base_url: str, *, timeout_s: int = 15,
+                      gateway=None) -> tuple[str, str, str] | None:
+    """Attempt to self-register on the target app.
+
+    Discovery strategy:
+    1. Crawl the homepage + login page for links containing registration keywords
+    2. Probe well-known registration paths as fallback
+    3. For each discovered URL, attempt multi-step registration with heuristic
+       field mapping (and optional LLM fallback via gateway).
+
+    Returns (login_url, username, password) on success, None on failure.
+    """
     import secrets
     try:
         import requests  # type: ignore
@@ -346,62 +604,24 @@ def try_self_register(base_url: str, *, timeout_s: int = 15
 
     try:
         sess = requests.Session()
+
+        # Phase 1: discover registration URLs from crawled links
+        reg_urls = _discover_registration_urls(sess, base, timeout_s)
+
+        # Phase 2: append well-known paths that weren't already found
+        seen = set(reg_urls)
         for path in _REG_PATH_HINTS:
-            reg_url = base + path
-            try:
-                r = sess.get(reg_url, timeout=timeout_s, allow_redirects=True)
-            except Exception:
-                continue
-            if r.status_code != 200:
-                continue
-            result = _detect_register_form(r.text, r.url)
-            if not result:
-                continue
-            action, fields = result
-            # Pull hidden field values from the actual page
-            hidden_vals: dict[str, str] = {}
-            for m in _REG_FIELD_RE.finditer(r.text):
-                nm = (m.group(1) or m.group(4) or "").strip()
-                tp = (m.group(2) or m.group(3) or "").lower().strip()
-                if nm and tp == "hidden":
-                    vm = re.search(
-                        rf"""<input\b[^>]*?\bname\s*=\s*["']{re.escape(nm)}["'][^>]*?\bvalue\s*=\s*["']([^"']*)["']""",
-                        r.text, re.IGNORECASE)
-                    hidden_vals[nm] = vm.group(1) if vm else ""
-            data = _guess_field_values(fields, username, password)
-            data.update(hidden_vals)
-            if not data:
-                continue
-            # POST the registration
-            try:
-                resp = sess.post(action, data=data, timeout=timeout_s,
-                                 allow_redirects=True)
-            except Exception:
-                continue
-            # Registration succeeded if: redirect to non-register page, or
-            # 200/201 without error messages
-            _ERR_RE = re.compile(
-                r"already\s+exists|already\s+taken|already\s+registered"
-                r"|invalid|error|failed|please\s+try\s+again",
-                re.IGNORECASE)
-            if resp.status_code in (200, 201, 302, 303):
-                if _ERR_RE.search(resp.text or ""):
-                    continue
-                # Try to find the login URL from the same base
-                _login_paths = ("/auth/login", "/login", "/signin",
-                                "/sign-in", "/account/login", "/users/sign_in")
-                for lp in _login_paths:
-                    login_url = base + lp
-                    cookie = obtain_session_cookie(login_url, username, password,
-                                                   timeout_s=timeout_s)
-                    if cookie:
-                        return login_url, username, password
-                # Also try email-based login
-                cookie = obtain_session_cookie(
-                    login_url, f"{username}@test.local", password,
-                    timeout_s=timeout_s)
-                if cookie:
-                    return login_url, f"{username}@test.local", password
+            url = base + path
+            if url not in seen:
+                reg_urls.append(url)
+                seen.add(url)
+
+        # Phase 3: try each URL with multi-step registration
+        for reg_url in reg_urls:
+            result = _try_register_at_url(sess, reg_url, base, username,
+                                           password, timeout_s, gateway=gateway)
+            if result:
+                return result
     except Exception:
         pass
     return None
