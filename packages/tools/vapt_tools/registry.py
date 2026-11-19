@@ -759,6 +759,14 @@ def _build_sstimap(args: dict) -> list[str]:
         if not re.fullmatch(r"[A-Za-z0-9_.\-\[\]]+=[^&\s]+(?:&[A-Za-z0-9_.\-\[\]]+=[^&\s]+)*", data):
             raise ValueError(f"sstimap data must be k=v[&k=v...]: {data!r}")
         argv += ["-d", data]
+    # Extra cookies (e.g. CSRF tokens for Django/Rails forms). Each entry is
+    # "name=value"; validated the same as the web-login cookie below.
+    extra_cookie = str(args.get("cookie", "")).strip()
+    if extra_cookie:
+        _reject_option_like(extra_cookie)
+        if not re.fullmatch(r"[A-Za-z0-9_.\-]+=\S+", extra_cookie):
+            raise ValueError(f"sstimap cookie must be name=value: {extra_cookie!r}")
+        argv += ["-C", extra_cookie]
     # Authenticated detection via the webvuln session cookie (same mechanism as the other
     # web tools). sstimap uses `-C name=value` (single value, not a cookie file).
     _c = _web_login_cookie()

@@ -459,19 +459,29 @@ def build_engagement_graph(
                     _bb_bases: list[str] = []
                     _t = scope.target
                     from urllib.parse import urlparse as _up_bb
+                    # Prefer the URL that the reachability probe already confirmed
+                    _probe_url = (probe_detail.get("url") or "") if reachable else ""
+                    if _probe_url and "://" in _probe_url:
+                        _bb_bases.append(_probe_url.rstrip("/"))
                     _p_bb = _up_bb(_t) if "://" in _t else None
                     if _p_bb and _p_bb.scheme:
-                        _bb_bases = [_t.rstrip("/")]
+                        if _t.rstrip("/") not in _bb_bases:
+                            _bb_bases.append(_t.rstrip("/"))
                     else:
-                        _bb_bases = [f"http://{_t}", f"https://{_t}"]
+                        for _cand in [f"http://{_t}", f"https://{_t}"]:
+                            if _cand not in _bb_bases:
+                                _bb_bases.append(_cand)
                         if scope.allowed_ports:
                             for _ap in scope.allowed_ports.split(","):
                                 _ap = _ap.strip()
                                 if _ap and _ap not in ("80", "443"):
-                                    _bb_bases.append(f"http://{_t}:{_ap}")
+                                    _cand_p = f"http://{_t}:{_ap}"
+                                    if _cand_p not in _bb_bases:
+                                        _bb_bases.append(_cand_p)
+                    log.append(f"intake: self-reg bases={_bb_bases}")
                     for _bb_base in _bb_bases:
                         reg_result = web_login.try_self_register(
-                            _bb_base, timeout_s=10, gateway=gateway)
+                            _bb_base, timeout_s=5, gateway=gateway)
                         if reg_result:
                             _login_url, _reg_user, _reg_pw = reg_result
                             _bb_cookie = web_login.obtain_session_cookie(
@@ -488,6 +498,50 @@ def build_engagement_graph(
                                                      "note": "black-box self-registration succeeded"})
                                 log.append(f"intake: black-box self-registration OK "
                                            f"via {_login_url} (user: {_reg_user})")
+                                _reg_urls_by_run[scope.run_id] = (
+                                    web_login.get_last_registration_urls())
+                                # Probe registration forms for multi-step SSTI
+                                try:
+                                    _ssti_hit = web_login.probe_registration_ssti(
+                                        _bb_base,
+                                        _reg_urls_by_run[scope.run_id],
+                                        timeout_s=8)
+                                    if _ssti_hit:
+                                        from vapt_persistence.models import (
+                                            Finding as _F, FindingObservation as _FO)
+                                        _ssti_title = (
+                                            f"ssti_detect: ssti at "
+                                            f"{_ssti_hit['injection_url']} "
+                                            f"(param name)")
+                                        _sf = _F(
+                                            run_id=scope.run_id,
+                                            title=_ssti_title,
+                                            status="confirmed",
+                                            severity="critical",
+                                            description=(
+                                                "Multi-step SSTI: template "
+                                                "expression injected via "
+                                                "registration form is rendered "
+                                                "by a server-side template engine"),
+                                        )
+                                        db.add(_sf)
+                                        db.flush()
+                                        db.add(_FO(
+                                            finding_id=_sf.id,
+                                            source_tool="ssti_detect",
+                                            detail=_ssti_hit))
+                                        db.flush()
+                                        ledger.record_event(
+                                            db, scope.run_id,
+                                            "finding.confirmed",
+                                            {"finding_id": _sf.id,
+                                             "title": _ssti_title,
+                                             "severity": "critical",
+                                             "source": "ssti_detect"})
+                                        log.append("intake: multi-step SSTI "
+                                                   "detected in registration flow")
+                                except Exception:
+                                    pass
                                 break
                         if _bb_cookie:
                             break
@@ -1620,6 +1674,9 @@ def build_engagement_graph(
     # planner reads this and emits probes with real sink field names (replaces the
     # old hardcoded (path, field) tiers).
     _form_map_by_run: dict[str, list] = {}
+    # Registration URLs discovered during self-registration (may not be linked
+    # from anywhere on the site — feed them into SSTI/injection scans).
+    _reg_urls_by_run: dict[str, list[str]] = {}
     # Reactive-wave cache. The second LLM invocation (Stage 2) reads findings +
     # probe traces from the first wave and proposes a targeted follow-up. Fires
     # at most once per run, and only when enough signal exists to react to
@@ -3639,8 +3696,11 @@ def build_engagement_graph(
             # the GET URL alone misses them. We read wapiti's own observed method from the
             # finding detail: POST → -d body; GET → ?param=1 in the URL.
             if method == "POST":
+                import secrets as _sec_t1
+                _csrf_tok_t1 = _sec_t1.token_hex(32)
                 ssti_args: dict = {"target": scope.target, "url": route,
-                                   "data": f"{param}=1"}
+                                   "data": f"{param}=1&csrfmiddlewaretoken={_csrf_tok_t1}",
+                                   "cookie": f"csrftoken={_csrf_tok_t1}"}
             else:
                 sep = "&" if "?" in route else "?"
                 ssti_args = {"target": scope.target, "url": f"{route}{sep}{param}=1"}
@@ -3714,10 +3774,18 @@ def build_engagement_graph(
                 # keeps the heuristic consistent with the dalfox + web_param_probe
                 # POST tiers. sstimap's `data` arg triggers POST mode (sstimap -d k=v).
                 if phases.is_post_sink_route(_ep):
+                    # Include a CSRF token so Django/Rails POST forms accept
+                    # the probe. The token value just needs to match between
+                    # the cookie and the body field.
+                    import secrets as _sec_t2
+                    _csrf_tok_t2 = _sec_t2.token_hex(32)
+                    _ssti_data_csrf = (_ssti_data
+                                       + f"&csrfmiddlewaretoken={_csrf_tok_t2}")
                     _ssti_args_t2: dict = {
                         "target": scope.target,
                         "url": _ep,
-                        "data": _ssti_data,
+                        "data": _ssti_data_csrf,
+                        "cookie": f"csrftoken={_csrf_tok_t2}",
                     }
                 else:
                     _sep = "&" if "?" in _ep else "?"
@@ -3733,59 +3801,103 @@ def build_engagement_graph(
                 _ssti_seen_routes.add(_ep)
                 ssti_idx += 1
 
-        # Fix 3 (2026-10-27) — form_map-driven aggressive SSTI retry tier.
-        # SSTI detection on Jinja2 forms is NONDETERMINISTIC run-to-run:
-        # /admin/offer catches reliably at level=2, but /admin/announcement
-        # missed in one of two consecutive runs with the same probe. sstimap's
-        # default --level=2 iterates every parameter but uses a bounded payload
-        # set; level=5 (max) adds more variants per param + longer rendering
-        # timeouts that catch filter-chain-protected renders (e.g. `{{ x|safe }}`
-        # on /admin/announcement). For every form_map endpoint with a textarea
-        # field on a Jinja2-fingerprinted stack, dispatch a secondary ssti_detect
-        # with level=5. Bounded by its own budget (4) so a chatty form_map can't
-        # blow the plan size.
-        if ssti_engine and ssti_engine.lower() in ("jinja2", "twig", "mako",
-                                                     "freemarker", "velocity"):
-            _form_map = _form_map_by_run.get(scope.run_id, []) or []
-            _retry_seen: set[tuple] = set()
-            # Bumped 4 → 8 (2026-10-28). Apps with multiple admin textarea
-            # forms (e.g. an admin CMS with content/announcement/footer/
-            # settings pages) have more Jinja2 sinks than 4; capping low
-            # starved /admin/offer-shaped sinks on richer admin surfaces.
-            _retry_budget = 8
-            for _em in _form_map:
+        # Fix 3 (2026-10-27, broadened 2026-11-19) — form_map-driven SSTI tier.
+        # Dispatch ssti_detect for every form_map form whose URL matches a
+        # template-rendering sink hint AND has injectable text fields (textarea
+        # OR text input). Previously gated on a known ssti_engine and textarea-
+        # only fields — missed SSTI in text inputs on unknown-engine apps
+        # (e.g. XBEN-025 registration form with name:text on Django/Jinja2).
+        # Also handles CSRF: when the form has a hidden field whose name
+        # contains "csrf", we generate a matching token for the POST body
+        # and pass a cookie arg so Django/Rails CSRF validation accepts it.
+        _form_map = _form_map_by_run.get(scope.run_id, []) or []
+        _retry_seen: set[tuple] = set()
+        _retry_budget = 8
+        for _em in _form_map:
+            if _retry_budget <= 0:
+                break
+            for _form in _em.forms:
                 if _retry_budget <= 0:
                     break
-                for _form in _em.forms:
-                    if _retry_budget <= 0:
+                _action = _form.action or _em.url
+                # Must be on a sink-pattern URL
+                if not any(h in (_action or "").lower()
+                           for h in _SSTI_SINK_PATH_HINTS):
+                    continue
+                _injectable = [f.name for f in _form.fields
+                               if f.type in ("textarea", "text") and f.name]
+                if not _injectable:
+                    continue
+                _dedup_key = (_action, _form.method or "post",
+                               tuple(sorted(_injectable)))
+                if _dedup_key in _retry_seen:
+                    continue
+                _retry_seen.add(_dedup_key)
+                # Build POST data with all injectable fields
+                _retry_data_parts = [f"{n}=1" for n in _injectable[:5]]
+                # CSRF handling: find hidden csrf field, generate matching
+                # token for both POST body and cookie
+                _csrf_field = None
+                _csrf_cookie = None
+                for _ff in _form.fields:
+                    if _ff.type == "hidden" and "csrf" in (_ff.name or "").lower():
+                        _csrf_field = _ff.name
                         break
-                    # Only forms with a textarea field — those are the ones
-                    # sstimap's default level missed on /admin/announcement.
-                    _textareas = [f.name for f in _form.fields
-                                  if f.type == "textarea" and f.name]
-                    if not _textareas:
-                        continue
-                    _action = _form.action or _em.url
-                    _dedup_key = (_action, _form.method or "post",
-                                   tuple(sorted(_textareas)))
-                    if _dedup_key in _retry_seen:
-                        continue
-                    _retry_seen.add(_dedup_key)
-                    # Multi-param body — sstimap's level=5 iterates every field;
-                    # we include all textarea names so the retry tests whichever
-                    # one is actually the template sink.
-                    _retry_data = "&".join(f"{n}=1" for n in _textareas[:5])
-                    _retry_args = {
-                        "target": scope.target,
-                        "url": _action,
-                        "data": _retry_data,
-                        "level": "5",       # max aggressive sstimap scan
-                        "engine": ssti_engine,
-                    }
-                    plan.append(("ssti_detect", _retry_args,
-                                 f"webvuln-ssti-retry-{ssti_idx}"))
-                    ssti_idx += 1
-                    _retry_budget -= 1
+                if _csrf_field:
+                    import secrets as _sec
+                    _csrf_tok = _sec.token_hex(32)
+                    _retry_data_parts.append(f"{_csrf_field}={_csrf_tok}")
+                    _csrf_cookie = f"csrftoken={_csrf_tok}"
+                _retry_data = "&".join(_retry_data_parts)
+                _lvl = "5" if ssti_engine else "3"
+                _retry_args: dict = {
+                    "target": scope.target,
+                    "url": _action,
+                    "data": _retry_data,
+                    "level": _lvl,
+                }
+                if ssti_engine:
+                    _retry_args["engine"] = ssti_engine
+                if _csrf_cookie:
+                    _retry_args["cookie"] = _csrf_cookie
+                plan.append(("ssti_detect", _retry_args,
+                             f"webvuln-ssti-retry-{ssti_idx}"))
+                ssti_idx += 1
+                _retry_budget -= 1
+
+        # Registration-URL SSTI tier. Registration forms often live at
+        # URLs not linked from any page (hidden multi-step flows). After
+        # self-registration discovers them, probe each for SSTI since
+        # template engines commonly render user-supplied name/bio fields.
+        _reg_urls = _reg_urls_by_run.get(scope.run_id, []) or []
+        _reg_budget = 6
+        for _rurl in _reg_urls:
+            if _reg_budget <= 0 or ssti_idx >= 20:
+                break
+            if _rurl in _ssti_seen_routes:
+                continue
+            _lo_r = (_rurl or "").lower()
+            if not any(h in _lo_r for h in _SSTI_SINK_PATH_HINTS):
+                continue
+            _ssti_seen_routes.add(_rurl)
+            _reg_fields = list(_SSTI_COMMON_PARAMS)[:5]
+            _reg_data_parts = [f"{n}=1" for n in _reg_fields]
+            import secrets as _sec_reg
+            _csrf_tok_reg = _sec_reg.token_hex(32)
+            _reg_data_parts.append(
+                f"csrfmiddlewaretoken={_csrf_tok_reg}")
+            _reg_ssti_args: dict = {
+                "target": scope.target,
+                "url": _rurl,
+                "data": "&".join(_reg_data_parts),
+                "cookie": f"csrftoken={_csrf_tok_reg}",
+            }
+            if ssti_engine:
+                _reg_ssti_args["engine"] = ssti_engine
+            plan.append(("ssti_detect", _reg_ssti_args,
+                         f"webvuln-ssti-reg-{ssti_idx}"))
+            ssti_idx += 1
+            _reg_budget -= 1
 
         # (Dynamic admin coverage — formerly here as hardcoded DineHub-specific
         # tiers for /admin/config / /admin/fetch_report / /admin/import, and a

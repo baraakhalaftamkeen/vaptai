@@ -265,7 +265,8 @@ _REG_STEP_SUFFIXES = (
 
 _LOGIN_PATH_HINTS = (
     "/auth/login", "/login", "/signin", "/sign-in",
-    "/account/login", "/users/sign_in", "/",
+    "/account/login", "/accounts/login", "/accounts/signin",
+    "/users/sign_in", "/user/login", "/",
 )
 
 _REG_FIELD_RE = re.compile(
@@ -493,9 +494,12 @@ def _try_register_at_url(sess, reg_url: str, base: str,
                           ) -> tuple[str, str, str] | None:
     """Attempt registration at a single URL, handling multi-step flows.
     Returns (login_url, username, password) on success, None on failure."""
+    import logging as _log_mod
+    _lg = _log_mod.getLogger("vapt.web_login")
     try:
         r = sess.get(reg_url, timeout=timeout_s, allow_redirects=True)
-    except Exception:
+    except Exception as _ge:
+        _lg.debug("_try_register GET %s failed: %s", reg_url, _ge)
         return None
     if r.status_code != 200:
         return None
@@ -509,6 +513,7 @@ def _try_register_at_url(sess, reg_url: str, base: str,
         else:
             form_result = _detect_any_form(current_html, current_url)
         if not form_result:
+            _lg.debug("_try_register step=%d no form at %s", step, current_url)
             if step > 0:
                 break
             return None
@@ -537,17 +542,25 @@ def _try_register_at_url(sess, reg_url: str, base: str,
                 data[nm] = vm.group(1) if vm else ""
 
         if not data:
+            _lg.debug("_try_register step=%d no data for %s", step, current_url)
             break
 
         try:
             resp = sess.post(action, data=data, timeout=timeout_s,
                              allow_redirects=True)
-        except Exception:
+        except Exception as _pe:
+            _lg.debug("_try_register POST %s failed: %s", action, _pe)
             break
+
+        _lg.debug("_try_register step=%d POST %s -> %d url=%s",
+                   step, action, resp.status_code, resp.url)
 
         if resp.status_code not in (200, 201, 302, 303):
             break
         if _REG_ERR_RE.search(resp.text or ""):
+            _err_m = _REG_ERR_RE.search(resp.text or "")
+            _lg.debug("_try_register step=%d err_re matched: %s",
+                       step, _err_m.group() if _err_m else "")
             break
 
         # Multi-step: if the response has another form on a different URL, continue
@@ -560,9 +573,11 @@ def _try_register_at_url(sess, reg_url: str, base: str,
                 continue
 
         # Registration appears complete — try to log in
+        _lg.debug("_try_register complete at step=%d, trying login", step)
         return _try_login_after_register(base, username, password, timeout_s)
 
     # Exhausted steps but may still have registered — try login
+    _lg.debug("_try_register exhausted steps, trying login anyway")
     return _try_login_after_register(base, username, password, timeout_s)
 
 
@@ -585,6 +600,17 @@ def _try_login_after_register(base: str, username: str, password: str,
     return None
 
 
+_last_registration_urls: list[str] = []
+
+
+def get_last_registration_urls() -> list[str]:
+    """Return registration URLs discovered during the last successful
+    self-registration.  These are URLs that returned HTTP 200 and
+    contained a form — useful for feeding into SSTI/injection scans
+    since registration forms are often not linked from the main site."""
+    return list(_last_registration_urls)
+
+
 def try_self_register(base_url: str, *, timeout_s: int = 15,
                       gateway=None) -> tuple[str, str, str] | None:
     """Attempt to self-register on the target app.
@@ -597,6 +623,8 @@ def try_self_register(base_url: str, *, timeout_s: int = 15,
 
     Returns (login_url, username, password) on success, None on failure.
     """
+    global _last_registration_urls
+    _last_registration_urls = []
     import secrets
     try:
         import requests  # type: ignore
@@ -607,35 +635,176 @@ def try_self_register(base_url: str, *, timeout_s: int = 15,
     password = f"VaptT3st!{secrets.token_hex(4)}"
     base = base_url.rstrip("/")
 
+    import logging as _log_mod
+    _lg = _log_mod.getLogger("vapt.web_login")
     try:
         sess = requests.Session()
 
         # Phase 1: discover registration URLs from crawled links
         reg_urls = _discover_registration_urls(sess, base, timeout_s)
+        _lg.info("self_register(%s) phase1 discovered=%d urls=%s",
+                 base, len(reg_urls), reg_urls[:3])
 
-        # Phase 2: append well-known paths that weren't already found
+        # Phase 2: append well-known paths that weren't already found.
+        # Also probe step-suffixes but ONLY when the base path exists (non-404)
+        # to avoid generating 100+ URLs that waste the run budget.
         seen = set(reg_urls)
+        reachable: list[str] = []
         for path in _REG_PATH_HINTS:
             url = base + path
             if url not in seen:
                 reg_urls.append(url)
                 seen.add(url)
+            try:
+                _head = sess.head(base + path, timeout=3,
+                                  allow_redirects=True)
+                _base_exists = _head.status_code < 404
+            except Exception:
+                _base_exists = False
+            if _base_exists:
+                reachable.append(url)
+                for suffix in _REG_STEP_SUFFIXES:
+                    surl = base + path + suffix
+                    if surl not in seen:
+                        reg_urls.append(surl)
+                        seen.add(surl)
+                    try:
+                        _sh = sess.head(surl, timeout=3,
+                                        allow_redirects=True)
+                        if _sh.status_code < 404:
+                            reachable.append(surl)
+                    except Exception:
+                        pass
 
-        # Phase 2b: for each base hint, also probe step-suffixes (multi-step
-        # registration flows like /register/step1 that have no link on any page)
-        for path in _REG_PATH_HINTS:
-            for suffix in _REG_STEP_SUFFIXES:
-                url = base + path + suffix
-                if url not in seen:
-                    reg_urls.append(url)
-                    seen.add(url)
+        _lg.info("self_register(%s) phase2 total=%d reachable=%d",
+                 base, len(reg_urls), len(reachable))
 
         # Phase 3: try each URL with multi-step registration
         for reg_url in reg_urls:
             result = _try_register_at_url(sess, reg_url, base, username,
                                            password, timeout_s, gateway=gateway)
             if result:
+                _lg.info("self_register(%s) OK via %s user=%s",
+                         base, reg_url, result[1])
+                _last_registration_urls = reachable or reg_urls[:20]
                 return result
+        _lg.info("self_register(%s) all %d urls failed", base, len(reg_urls))
+    except Exception as _exc:
+        _lg.warning("self_register(%s) exception: %s", base, _exc)
+    return None
+
+
+def probe_registration_ssti(base_url: str, reg_urls: list[str] | None = None,
+                            *, timeout_s: int = 10) -> dict | None:
+    """Walk the registration flow injecting a canary template expression
+    into every text field.  Check each subsequent page for the rendered
+    result.  Returns a dict describing the finding on success, None if
+    no SSTI detected.
+
+    Works for multi-step flows where the injection point (step N) and
+    the rendering point (step N+k) are different URLs — a pattern that
+    single-request tools like sstimap cannot detect.
+    """
+    import secrets
+    try:
+        import requests as _req
     except Exception:
-        pass
+        return None
+
+    # Canary payloads for different template engines.
+    # Django: {% widthratio A 1 B %} renders A*B (math via {{}} is invalid).
+    # Jinja2/Twig: {{A*B}} renders the product directly.
+    _canaries = [
+        ("{% widthratio 7 1 7 %}", "49", "django"),
+        ("{{" + "83*97" + "}}", "8051", "jinja2"),
+    ]
+    base = base_url.rstrip("/")
+
+    urls = list(reg_urls or _last_registration_urls)
+    if not urls:
+        return None
+
+    for canary_expr, canary_result, engine_hint in _canaries:
+        for reg_url in urls:
+            try:
+                sess = _req.Session()
+                r = sess.get(reg_url, timeout=timeout_s,
+                             allow_redirects=True)
+                if r.status_code != 200:
+                    continue
+                current_url = r.url
+                current_html = r.text
+                injection_url = ""
+
+                for step in range(6):
+                    if step == 0:
+                        form_result = _detect_register_form(
+                            current_html, current_url)
+                    else:
+                        form_result = _detect_any_form(
+                            current_html, current_url)
+                    if not form_result:
+                        break
+                    action, fields = form_result
+
+                    data: dict[str, str] = {}
+                    injected = False
+                    for name, ftype in fields.items():
+                        if ftype == "hidden":
+                            vm = re.search(
+                                rf'name="{re.escape(name)}"'
+                                rf'[^>]*value="([^"]*)"',
+                                current_html, re.I)
+                            data[name] = vm.group(1) if vm else ""
+                        elif ftype in ("text", "textarea"):
+                            data[name] = canary_expr
+                            injected = True
+                        elif ftype == "email":
+                            rnd = secrets.token_hex(4)
+                            data[name] = f"ssti{rnd}@test.local"
+                        elif ftype == "password":
+                            data[name] = (
+                                f"VaptT3st!{secrets.token_hex(4)}")
+                        elif ftype in ("checkbox", "radio"):
+                            data[name] = "on"
+                        elif ftype == "select":
+                            opts = re.findall(
+                                r'<option[^>]*value="([^"]*)"',
+                                current_html, re.I)
+                            data[name] = opts[0] if opts else "1"
+                        else:
+                            data[name] = "1"
+
+                    if injected and not injection_url:
+                        injection_url = action
+
+                    try:
+                        resp = sess.post(action, data=data,
+                                         timeout=timeout_s,
+                                         allow_redirects=True)
+                    except Exception:
+                        break
+
+                    body = resp.text or ""
+                    if (canary_result in body
+                            and canary_expr not in body):
+                        return {
+                            "confirmed": True,
+                            "vuln": "ssti",
+                            "injection_url": injection_url or action,
+                            "render_url": resp.url,
+                            "engine_hint": engine_hint,
+                            "canary": (f"{canary_expr}"
+                                       f"={canary_result}"),
+                        }
+
+                    if resp.status_code not in (200, 201, 302, 303):
+                        break
+                    if resp.url != current_url:
+                        current_url = resp.url
+                        current_html = resp.text
+                        continue
+                    break
+            except Exception:
+                continue
     return None
