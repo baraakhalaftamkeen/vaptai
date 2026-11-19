@@ -258,6 +258,11 @@ _REG_PATH_HINTS = (
     "/create-account", "/join",
 )
 
+_REG_STEP_SUFFIXES = (
+    "/step1", "/step1/", "/step/1", "/1",
+    "/new", "/start", "/begin",
+)
+
 _LOGIN_PATH_HINTS = (
     "/auth/login", "/login", "/signin", "/sign-in",
     "/account/login", "/users/sign_in", "/",
@@ -615,6 +620,15 @@ def try_self_register(base_url: str, *, timeout_s: int = 15,
             if url not in seen:
                 reg_urls.append(url)
                 seen.add(url)
+
+        # Phase 2b: for each base hint, also probe step-suffixes (multi-step
+        # registration flows like /register/step1 that have no link on any page)
+        for path in _REG_PATH_HINTS:
+            for suffix in _REG_STEP_SUFFIXES:
+                url = base + path + suffix
+                if url not in seen:
+                    reg_urls.append(url)
+                    seen.add(url)
 
         # Phase 3: try each URL with multi-step registration
         for reg_url in reg_urls:

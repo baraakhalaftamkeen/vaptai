@@ -1254,11 +1254,22 @@ def build_engagement_graph(
         #   4. Hard cap at 40 arjun runs (was 12). arjun is ~10s per run with
         #      the default wordlist, so 40 × 10s = 400s worst case.
         bases: list[str] = []
+        _bases_seen_arj: set[str] = set()
         if "80" in open_ports:
             bases.append(f"http://{scope.target}")
+            _bases_seen_arj.add("80")
         for port, _svc in web:
             scheme = "https" if (port.isdigit() and int(port) in phases._TLS_PORTS) else "http"
             bases.append(f"{scheme}://{scope.target}:{port}")
+            _bases_seen_arj.add(port)
+        if scope.allowed_ports:
+            for _ap in scope.allowed_ports.split(","):
+                _ap = _ap.strip()
+                if _ap and _ap not in _bases_seen_arj and _ap not in ("80", "443"):
+                    _sch = ("https" if _ap.isdigit() and int(_ap) in
+                                        phases._TLS_PORTS else "http")
+                    bases.append(f"{_sch}://{scope.target}:{_ap}")
+                    _bases_seen_arj.add(_ap)
 
         from urllib.parse import urlparse as _up_arj
         _STATIC_EXTS = (".css", ".js", ".png", ".jpg", ".jpeg", ".gif",
@@ -2143,12 +2154,26 @@ def build_engagement_graph(
         # Build base-URL list ONCE for the next three steps.
         open_ports_local = set(phases.open_ports_from_findings(db, scope.run_id))
         bases: list[str] = []
+        _bases_seen: set[str] = set()
         if "80" in open_ports_local:
-            bases.append(f"http://{scope.target}")
+            _b80 = f"http://{scope.target}"
+            bases.append(_b80)
+            _bases_seen.add("80")
         for _p, _s in phases.web_ports_from_findings(db, scope.run_id):
             _sch = ("https" if (_p.isdigit() and int(_p) in
                                 phases._TLS_PORTS) else "http")
             bases.append(f"{_sch}://{scope.target}:{_p}")
+            _bases_seen.add(_p)
+        # Ensure scope-allowed ports are in bases even when nmap mis-fingerprints
+        # the service (e.g. port 5003 identified as "filemaker" instead of HTTP).
+        if scope.allowed_ports:
+            for _ap in scope.allowed_ports.split(","):
+                _ap = _ap.strip()
+                if _ap and _ap not in _bases_seen and _ap not in ("80", "443"):
+                    _sch = ("https" if _ap.isdigit() and int(_ap) in
+                                        phases._TLS_PORTS else "http")
+                    bases.append(f"{_sch}://{scope.target}:{_ap}")
+                    _bases_seen.add(_ap)
 
         # 2+3. Authenticated BFS crawl. Produces the admin-surface URL set the
         # unauthenticated discovery can't see; persist to DB so every downstream
@@ -2596,7 +2621,7 @@ def build_engagement_graph(
             ).scalars().all()
             execed = [r for r in execed_all
                       if r.tool_id in _WEBVULN_ONLY_TOOLS]
-            if len(execed) < 3:
+            if len(execed) < 1:
                 skip_key = f"{scope.run_id}:rx:insufficient"
                 if skip_key not in _rx_skip_logged:
                     try:
@@ -2604,7 +2629,7 @@ def build_engagement_graph(
                                             {"reason": "insufficient_signal",
                                              "webvuln_executions": len(execed),
                                              "total_executions": len(execed_all),
-                                             "note": "need ≥3 webvuln-phase executions to "
+                                             "note": "need ≥1 webvuln-phase execution to "
                                                      "react to; fires on a later iteration"})
                         _rx_skip_logged.add(skip_key)
                     except Exception:
@@ -2828,14 +2853,14 @@ def build_engagement_graph(
             ).scalars().all()
             execed_wv = [r for r in execed_wv
                           if r.tool_id in _WEBVULN_ONLY_TOOLS_AG]
-            if len(execed_wv) < 3:
+            if len(execed_wv) < 1:
                 skip_key = f"{scope.run_id}:ag:too_early"
                 if skip_key not in _rx_skip_logged:
                     try:
                         ledger.record_event(db, scope.run_id, "webvuln.recon_agent.skip",
                                             {"reason": "too_early",
                                              "webvuln_executions": len(execed_wv),
-                                             "note": "waiting for ≥3 webvuln probes to "
+                                             "note": "waiting for ≥1 webvuln probe to "
                                                      "execute before the recon agent "
                                                      "fires; this gives it real signal "
                                                      "to reason over"})
