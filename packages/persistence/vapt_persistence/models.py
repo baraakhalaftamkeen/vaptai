@@ -21,7 +21,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
 )
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 
 from .base import Base, created_column, pk_column, updated_column
 
@@ -275,6 +275,12 @@ class Finding(Base):
 
     run: Mapped[Run] = relationship(back_populates="findings")
     observations: Mapped[list[FindingObservation]] = relationship(back_populates="finding")
+
+    @validates("title")
+    def _truncate_title(self, _key: str, value: str) -> str:
+        if value and len(value) > 500:
+            return value[:497] + "..."
+        return value
 
 
 class FindingObservation(Base):

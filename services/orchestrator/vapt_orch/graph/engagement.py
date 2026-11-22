@@ -1362,6 +1362,11 @@ def build_engagement_graph(
             _clean = f"{_pu.scheme or 'http'}://{_pu.netloc}{_pu.path or '/'}"
             _arjun_urls.append(_clean)
 
+        # Union source 0: site roots — minimal apps may have no crawlable
+        # links, but the index page often reflects user input via hidden
+        # GET params (e.g. ?name=, ?q=). arjun discovers these reliably.
+        for _b in bases:
+            _consider_arjun_url(_b + "/")
         # Union source A: discovered endpoints per base (cap 40 each)
         for _b in bases:
             for _u in phases.discovered_endpoint_urls(
@@ -3899,14 +3904,45 @@ def build_engagement_graph(
             ssti_idx += 1
             _reg_budget -= 1
 
-        # (Dynamic admin coverage — formerly here as hardcoded DineHub-specific
-        # tiers for /admin/config / /admin/fetch_report / /admin/import, and a
-        # fixed table of (/admin/offer, offer) / (/admin/announcement, content)
-        # SSTI sinks. Deleted — the LLM planner now derives these dynamically
-        # from the authenticated form_map built at post-auth time: it sees the
-        # real field names + Content-Type and emits ssti_detect / xxe / SSRF
-        # probes with the correct method+field for whatever target the operator
-        # points us at, not just DineHub.)
+        # Crawl-discovered parameterized URLs — SSTI on known injection points.
+        # The crawl may find URLs like /?name=test or /render?tpl=... that
+        # already carry query parameters. These are real injection points worth
+        # testing for SSTI regardless of path hints, since the crawler proves
+        # the parameter is accepted. Budget-capped and de-duped against
+        # already-scheduled routes.
+        from urllib.parse import urlparse as _up_ssti_p, parse_qs as _pqs_ssti
+        _param_budget = 6
+        for _seed in seeds:
+            if _param_budget <= 0 or ssti_idx >= 24:
+                break
+            _sp = _up_ssti_p(_seed)
+            if not _sp.query:
+                continue
+            _seed_path = f"{_sp.scheme}://{_sp.hostname}"
+            if _sp.port:
+                _seed_path += f":{_sp.port}"
+            _seed_path += _sp.path
+            if _seed_path in _ssti_seen_routes:
+                continue
+            _ssti_seen_routes.add(_seed_path)
+            _qparams = [k for k, _ in _pqs_ssti(_sp.query, keep_blank_values=True).items()]
+            if not _qparams:
+                continue
+            _ssti_url = _seed_path
+            _sep = "?"
+            for _qp in _qparams[:5]:
+                _ssti_url += f"{_sep}{_qp}=1"
+                _sep = "&"
+            _param_ssti_args: dict = {
+                "target": scope.target,
+                "url": _ssti_url,
+            }
+            if ssti_engine:
+                _param_ssti_args["engine"] = ssti_engine
+            plan.append(("ssti_detect", _param_ssti_args,
+                         f"webvuln-ssti-param-{ssti_idx}"))
+            ssti_idx += 1
+            _param_budget -= 1
 
         # SQLi Tier-2 confirmation on wapiti's SQLi findings. Wapiti's SQLi detection
         # is NONDETERMINISTIC run-to-run (per the webvuln-discovery-pipeline memory)
@@ -4182,6 +4218,46 @@ def build_engagement_graph(
                     ))
                     sqli_idx += 1
                     _sqli_fm_budget -= 1
+
+        # (E) sqli_detect on crawl-discovered parameterized URLs — covers
+        # GET endpoints whose params came from the spider (seeds) rather
+        # than from form_map or arjun. These are frequently the injection
+        # surface on frameworks that use ORM-style lookups in query strings
+        # (e.g. Django ?field__lookup=val, Drupal ?param[key]=val, Rails
+        # ?model[attr]=val). Budget-capped to 6 to avoid blowing up.
+        from urllib.parse import urlparse as _up_sqli_p, parse_qs as _pqs_sqli
+        _sqli_crawl_budget = 6
+        for _seed in seeds:
+            if _sqli_crawl_budget <= 0 or sqli_idx >= 20:
+                break
+            _sp = _up_sqli_p(_seed)
+            if not _sp.query:
+                continue
+            _seed_path = f"{_sp.scheme}://{_sp.hostname}"
+            if _sp.port:
+                _seed_path += f":{_sp.port}"
+            _seed_path += _sp.path
+            _qparams = list(_pqs_sqli(_sp.query, keep_blank_values=True).keys())
+            if not _qparams:
+                continue
+            for _qp in _qparams[:3]:
+                if _sqli_crawl_budget <= 0 or sqli_idx >= 20:
+                    break
+                _k = (_seed_path, _qp)
+                if _k in _sqli_fm_seen or _k in _seen_auth:
+                    continue
+                _sqli_fm_seen.add(_k)
+                _sep = "&" if "?" in _seed_path else "?"
+                plan.append((
+                    "sqli_detect",
+                    {"target": scope.target,
+                     "url": f"{_seed_path}{_sep}{_qp}=1",
+                     "param": _qp,
+                     "method": "get"},
+                    f"webvuln-sqli-crawl-{sqli_idx}",
+                ))
+                sqli_idx += 1
+                _sqli_crawl_budget -= 1
 
         # (B) dalfox on FORM endpoints — iterate form_map FIRST (so admin
         # textarea forms like /admin/announcement + /admin/offer get hit
@@ -5563,6 +5639,12 @@ def build_engagement_graph(
             # Discovery for THIS base: file-sinks ranked first (unbounded within tier,
             # cap=25 safety); non-sink gets 10 slots.
             all_eps = phases.discovered_endpoint_urls(db, scope, base_url=base_url, cap=50)
+            # Always include the site root for injection probes — minimal
+            # apps may have no crawlable links, but the index page often
+            # reflects user input (search, greeting, etc.).
+            _root = base_url + "/"
+            if _root not in all_eps:
+                all_eps.insert(0, _root)
             sink_eps = [u for u in all_eps if phases.is_file_sink_route(u)]
             non_sink_eps = [u for u in all_eps if not phases.is_file_sink_route(u)][:10]
             for ep_url in (sink_eps[:25] + non_sink_eps):

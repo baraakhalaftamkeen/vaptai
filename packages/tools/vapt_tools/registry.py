@@ -282,7 +282,8 @@ def _build_nuclei(args: dict) -> list[str]:
         if not re.fullmatch(r"\d{1,5}", p) or not 0 < int(p) < 65536:
             raise ValueError(f"invalid port: {port!r}")
         url = f"{scheme}://{target}:{p}"
-    argv = ["nuclei", "-silent", "-severity", sev]
+    argv = ["nuclei", "-silent", "-no-color", "-follow-host-redirects",
+            "-severity", sev]
     _c = _web_login_cookie()
     if _c:
         argv += ["-H", f"Cookie: {_c}"]
@@ -331,7 +332,7 @@ def _build_nuclei_dast(args: dict) -> list[str]:
     # deprecated and -fuzzing-templates is NOT a valid flag — it caused exit code 2
     # on DineHub runs). -dast alone runs the full fuzzing library on seed URLs
     # (SQLi/XSS/SSTI/LFI/SSRF/open-redirect/header injection).
-    argv = [binary, "-dast", "-silent", "-severity", sev]
+    argv = [binary, "-dast", "-silent", "-no-color", "-severity", sev]
     _c = _web_login_cookie()
     if _c:
         argv += ["-H", f"Cookie: {_c}"]
@@ -392,7 +393,12 @@ def _build_wapiti(args: dict) -> list[str]:
         argv += ["--start", s]
     # Exclude logout/signout URLs so wapiti's own crawler doesn't follow a /logout link
     # and destroy the authenticated session cookie mid-scan.
-    argv += ["--exclude", r"https?://[^/]*/(?:auth/)?(?:logout|signout|sign[_-]?out|log[_-]?out)\b"]
+    # Wapiti's -x accepts simple URL substrings, NOT regex.
+    for _seg in ("logout", "signout", "sign-out", "sign_out", "log-out", "log_out"):
+        argv += ["-x", f"http://{target}/{_seg}"]
+        argv += ["-x", f"https://{target}/{_seg}"]
+        argv += ["-x", f"http://{target}/auth/{_seg}"]
+        argv += ["-x", f"https://{target}/auth/{_seg}"]
     # Hard runtime caps. Prior fully-authenticated runs on DineHub hit the 10-minute
     # subprocess timeout AT port=5000 even with --max-scan-time 300 set — the auth-crawl
     # had surfaced 34 endpoints, each module (17 of them) attacks every endpoint, and
@@ -857,7 +863,7 @@ def _build_nuclei_cve(args: dict) -> list[str]:
         if not re.fullmatch(r"\d{1,5}", p) or not 0 < int(p) < 65536:
             raise ValueError(f"invalid port: {port!r}")
         url = f"{scheme}://{target}:{p}"
-    return [binary, "-u", url, "-id", cve.lower(), "-silent", "-jsonl"]
+    return [binary, "-u", url, "-id", cve.lower(), "-silent", "-no-color", "-jsonl"]
 
 
 def _build_nessus_import(args: dict) -> list[str]:

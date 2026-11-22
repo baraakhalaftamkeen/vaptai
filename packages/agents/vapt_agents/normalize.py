@@ -350,6 +350,7 @@ _SEV = {"info": "info", "low": "low", "medium": "medium", "high": "high", "criti
 
 def _nuclei(text: str) -> list[Observation]:
     obs: list[Observation] = []
+    text = _ANSI.sub("", text)
     # nuclei -silent lines look like: [template-id] [protocol] [severity] url
     for m in re.finditer(r"\[([^\]]+)\]\s*\[[^\]]+\]\s*\[(info|low|medium|high|critical)\]\s*(\S+)", text):
         tmpl, sev, url = m.group(1), m.group(2), m.group(3)
