@@ -1,0 +1,11 @@
+{
+  "vulhub_env": "struts2/s2-045",
+  "grade": "FAIL",
+  "run_status": "..........................................................................................timeout",
+  "findings_count": 0,
+  "confirmed_count": 0,
+  "elapsed_s": 902,
+  "run_id": "56ead41d-9314-49ba-90b5-087b344c3e40",
+  "engagement_id": "295c0802-371d-4bfc-8812-3340bcb02072",
+  "timestamp": "2026-11-23T11:37:38Z"
+}

@@ -15,7 +15,7 @@ const LINKS = [
   { href: "/approvals", label: "Approvals", icon: "check" },
   { href: "/tools", label: "Tools", icon: "wrench" },
   { href: "/cves", label: "CVEs", icon: "shield" },
-  { href: "/tenable", label: "Tenable", icon: "radar" },
+  { href: "/tenable", label: "VA Management", icon: "radar" },
 ];
 
 const ICONS: Record<string, React.ReactElement> = {

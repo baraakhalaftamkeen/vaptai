@@ -178,8 +178,8 @@ def candidate_ids_for_run(db: Session, run_id: str) -> list[str]:
 _WEB_PORTS = {
     591, 2082, 2083, 2086, 2087, 2095, 2096, 3000, 3001, 4200, 4443, 5000, 5001,
     5002, 5003, 5004, 5005, 5500, 5601, 5985, 5986, 7001, 7002, 7443, 8000, 8001,
-    8002, 8008, 8080, 8081, 8088, 8090, 8443, 8834, 8888, 9000, 9001, 9043, 9080,
-    9090, 9200, 9443, 10000,
+    8002, 8008, 8080, 8081, 8082, 8083, 8084, 8085, 8086, 8087, 8088, 8089, 8090,
+    8443, 8834, 8888, 9000, 9001, 9043, 9080, 9090, 9200, 9443, 10000,
 }
 
 
@@ -307,7 +307,7 @@ def webvuln_seed_urls(db: Session, scope: RunScope, *, base_url: str, cap: int =
     return seeds
 
 
-_WAPITI_PATH_RE = re.compile(r"wapiti:\s*[^\n]*?\s+at\s+(/[^\s(]+)")
+_WAPITI_PATH_RE = re.compile(r"(?:wapiti:\s*)?[^\n]*?\s+at\s+(/[^\s(]+)")
 
 
 def discovered_endpoint_urls(db: Session, scope: RunScope, *, base_url: str,
@@ -1731,14 +1731,14 @@ def validate_cve_candidate(
 _SERVICE_SOURCE_TOOLS = {"nmap_service_scan", "http_probe"}
 
 _WAPITI_XSS_TITLE_RE = re.compile(
-    r"wapiti:\s*Reflected Cross Site Scripting at (\S+)\s*\(param:\s*([^)]+)\)",
+    r"(?:wapiti:\s*)?Reflected Cross Site Scripting at (\S+)\s*\(param:\s*([^)]+)\)",
     re.IGNORECASE,
 )
 # Wapiti's finding title for an SQLi hit. Wapiti labels these as either
 # "SQL Injection" (error-based / boolean reflection) or "Blind SQL Injection"
 # (timing-based). Both become sqli_detect confirmation candidates.
 _WAPITI_SQLI_TITLE_RE = re.compile(
-    r"wapiti:\s*(?:Blind\s+)?SQL\s+Injection\s+at\s+(\S+)\s*\(param:\s*([^)]+)\)",
+    r"(?:wapiti:\s*)?(?:Blind\s+)?SQL\s+Injection\s+at\s+(\S+)\s*\(param:\s*([^)]+)\)",
     re.IGNORECASE,
 )
 
@@ -1955,7 +1955,7 @@ _PROOF_SOURCE_TOOLS = {"sstimap", "web_param_probe", "dalfox", "idor_probe",
 # Scanner tools whose findings can be re-verified by a targeted re-scan with
 # the SAME tool on the SAME parameters. A positive re-hit is independent
 # confirmation (two runs, same verdict → confirmed).
-_REVERIFIABLE_SCANNER_TOOLS = {"wapiti", "nuclei_safe", "nuclei_intrusive", "nuclei_dast",
+_REVERIFIABLE_SCANNER_TOOLS = {"wapiti", "nuclei", "nuclei_safe", "nuclei_intrusive", "nuclei_dast",
                                "nikto", "shcheck", "sslyze", "zap_baseline"}
 
 
@@ -1994,8 +1994,27 @@ def validate_scanner_candidate(
     if not tool:
         return False
     url = _scanner_finding_url(db, finding_id)
-    args: dict = {"target": url or scope.target}
     port = _finding_port(db, finding_id)
+    if not port and url:
+        from urllib.parse import urlparse as _up
+        _pp = _up(url)
+        if _pp.port:
+            port = str(_pp.port)
+    # The normalizer outputs bare "nuclei" for all nuclei variants, but only
+    # specific variants (nuclei_safe, etc.) are registered tools. For findings
+    # whose title contains a CVE ID, use nuclei_cve for a fast targeted check;
+    # otherwise fall back to nuclei_safe (broadest template coverage).
+    if tool == "nuclei":
+        cve_m = re.search(r"(CVE-\d{4}-\d{4,})", finding.title or "", re.I)
+        if cve_m:
+            tool = "nuclei_cve"
+            scheme = "http" if url and url.startswith("http://") else "https"
+            args: dict = {"target": scope.target, "cve": cve_m.group(1), "scheme": scheme}
+        else:
+            tool = "nuclei_safe"
+            args = {"target": scope.target}
+    else:
+        args = {"target": url or scope.target}
     if port:
         args["port"] = port
     recheck = harness.run_action(

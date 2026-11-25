@@ -9,11 +9,18 @@ import Link from "next/link";
 import { api, type Approval, type Decision } from "@/lib/api";
 import { Button, PolicyTag, ShortId } from "@/components/ui";
 
+interface OTPRequest {
+  runId: string;
+  message: string;
+}
+
 export default function ApprovalDock() {
   const [items, setItems] = useState<Approval[]>([]);
   const [busy, setBusy] = useState<string | null>(null);
   const [note, setNote] = useState<string | null>(null);
   const [dismissed, setDismissed] = useState<Set<string>>(new Set());
+  const [otpRequests, setOtpRequests] = useState<OTPRequest[]>([]);
+  const [otpCode, setOtpCode] = useState("");
   const alive = useRef(true);
 
   const poll = useCallback(async () => {
@@ -21,9 +28,25 @@ export default function ApprovalDock() {
       const list = await api.listApprovals();
       if (alive.current) setItems(list);
     } catch {
-      // Not signed in / transient: just keep the dock empty.
       if (alive.current) setItems([]);
     }
+    // Check for OTP-requiring runs by looking at awaiting_approval runs with otp events
+    try {
+      const runs = await api.listRuns();
+      const otps: OTPRequest[] = [];
+      for (const r of runs) {
+        if (r.status === "awaiting_approval") {
+          try {
+            const events = await api.runEvents(r.id);
+            const otpEvt = events.find((e: { kind: string }) => e.kind === "webvuln.otp_required");
+            if (otpEvt) {
+              otps.push({ runId: r.id, message: "OTP/2FA code required for login" });
+            }
+          } catch { /* ignore */ }
+        }
+      }
+      if (alive.current) setOtpRequests(otps);
+    } catch { /* ignore */ }
   }, []);
 
   useEffect(() => {
@@ -58,8 +81,24 @@ export default function ApprovalDock() {
     }
   }
 
+  async function submitOtp(runId: string) {
+    if (!otpCode.trim()) return;
+    setBusy(runId);
+    setNote(null);
+    try {
+      await api.submitOtp(runId, otpCode.trim());
+      setOtpRequests((prev) => prev.filter((o) => o.runId !== runId));
+      setOtpCode("");
+      poll();
+    } catch (e) {
+      setNote(String(e));
+    } finally {
+      setBusy(null);
+    }
+  }
+
   const visible = items.filter((a) => !dismissed.has(a.id));
-  if (visible.length === 0) return null;
+  if (visible.length === 0 && otpRequests.length === 0) return null;
 
   return (
     <div className="fixed bottom-4 right-4 z-50 w-[min(92vw,22rem)] space-y-2">
@@ -137,6 +176,42 @@ export default function ApprovalDock() {
       {visible.length > 4 && (
         <div className="text-2xs text-ink-3 text-right pr-1">+{visible.length - 4} more pending</div>
       )}
+      {otpRequests.map((otp) => (
+        <div
+          key={`otp-${otp.runId}`}
+          className="bg-surface border border-line-strong rounded-lg shadow-xl p-3 animate-[fadeIn_120ms_ease-out]"
+        >
+          <div className="flex items-center gap-2 mb-1.5">
+            <span className="relative flex h-2 w-2 shrink-0">
+              <span className="absolute inline-flex h-full w-full rounded-full bg-accent opacity-60 animate-ping" />
+              <span className="relative inline-flex h-2 w-2 rounded-full bg-accent" />
+            </span>
+            <span className="text-sm font-medium">OTP / 2FA Required</span>
+          </div>
+          <div className="text-sm text-ink mb-2">{otp.message}</div>
+          <div className="flex items-center gap-2">
+            <input
+              type="text"
+              className="flex-1 h-8 bg-input-bg border border-line rounded px-2 text-sm text-ink focus:border-primary outline-none font-mono tracking-widest"
+              placeholder="Enter code"
+              value={otpCode}
+              onChange={(e) => setOtpCode(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && submitOtp(otp.runId)}
+              autoFocus
+            />
+            <Button
+              variant="primary"
+              onClick={() => submitOtp(otp.runId)}
+              disabled={busy === otp.runId || !otpCode.trim()}
+            >
+              {busy === otp.runId ? "..." : "Submit"}
+            </Button>
+          </div>
+          <div className="text-2xs text-ink-3 mt-1.5">
+            Run <ShortId id={otp.runId} />
+          </div>
+        </div>
+      ))}
     </div>
   );
 }

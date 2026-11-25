@@ -37,3 +37,8 @@ class RunScope:
     is_wildcard: bool = False
     wildcard_base: str = ""
     target_type: str = "web"
+    # WAF-aware rate limiting: requests per second (0 = unlimited), inter-request
+    # delay in milliseconds, and burst size (max concurrent requests).
+    rate_limit_rps: int = 0
+    rate_limit_delay_ms: int = 0
+    rate_limit_burst: int = 0

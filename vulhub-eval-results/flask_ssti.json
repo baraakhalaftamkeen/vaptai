@@ -1,0 +1,6 @@
+{
+  "vulhub_env": "flask/ssti",
+  "run_id": "b35342b3-ba9f-464d-8a4e-5c4a51de23b1",
+  "status": "completed",
+  "port": 8002
+}

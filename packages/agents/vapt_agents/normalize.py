@@ -18,6 +18,145 @@ def _clean(text: str) -> str:
     return _ANSI.sub("", text).strip()
 
 
+# ---------------------------------------------------------------------------
+# Human-readable title generation
+# ---------------------------------------------------------------------------
+_CVE_RE = re.compile(r"(CVE-\d{4}-\d{4,7})", re.IGNORECASE)
+
+_NUCLEI_KNOWN: dict[str, str] = {
+    "grafana-path-traversal": "Path Traversal in Grafana",
+    "apache-httpd-rce": "Remote Code Execution in Apache HTTP Server",
+    "apache-log4j-rce": "Remote Code Execution via Log4Shell",
+    "springboot-actuator": "Spring Boot Actuator Exposed",
+    "git-config": "Git Configuration Exposed",
+    "docker-api": "Docker API Exposed",
+    "phpmyadmin-panel": "phpMyAdmin Panel Detected",
+    "wordpress-login": "WordPress Login Panel Detected",
+    "tomcat-manager": "Apache Tomcat Manager Exposed",
+    "joomla-panel": "Joomla Admin Panel Detected",
+    "drupal-install": "Drupal Installation Page Exposed",
+    "jenkins-login": "Jenkins Login Panel Detected",
+    "elasticsearch-unauth": "Elasticsearch Unauthenticated Access",
+    "kibana-unauth": "Kibana Unauthenticated Access",
+    "mongodb-unauth": "MongoDB Unauthenticated Access",
+    "redis-unauth": "Redis Unauthenticated Access",
+    "mysql-unauth": "MySQL Unauthenticated Access",
+    "ssh-weak-algo": "SSH Weak Algorithm Supported",
+    "ssl-weak-cipher": "SSL/TLS Weak Cipher Suite",
+    "cors-misconfig": "CORS Misconfiguration",
+    "open-redirect": "Open Redirect",
+    "directory-listing": "Directory Listing Enabled",
+    "exposed-env": "Environment File Exposed (.env)",
+    "exposed-git": "Git Repository Exposed (.git)",
+    "exposed-ds-store": "macOS .DS_Store Exposed",
+    "robots-txt": "robots.txt File Detected",
+    "security-txt": "security.txt File Detected",
+    "waf-detect": "WAF Detected",
+}
+
+_NUCLEI_PATTERN_MAP: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"(?i)^(cve-\d{4}-\d{4,7})$"), ""),
+    (re.compile(r"(?i)(.+)-xss$"), "{0} Cross-Site Scripting (XSS)"),
+    (re.compile(r"(?i)(.+)-sqli$"), "{0} SQL Injection"),
+    (re.compile(r"(?i)(.+)-ssrf$"), "{0} Server-Side Request Forgery (SSRF)"),
+    (re.compile(r"(?i)(.+)-rce$"), "{0} Remote Code Execution"),
+    (re.compile(r"(?i)(.+)-lfi$"), "{0} Local File Inclusion"),
+    (re.compile(r"(?i)(.+)-rfi$"), "{0} Remote File Inclusion"),
+    (re.compile(r"(?i)(.+)-idor$"), "{0} Insecure Direct Object Reference"),
+    (re.compile(r"(?i)(.+)-path-traversal$"), "{0} Path Traversal"),
+    (re.compile(r"(?i)(.+)-open-redirect$"), "{0} Open Redirect"),
+    (re.compile(r"(?i)(.+)-default-login$"), "{0} Default Credentials"),
+    (re.compile(r"(?i)(.+)-unauth(?:orized)?(?:-access)?$"), "{0} Unauthenticated Access"),
+    (re.compile(r"(?i)(.+)-panel$"), "{0} Admin Panel Detected"),
+    (re.compile(r"(?i)(.+)-detect$"), "{0} Detected"),
+    (re.compile(r"(?i)(.+)-exposure$"), "{0} Information Exposure"),
+    (re.compile(r"(?i)(.+)-disclosure$"), "{0} Information Disclosure"),
+    (re.compile(r"(?i)(.+)-misconfig(?:uration)?$"), "{0} Misconfiguration"),
+]
+
+
+def _slug_to_name(slug: str) -> str:
+    """Convert a kebab-case slug like 'apache-tomcat' to 'Apache Tomcat'."""
+    return " ".join(w.capitalize() if w.lower() not in ("in", "of", "via", "to", "for", "and", "the", "a")
+                    else w.lower() for w in slug.split("-")).strip()
+
+
+def _humanize_nuclei_template(tmpl: str) -> str:
+    """Turn a nuclei template id into a human-readable title."""
+    low = tmpl.lower().strip()
+    if low in _NUCLEI_KNOWN:
+        return _NUCLEI_KNOWN[low]
+    for pat, fmt in _NUCLEI_PATTERN_MAP:
+        m = pat.match(tmpl)
+        if m:
+            if not fmt:
+                return m.group(1).upper()
+            return fmt.format(_slug_to_name(m.group(1)))
+    return _slug_to_name(tmpl)
+
+
+def _url_path_brief(url: str) -> str:
+    """Extract just the path from a URL for concise display."""
+    from urllib.parse import urlparse
+    try:
+        p = urlparse(url)
+        path = p.path or "/"
+        host = p.hostname or ""
+        port = f":{p.port}" if p.port and p.port not in (80, 443) else ""
+        return f"{host}{port}{path}" if host else path
+    except Exception:
+        return url[:80]
+
+
+def humanize_title(source_tool: str, raw_title: str, detail: dict | None = None) -> str:
+    """Generate a professional, human-readable finding title from raw tool output.
+
+    Transforms raw identifiers like 'nuclei:CVE-2021-43798 @ http://target/path' into
+    'Path Traversal in Grafana (CVE-2021-43798) — target/path'.
+    """
+    detail = detail or {}
+
+    if source_tool == "nuclei":
+        tmpl = detail.get("template", "")
+        url = detail.get("url", "")
+        title = _humanize_nuclei_template(tmpl) if tmpl else raw_title
+        cves = _CVE_RE.findall(tmpl) if tmpl else []
+        if cves and cves[0].upper() not in title.upper():
+            title += f" ({cves[0].upper()})"
+        if url:
+            title += f" — {_url_path_brief(url)}"
+        return title
+
+    if source_tool == "wapiti":
+        title = raw_title
+        if title.lower().startswith("wapiti: "):
+            title = title[8:]
+        return title
+
+    if source_tool in ("sqli_detect", "sstimap", "ssti_detect"):
+        title = raw_title
+        if title.startswith(f"{source_tool}: "):
+            title = title[len(source_tool) + 2:]
+        return title.capitalize() if title and title[0].islower() else title
+
+    if source_tool == "dalfox":
+        return raw_title
+
+    if source_tool == "web_param_probe":
+        return raw_title
+
+    if source_tool == "idor_probe":
+        return raw_title
+
+    # Generic: strip "tool_id: " or "tool_id " prefix
+    for prefix in (f"{source_tool}: ", f"{source_tool} "):
+        if raw_title.startswith(prefix):
+            rest = raw_title[len(prefix):]
+            return rest.capitalize() if rest and rest[0].islower() else rest
+
+    return raw_title
+
+
 @dataclass
 class Observation:
     source_tool: str
@@ -354,8 +493,10 @@ def _nuclei(text: str) -> list[Observation]:
     # nuclei -silent lines look like: [template-id] [protocol] [severity] url
     for m in re.finditer(r"\[([^\]]+)\]\s*\[[^\]]+\]\s*\[(info|low|medium|high|critical)\]\s*(\S+)", text):
         tmpl, sev, url = m.group(1), m.group(2), m.group(3)
+        detail = {"template": tmpl, "url": url}
+        title = humanize_title("nuclei", f"{tmpl} @ {url}", detail)
         obs.append(
-            Observation("nuclei", f"{tmpl} @ {url}", _SEV.get(sev, "info"), {"template": tmpl, "url": url})
+            Observation("nuclei", title, _SEV.get(sev, "info"), detail)
         )
     return obs
 
@@ -374,7 +515,7 @@ def _zap(text: str) -> list[Observation]:
             continue
         seen.add(plugin)
         sev = "medium" if level == "FAIL" else "low"
-        obs.append(Observation("zap_baseline", f"ZAP: {name}", sev,
+        obs.append(Observation("zap_baseline", name, sev,
                                {"plugin_id": plugin, "level": level}))
     return obs
 
@@ -409,7 +550,7 @@ def _host_scripts(text: str) -> list[Observation]:
                 {"script": sid, "detail": out[:300], "port": "139"}))
         else:
             if out:
-                obs.append(Observation("host_scripts", f"NSE {sid}", "info",
+                obs.append(Observation("host_scripts", f"NSE Script: {_slug_to_name(sid)}", "info",
                     {"script": sid, "detail": out[:200]}))
     return obs
 
@@ -604,7 +745,7 @@ def _nikto(text: str) -> list[Observation]:
         detail = {"message": body[:300]}
         if cves:
             detail["cve"] = cves[0].upper()
-        obs.append(Observation("nikto", f"Nikto: {body[:140]}", sev, detail))
+        obs.append(Observation("nikto", body[:140], sev, detail))
         if len(obs) >= 30:
             break
     return obs
@@ -619,12 +760,12 @@ def _wpscan(text: str) -> list[Observation]:
         if line.startswith("[!]") and "title:" in low:
             title = line.split(":", 1)[1].strip() if ":" in line else line[3:].strip()
             cur_vuln = title
-            obs.append(Observation("wpscan", f"WordPress: {title[:140]}", "medium",
+            obs.append(Observation("wpscan", f"WordPress Vulnerability: {title[:130]}", "medium",
                                    {"message": title[:300]}))
         elif line.startswith("[!]") and "vulnerabilit" in low:
             continue  # count header line; individual titles follow
         elif line.startswith("[+]") and ("identified" in low or "version" in low):
-            obs.append(Observation("wpscan", f"WordPress: {line[3:].strip()[:140]}", "info",
+            obs.append(Observation("wpscan", line[3:].strip()[:140], "info",
                                    {"message": line[3:].strip()[:200]}))
         if len(obs) >= 25:
             break
@@ -1573,7 +1714,7 @@ def _wapiti(text: str) -> list[Observation]:
             if key in seen:
                 continue
             seen.add(key)
-            title = f"wapiti: {category} at {path}" + (f" (param: {param})" if param else "")
+            title = f"{category} at {path}" + (f" (param: {param})" if param else "")
             # Parse the Host header out of http_request so the probe planner knows WHICH
             # web base this finding came from. On DineHub, wapiti ran against port 5000
             # (the Flask app) but the path "/fetch/logo" would otherwise get joined to

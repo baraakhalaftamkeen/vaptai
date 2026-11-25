@@ -166,6 +166,9 @@ def _run_scope(db, run: Run, eng: Engagement) -> RunScope:
         is_wildcard=is_wildcard,
         wildcard_base=wildcard_base,
         target_type=eng.target_type or "web",
+        rate_limit_rps=int(scope.get("rate_limit_rps", 0)),
+        rate_limit_delay_ms=int(scope.get("rate_limit_delay_ms", 0)),
+        rate_limit_burst=int(scope.get("rate_limit_burst", 0)),
     )
 
 
@@ -424,7 +427,8 @@ def start_run(self, run_id: str) -> dict:
 
 
 @celery_app.task(name="runs.resume", bind=True, max_retries=3)
-def resume_run(self, run_id: str, decision: str = "approve") -> dict:
+def resume_run(self, run_id: str, decision: str = "approve",
+               otp_code: str = "") -> dict:
     """Resume a run paused for approval. `decision` is the human verdict
     ('approve' | 'approve_batch' | 'reject'). Marks the pending approval(s) decided
     and resumes the graph on the same thread via Command(resume=...)."""
@@ -464,5 +468,8 @@ def resume_run(self, run_id: str, decision: str = "approve") -> dict:
         # resume. The graph nodes read the recorded per-action decision via
         # phases.prior_decision, so here we only drive the graph forward.
         run.status = "running"
-        final_state = _drive_graph(graph, Command(resume={"decision": decision}), config, db)
+        resume_payload: dict = {"decision": decision}
+        if otp_code:
+            resume_payload["otp_code"] = otp_code
+        final_state = _drive_graph(graph, Command(resume=resume_payload), config, db)
         return _finalize(db, run, final_state)

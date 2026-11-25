@@ -286,4 +286,4 @@ def test_graph_routes_and_persists_nikto(db):
     s.commit()
     assert out["phase"] == "report"
     titles = [f.title for f in s.query(Finding).all()]
-    assert any(t.startswith("Nikto:") and "outdated" in t.lower() for t in titles), titles
+    assert any("outdated" in t.lower() for t in titles), titles

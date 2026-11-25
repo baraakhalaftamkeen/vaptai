@@ -69,6 +69,63 @@ from vapt_tools.catalog import _PURPOSE as TOOL_PURPOSE
 
 from .state import EngagementState
 
+
+def _inject_rate_limit(args: dict, scope: RunScope) -> dict:
+    """Merge scope-level rate-limit settings into a tool's args dict."""
+    if scope.rate_limit_rps:
+        args.setdefault("rate_limit_rps", scope.rate_limit_rps)
+    if scope.rate_limit_delay_ms:
+        args.setdefault("rate_limit_delay_ms", scope.rate_limit_delay_ms)
+    if scope.rate_limit_burst:
+        args.setdefault("rate_limit_burst", scope.rate_limit_burst)
+    return args
+
+
+_NUCLEI_TOOLS = {"nuclei_safe", "nuclei_intrusive"}
+
+
+def _inject_nuclei_web_target(
+    args: dict, scope: RunScope, db: "Session", run_id: str,
+) -> dict:
+    """Fill scheme/port for nuclei scan-plan tools when the LLM or fallback plan
+    omitted them.  Without these, ``_build_nuclei`` defaults to ``https://<host>``
+    which misses services on non-standard ports (e.g. Joomla on :8093).
+
+    Priority: discovered web ports from nmap findings → scope allowed_ports →
+    skip (leave as-is so the default https://<host> still runs).
+    """
+    if args.get("port") and args.get("scheme"):
+        return args  # already set by the planner
+
+    web = phases.web_ports_from_findings(db, run_id)
+    open_p = set(phases.open_ports_from_findings(db, run_id))
+
+    # Also consider 80/443 which web_ports_from_findings excludes
+    candidates: list[tuple[str, str]] = []
+    if "80" in open_p:
+        candidates.append(("80", "http"))
+    if "443" in open_p:
+        candidates.append(("443", "https"))
+    for port, _svc in web:
+        sch = "https" if port.isdigit() and int(port) in phases._TLS_PORTS else "http"
+        candidates.append((port, sch))
+
+    # Fallback: scope allowed_ports (the engagement knows its own port)
+    if not candidates and scope.allowed_ports:
+        for ap in scope.allowed_ports.split(","):
+            ap = ap.strip()
+            if ap and ap.isdigit():
+                sch = "https" if int(ap) in phases._TLS_PORTS else "http"
+                candidates.append((ap, sch))
+
+    if candidates:
+        port, scheme = candidates[0]
+        args.setdefault("scheme", scheme)
+        if port not in ("80", "443"):
+            args.setdefault("port", port)
+
+    return args
+
 # Reporting/remediation agents must stay grounded in the actual findings — a security
 # report that invents CVEs/ports/services is worse than useless.
 GROUNDED_SYSTEM = (
@@ -549,6 +606,14 @@ def build_engagement_graph(
                     ledger.record_event(db, scope.run_id, "intake.auth",
                                         {"ok": False, "reason": "self_registration_error",
                                          "error": str(_reg_exc)[:200]})
+            _captcha_block = web_login.get_last_captcha_block()
+            if _captcha_block and not _bb_cookie:
+                ledger.record_event(db, scope.run_id, "coverage_gap",
+                                    {"reason": "captcha_blocked",
+                                     "captcha_type": _captcha_block,
+                                     "note": f"Self-registration blocked by {_captcha_block} — "
+                                             "authenticated scanning coverage reduced"})
+                log.append(f"intake: CAPTCHA ({_captcha_block}) blocked self-registration")
             if not _bb_cookie:
                 ledger.record_event(db, scope.run_id, "intake.auth",
                                     {"ok": False, "reason": "black_box_mode",
@@ -984,6 +1049,9 @@ def build_engagement_graph(
         item = plan_items[idx]
         tool_id = item["tool_id"]
         args = dict(item.get("args") or {})
+        _inject_rate_limit(args, scope)
+        if tool_id in _NUCLEI_TOOLS:
+            _inject_nuclei_web_target(args, scope, db, scope.run_id)
         task_id = f"scan-{idx}"
         base = {"phase": "scan", "scan_idx": idx + 1, "scan_iters": iters, **state_patch}
 
@@ -1279,6 +1347,7 @@ def build_engagement_graph(
             except ManifestError:
                 break
             args = {"target": scope.target, **r_args}
+            _inject_rate_limit(args, scope)
             if phases.already_executed(db, scope, task_id=r_task, tool_id=tool_id, args=args):
                 continue
             step = phases.scan_action(db, scope, harness, tool_id=tool_id, args=args, task_id=r_task)
@@ -1492,7 +1561,13 @@ def build_engagement_graph(
 
         # (2b) Gap 1: Scanner re-verification — re-run the same scanner tool on the same
         # target. A second positive is independent confirmation. Budget-bounded.
+        # Prioritize CVE-bearing findings (nuclei CVE hits) over generic scanner
+        # output (nikto info lines) so the budget is spent on high-value checks.
         _SCANNER_REVERIFY_BUDGET = 15
+        import re as _re_val
+        scanner_cands.sort(
+            key=lambda fid: (0 if _re_val.search(r"CVE-\d{4}-\d{4,}", (db.get(phases.Finding, fid).title or "")) else 1),
+        )
         scanner_confirmed = 0
         for fid in scanner_cands[:_SCANNER_REVERIFY_BUDGET]:
             try:
@@ -3634,8 +3709,16 @@ def build_engagement_graph(
         for port, _svc in phases.web_ports_from_findings(db, scope.run_id):
             scheme = "https" if (port.isdigit() and int(port) in phases._TLS_PORTS) else "http"
             endpoints.append({"scheme": scheme, "port": port})
+        _ep_ports = {ep.get("port") for ep in endpoints if ep.get("port")}
+        if scope.allowed_ports:
+            for _ap in scope.allowed_ports.split(","):
+                _ap = _ap.strip()
+                if _ap and _ap not in _ep_ports and _ap in open_ports:
+                    _sch = "https" if (_ap.isdigit() and int(_ap) in phases._TLS_PORTS) else "http"
+                    endpoints.append({"scheme": _sch, "port": _ap})
         seen: set[tuple] = set()
         plan: list[tuple[str, dict, str]] = []
+        seeds: list = []
         n = 0
         for ep in endpoints:
             key = (ep.get("scheme"), ep.get("port"))
@@ -6295,7 +6378,34 @@ def build_engagement_graph(
             cookie = None
             login_url = candidate_login_urls[0]  # for ledger / B+C reuse below
             for _cand_url in candidate_login_urls:
-                _ck = web_login.obtain_session_cookie(_cand_url, user, pw)
+                try:
+                    _ck = web_login.obtain_session_cookie(_cand_url, user, pw)
+                except web_login.OTPRequired as otp_exc:
+                    ledger.record_event(db, scope.run_id, "webvuln.otp_required",
+                                        {"login_url": str(_cand_url),
+                                         "otp_url": otp_exc.otp_url,
+                                         "otp_field": otp_exc.otp_field})
+                    otp_response = interrupt({
+                        "type": "otp_required",
+                        "message": "The login page requires a one-time password (OTP/2FA). "
+                                   "Please enter the code from your authenticator app or SMS.",
+                        "otp_url": otp_exc.otp_url,
+                        "otp_field": otp_exc.otp_field,
+                    })
+                    otp_code = ""
+                    if isinstance(otp_response, dict):
+                        otp_code = str(otp_response.get("otp_code", "")).strip()
+                    elif isinstance(otp_response, str):
+                        otp_code = otp_response.strip()
+                    if otp_code:
+                        _ck = web_login.submit_otp(
+                            otp_exc.otp_url, otp_exc.otp_field, otp_code,
+                            otp_exc.session_cookies, timeout_s=15)
+                    else:
+                        _ck = None
+                        ledger.record_event(db, scope.run_id, "webvuln.otp_skipped",
+                                            {"note": "No OTP code provided; continuing "
+                                                     "unauthenticated"})
                 if _ck:
                     cookie = _ck
                     login_url = _cand_url
@@ -6546,6 +6656,60 @@ def build_engagement_graph(
         if res is not None and res.outcome != "ok":
             return {**base, "coverage_gaps": [f"{tool_id}: tool {res.outcome}"],
                     "log": [f"webvuln: {tool_id} ran but produced no results"]}
+
+        # --- Credential escalation: when weak_cred_probe discovers valid
+        # default credentials AND the run has no session cookie yet, use
+        # the discovered creds to establish an authenticated session. This
+        # unlocks the recon agent and all subsequent authenticated scans
+        # (idor_probe, auth-crawl, wapiti --form-login) without requiring
+        # the operator to supply credentials manually.
+        if (tool_id == "weak_cred_probe"
+                and step.candidate_ids
+                and not web_credentials.get_web_cookie(scope.run_id)):
+            try:
+                import json as _json_wcp
+                _raw_obs = (res.observations or [{}])[0] if res else {}
+                _raw_stdout = _raw_obs.get("stdout", "") if isinstance(_raw_obs, dict) else ""
+                _wcp_data = _json_wcp.loads(_raw_stdout) if _raw_stdout else {}
+                _wcp_findings = _wcp_data.get("findings", [])
+                _wcp_trace = _wcp_data.get("trace", [])
+                _wcp_user = _wcp_pw = _wcp_url = None
+                for _wf in (_wcp_findings if isinstance(_wcp_findings, list) else []):
+                    if isinstance(_wf, dict) and _wf.get("confirmed"):
+                        _wcp_user = _wf.get("user")
+                        _wcp_url = _wf.get("url")
+                        break
+                if _wcp_user and _wcp_url:
+                    for _wt in (_wcp_trace if isinstance(_wcp_trace, list) else []):
+                        if (isinstance(_wt, dict)
+                                and _wt.get("user") == _wcp_user
+                                and _wt.get("likely_success")):
+                            _wcp_pw = _wt.get("pass")
+                            break
+                if _wcp_user and _wcp_pw and _wcp_url:
+                    _wcp_cookie = web_login.obtain_session_cookie(
+                        _wcp_url, _wcp_user, _wcp_pw)
+                    if _wcp_cookie:
+                        web_credentials.set_web_cookie(scope.run_id, _wcp_cookie)
+                        web_credentials.set_web_cookie_a(scope.run_id, _wcp_cookie)
+                        ledger.record_event(
+                            db, scope.run_id, "webvuln.weak_cred_escalation",
+                            {"login_url": str(_wcp_url)[:200],
+                             "user": str(_wcp_user)[:60],
+                             "note": "weak_cred_probe discovered valid default "
+                                     "credentials; session cookie cached for "
+                                     "recon agent and authenticated scanning"})
+                    else:
+                        ledger.record_event(
+                            db, scope.run_id, "webvuln.weak_cred_escalation",
+                            {"login_url": str(_wcp_url)[:200],
+                             "user": str(_wcp_user)[:60],
+                             "ok": False,
+                             "note": "weak_cred_probe found valid creds but "
+                                     "obtain_session_cookie failed — the login "
+                                     "form may need CSRF or multi-step handling"})
+            except Exception:
+                pass
 
         # Post-dalfox response capture: when dalfox confirms XSS via POST,
         # replay confirmed payloads AND custom bypass payloads through

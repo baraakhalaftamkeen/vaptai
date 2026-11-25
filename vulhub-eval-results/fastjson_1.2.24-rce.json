@@ -1,0 +1,13 @@
+{
+  "vulhub_env": "fastjson/1.2.24-rce",
+  "grade": "PASS",
+  "run_status": ".........................................................................completed",
+  "findings_count": 9,
+  "confirmed_count": 1,
+  "elapsed_s": 733,
+  "run_id": "15e88de5-4a53-43a4-a58b-850f0b7f2f10",
+  "engagement_id": "8394e57a-9902-461e-a287-b96d7e682708",
+  "timestamp": "2026-11-25T08:08:51Z",
+  "target_cve_found": true,
+  "target_cve_status": "candidate"
+}

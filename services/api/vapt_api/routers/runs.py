@@ -525,6 +525,32 @@ def cancel_run(
     return run
 
 
+class OTPSubmit(BaseModel):
+    otp_code: str
+
+
+@router.post("/{run_id}/otp", response_model=RunOut)
+def submit_otp(
+    run_id: str,
+    body: OTPSubmit,
+    db: Session = Depends(get_db),
+    user: CurrentUser = Depends(get_current_user),
+) -> Run:
+    """Submit an OTP code for a run paused at a 2FA challenge."""
+    run = _owned_run(db, user, run_id, Role.ANALYST, Role.LEAD)
+    if run.status != "awaiting_approval":
+        raise HTTPException(status.HTTP_409_CONFLICT, "run is not awaiting OTP input")
+    run.status = "queued"
+    db.add(Outbox(run_id=run.id, topic="run.resume",
+                  payload={"run_id": run.id, "decision": "approve",
+                           "otp_code": body.otp_code}))
+    db.add(RunEvent(run_id=run.id, seq=_next_seq(db, run.id),
+                    kind="run.otp_submitted", payload={"by": user.id}))
+    db.commit()
+    db.refresh(run)
+    return run
+
+
 def _owned_run(db: Session, user: CurrentUser, run_id: str, *roles: Role) -> Run:
     run = db.get(Run, run_id)
     if run is None:

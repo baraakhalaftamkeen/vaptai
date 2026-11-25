@@ -52,6 +52,7 @@ def celery_dispatcher(topic: str, payload: dict) -> None:
     if topic == "run.start":
         tasks.start_run.delay(run_id)
     elif topic == "run.resume":
-        tasks.resume_run.delay(run_id, payload.get("decision", "approve"))
+        tasks.resume_run.delay(run_id, payload.get("decision", "approve"),
+                               payload.get("otp_code", ""))
     else:  # unknown topic: leave undelivered for inspection rather than silently dropping
         raise ValueError(f"unknown outbox topic: {topic!r}")

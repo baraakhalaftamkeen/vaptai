@@ -56,6 +56,11 @@ export default function NewEngagementPage() {
   const [domainUser, setDomainUser] = useState("");
   const [domainPass, setDomainPass] = useState("");
 
+  // WAF-aware rate limiting
+  const [rateLimitRps, setRateLimitRps] = useState("");
+  const [rateLimitDelayMs, setRateLimitDelayMs] = useState("");
+  const [rateLimitBurst, setRateLimitBurst] = useState("");
+
   useEffect(() => {
     api.listPlaybooks().then(setPlaybooks).catch(() => setPlaybooks([]));
   }, []);
@@ -80,6 +85,9 @@ export default function NewEngagementPage() {
           allowed_action_classes: classes,
           allow_exploitation: exploit,
           poc_playbook: playbook,
+          ...(rateLimitRps ? { rate_limit_rps: parseInt(rateLimitRps, 10) } : {}),
+          ...(rateLimitDelayMs ? { rate_limit_delay_ms: parseInt(rateLimitDelayMs, 10) } : {}),
+          ...(rateLimitBurst ? { rate_limit_burst: parseInt(rateLimitBurst, 10) } : {}),
           ...(mode !== "black_box" && target !== "network"
             ? {
                 web_credentials: {
@@ -438,6 +446,49 @@ export default function NewEngagementPage() {
                 </p>
               </div>
             )}
+          </div>
+
+          <div className="border-t border-line pt-4">
+            <span className="block text-xs text-ink-2 mb-2">Rate limiting (WAF / IPS evasion)</span>
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+              <label className="block">
+                <span className="block text-2xs text-ink-3 mb-1">Requests/sec (0 = unlimited)</span>
+                <input
+                  className={inputCls}
+                  type="number"
+                  min="0"
+                  value={rateLimitRps}
+                  onChange={(e) => setRateLimitRps(e.target.value)}
+                  placeholder="0"
+                />
+              </label>
+              <label className="block">
+                <span className="block text-2xs text-ink-3 mb-1">Delay between requests (ms)</span>
+                <input
+                  className={inputCls}
+                  type="number"
+                  min="0"
+                  value={rateLimitDelayMs}
+                  onChange={(e) => setRateLimitDelayMs(e.target.value)}
+                  placeholder="0"
+                />
+              </label>
+              <label className="block">
+                <span className="block text-2xs text-ink-3 mb-1">Burst size (concurrent)</span>
+                <input
+                  className={inputCls}
+                  type="number"
+                  min="0"
+                  value={rateLimitBurst}
+                  onChange={(e) => setRateLimitBurst(e.target.value)}
+                  placeholder="0"
+                />
+              </label>
+            </div>
+            <p className="text-2xs text-ink-3 mt-2">
+              Throttle scan speed to avoid WAF/IPS blocks. Applied to nmap, nuclei, and wapiti.
+              Leave all at 0 for maximum speed.
+            </p>
           </div>
 
           <div className="flex items-center gap-2 pt-1">

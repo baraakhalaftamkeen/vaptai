@@ -76,9 +76,9 @@ export default function TenablePage() {
   return (
     <div className="max-w-[1100px]">
       <header className="mb-5">
-        <h1 className="text-2xl font-semibold leading-tight">Tenable Findings</h1>
+        <h1 className="text-2xl font-semibold leading-tight">VA Management</h1>
         <p className="text-sm text-ink-2 mt-0.5">
-          Vulnerability findings from your Tenable.sc instance.
+          Vulnerability findings from your vulnerability assessment platform.
           {tStatus?.configured && tStatus.url && (
             <span className="ml-1 text-ink-3">Connected to {tStatus.url}</span>
           )}
@@ -141,7 +141,7 @@ export default function TenablePage() {
         ) : vulns.length === 0 ? (
           <Empty>
             {tStatus && !tStatus.configured
-              ? "Tenable.sc is not configured. Set the VAPT_TENABLE_* environment variables."
+              ? "VA management platform is not configured. Set the VAPT_TENABLE_* environment variables."
               : "No vulnerabilities found matching your filters."}
           </Empty>
         ) : (

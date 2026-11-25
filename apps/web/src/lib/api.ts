@@ -398,6 +398,11 @@ export const api = {
     }),
   pauseRun: (runId: string) => req<Run>(`/api/v2/runs/${runId}/pause`, { method: "POST" }),
   cancelRun: (runId: string) => req<Run>(`/api/v2/runs/${runId}/cancel`, { method: "POST" }),
+  submitOtp: (runId: string, otpCode: string) =>
+    req<Run>(`/api/v2/runs/${runId}/otp`, {
+      method: "POST",
+      body: JSON.stringify({ otp_code: otpCode }),
+    }),
   runEvents: (runId: string, afterSeq = 0) =>
     req<RunEvent[]>(`/api/v2/runs/${runId}/events?after_seq=${afterSeq}`),
   listApprovals: (runId?: string) =>

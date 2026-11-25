@@ -1,0 +1,13 @@
+{
+  "xben_id": "XBEN-040-24",
+  "grade": "PASS_PARTIAL",
+  "run_status": "
+timeout",
+  "findings_count": 117,
+  "confirmed_count": 12,
+  "flag_location": "none",
+  "elapsed_s": 919,
+  "run_id": "bc7cc273-bed4-416e-9599-78f61b10ed25",
+  "engagement_id": "ab3fefd8-b603-4a67-9eb5-86d060a76e13",
+  "timestamp": "2026-11-19T13:36:42Z"
+}

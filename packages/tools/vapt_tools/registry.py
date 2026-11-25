@@ -211,7 +211,12 @@ def _build_nmap(args: dict) -> list[str]:
     # number of services, not the port range. Fixed timing, TCP connect (non-privileged).
     target = _valid_host(str(args["target"]))
     ports = _bounded_ports(args)
-    return ["nmap", "-sT", "-sV", "-Pn", "-T3", "-p", ports, "-oX", "-", target]
+    argv = ["nmap", "-sT", "-sV", "-Pn", "-T3", "-p", ports, "-oX", "-", target]
+    rps = int(args.get("rate_limit_rps", 0))
+    if rps > 0:
+        argv.insert(-1, "--max-rate")
+        argv.insert(-1, str(rps))
+    return argv
 
 
 # Fixed, SAFE NSE discovery scripts for Windows service posture. Not model-controllable:
@@ -284,6 +289,12 @@ def _build_nuclei(args: dict) -> list[str]:
         url = f"{scheme}://{target}:{p}"
     argv = ["nuclei", "-silent", "-no-color", "-follow-host-redirects",
             "-severity", sev]
+    rps = int(args.get("rate_limit_rps", 0))
+    if rps > 0:
+        argv += ["-rl", str(rps)]
+    burst = int(args.get("rate_limit_burst", 0))
+    if burst > 0:
+        argv += ["-bs", str(burst)]
     _c = _web_login_cookie()
     if _c:
         argv += ["-H", f"Cookie: {_c}"]
@@ -333,6 +344,12 @@ def _build_nuclei_dast(args: dict) -> list[str]:
     # on DineHub runs). -dast alone runs the full fuzzing library on seed URLs
     # (SQLi/XSS/SSTI/LFI/SSRF/open-redirect/header injection).
     argv = [binary, "-dast", "-silent", "-no-color", "-severity", sev]
+    rps = int(args.get("rate_limit_rps", 0))
+    if rps > 0:
+        argv += ["-rl", str(rps)]
+    burst = int(args.get("rate_limit_burst", 0))
+    if burst > 0:
+        argv += ["-bs", str(burst)]
     _c = _web_login_cookie()
     if _c:
         argv += ["-H", f"Cookie: {_c}"]
@@ -419,6 +436,9 @@ def _build_wapiti(args: dict) -> list[str]:
         if not re.fullmatch(r"\d{1,5}", _ma) or int(_ma) < 10:
             raise ValueError(f"invalid max_attack_time: {_max_attack!r}")
         argv += ["--max-attack-time", _ma]
+    delay_ms = int(args.get("rate_limit_delay_ms", 0))
+    if delay_ms > 0:
+        argv += ["--wait", str(max(1, delay_ms // 1000))]
     # Authenticated scan: inject session cookie if the webvuln node obtained one.
     _c = _web_login_cookie()
     if _c:

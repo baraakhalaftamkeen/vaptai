@@ -28,6 +28,22 @@ from urllib.parse import urljoin, urlparse
 _USER_FIELD_HINTS = ("username", "user", "email", "login", "u", "name")
 _PASS_FIELD_HINTS = ("password", "pass", "pwd", "p")
 
+# OTP / 2FA detection patterns
+_OTP_FIELD_NAMES = frozenset({
+    "otp", "totp", "code", "token", "verification_code", "verify_code",
+    "mfa_code", "2fa_code", "auth_code", "one_time_password", "passcode",
+    "twofa", "two_factor", "mfa", "otp_code", "security_code",
+})
+_OTP_PAGE_RE = re.compile(
+    r"(?:enter|type|input|provide|submit).{0,30}"
+    r"(?:verification|otp|one.?time|2fa|two.?factor|mfa|security)\s*code"
+    r"|(?:verification|otp|one.?time|2fa|two.?factor|mfa|security)\s*code"
+    r"|authenticator\s+app"
+    r"|we.{0,20}sent.{0,30}(?:code|otp|token)"
+    r"|check\s+your\s+(?:email|phone|device)",
+    re.IGNORECASE,
+)
+
 _INPUT_RE = re.compile(
     r"""<input\b[^>]*?\bname\s*=\s*["']([^"']+)["'][^>]*?\btype\s*=\s*["']([^"']+)["']"""
     r"""|<input\b[^>]*?\btype\s*=\s*["']([^"']+)["'][^>]*?\bname\s*=\s*["']([^"']+)["']""",
@@ -37,6 +53,112 @@ _FORM_ACTION_RE = re.compile(
     r"""<form\b[^>]*?\baction\s*=\s*["']([^"']*)["']""",
     re.IGNORECASE,
 )
+
+
+# CAPTCHA detection
+_CAPTCHA_RE = re.compile(
+    r"google\.com/recaptcha|www\.google\.com/recaptcha"
+    r"|hcaptcha\.com|js\.hcaptcha\.com"
+    r"|challenges\.cloudflare\.com/turnstile"
+    r"|captcha\.com|funcaptcha\.com"
+    r'|class\s*=\s*["\'][^"\']*g-recaptcha'
+    r'|class\s*=\s*["\'][^"\']*h-captcha'
+    r'|data-sitekey\s*=\s*["\']'
+    r'|id\s*=\s*["\']captcha["\']',
+    re.IGNORECASE,
+)
+
+# Known test site keys for CAPTCHA providers (always pass validation)
+_RECAPTCHA_TEST_KEY = "6LeIxAcTAAAAAJcZVRqyHh71UMIEGNQ_MXjiZKhI"
+_HCAPTCHA_TEST_KEY = "10000000-ffff-ffff-ffff-000000000001"
+
+
+def detect_captcha(html: str) -> str | None:
+    """Detect CAPTCHA on a page. Returns the CAPTCHA type or None."""
+    if not html:
+        return None
+    low = html.lower()
+    if "g-recaptcha" in low or "recaptcha" in low:
+        return "recaptcha"
+    if "h-captcha" in low or "hcaptcha" in low:
+        return "hcaptcha"
+    if "turnstile" in low:
+        return "turnstile"
+    if _CAPTCHA_RE.search(html):
+        return "generic"
+    return None
+
+
+def _has_test_sitekey(html: str) -> bool:
+    """Check if the page uses a known CAPTCHA test site key (always passes)."""
+    return (_RECAPTCHA_TEST_KEY in html or _HCAPTCHA_TEST_KEY in html)
+
+
+class OTPRequired(Exception):
+    """Raised when login succeeds but the server presents an OTP/2FA challenge."""
+    def __init__(self, otp_url: str, otp_field: str, session_cookies: str):
+        self.otp_url = otp_url
+        self.otp_field = otp_field
+        self.session_cookies = session_cookies
+        super().__init__(f"OTP required at {otp_url} (field={otp_field})")
+
+
+def _detect_otp_form(html: str) -> str | None:
+    """Return the name of the OTP input field if the page is an OTP/2FA challenge, else None."""
+    if not html:
+        return None
+    if not _OTP_PAGE_RE.search(html):
+        return None
+    for m in _INPUT_RE.finditer(html):
+        name = (m.group(1) or m.group(4) or "").strip()
+        itype = (m.group(2) or m.group(3) or "").lower().strip()
+        if not name:
+            continue
+        low = name.lower().replace("-", "_")
+        if low in _OTP_FIELD_NAMES:
+            return name
+        if itype in ("text", "number", "tel") and any(kw in low for kw in ("otp", "code", "token", "verify")):
+            return name
+    return None
+
+
+def submit_otp(otp_url: str, otp_field: str, otp_code: str,
+               session_cookies: str, *, timeout_s: int = 15) -> str | None:
+    """Submit an OTP code to complete 2FA login. Returns the final session cookie string."""
+    try:
+        import requests
+    except Exception:
+        return None
+    try:
+        sess = requests.Session()
+        for pair in session_cookies.split(";"):
+            pair = pair.strip()
+            if "=" in pair:
+                k, v = pair.split("=", 1)
+                sess.cookies.set(k.strip(), v.strip())
+        r = sess.get(otp_url, timeout=timeout_s, allow_redirects=True)
+        html = r.text if r.ok else ""
+        hidden = {}
+        for m in _INPUT_RE.finditer(html):
+            name = (m.group(1) or m.group(4) or "").strip()
+            itype = (m.group(2) or m.group(3) or "").lower().strip()
+            if name and itype == "hidden":
+                vm = re.search(
+                    rf"""<input\b[^>]*?\bname\s*=\s*["']{re.escape(name)}["'][^>]*?\bvalue\s*=\s*["']([^"']*)["']""",
+                    html, re.IGNORECASE)
+                hidden[name] = vm.group(1) if vm else ""
+        action = _detect_form_action(html, r.url)
+        data = {otp_field: otp_code, **hidden}
+        resp = sess.post(action, data=data, timeout=timeout_s, allow_redirects=True)
+        if not sess.cookies:
+            return None
+        parts = []
+        for c in sess.cookies:
+            if c.name and c.value is not None:
+                parts.append(f"{c.name}={c.value}")
+        return "; ".join(parts) if parts else None
+    except Exception:
+        return None
 
 
 def _detect_form_fields(html: str) -> tuple[str, str]:
@@ -105,6 +227,10 @@ def obtain_session_cookie(login_url: str, username: str, password: str,
             html = ""
         user_field, pass_field = _detect_form_fields(html)
         action = _detect_form_action(html, effective_login_url)
+        # CAPTCHA on the login form: if present and not a test key, skip
+        captcha_type = detect_captcha(html)
+        if captcha_type and not _has_test_sitekey(html):
+            return None
         # Pull any hidden fields (CSRF token etc.) so the POST matches what the browser would send.
         hidden = {}
         for m in _INPUT_RE.finditer(html):
@@ -123,6 +249,20 @@ def obtain_session_cookie(login_url: str, username: str, password: str,
         # Stay in-scope: the login must not redirect us off-host (a safety guard, not auth proof).
         if urlparse(resp.url).hostname != host_before:
             return None
+
+        # OTP / 2FA detection: if the POST response is an OTP challenge, raise
+        # OTPRequired so the caller (engagement graph) can pause for human input.
+        otp_field = _detect_otp_form(resp.text or "")
+        if otp_field:
+            parts = []
+            for c in sess.cookies:
+                if c.name and c.value is not None:
+                    parts.append(f"{c.name}={c.value}")
+            raise OTPRequired(
+                otp_url=resp.url,
+                otp_field=otp_field,
+                session_cookies="; ".join(parts),
+            )
 
         # Two-step login support: if the first POST redirected to a page that
         # contains a password field (but we haven't set a session cookie yet),
@@ -256,6 +396,8 @@ _REG_PATH_HINTS = (
     "/accounts/register", "/user/register", "/users/register",
     "/api/register", "/api/signup", "/api/auth/register",
     "/create-account", "/join",
+    "/enroll", "/onboarding", "/get-started",
+    "/membership/register", "/member/signup",
 )
 
 _REG_STEP_SUFFIXES = (
@@ -407,6 +549,12 @@ def _guess_field_values(fields: dict[str, str], username: str, password: str,
                       "confirmPassword", "repassword"}
     _fname_names = {"first_name", "firstname", "fname", "first"}
     _lname_names = {"last_name", "lastname", "lname", "last"}
+    _phone_names = {"phone", "phone_number", "mobile", "tel", "telephone", "cell"}
+    _address_names = {"address", "street", "address1", "street_address"}
+    _city_names = {"city", "town"}
+    _zip_names = {"zip", "zipcode", "zip_code", "postal", "postal_code", "postcode"}
+    _date_names = {"dob", "date_of_birth", "birth_date", "birthday"}
+    _company_names = {"company", "organization", "org", "company_name"}
     for name, ftype in fields.items():
         low = name.lower().replace("-", "_")
         if ftype == "hidden":
@@ -423,13 +571,24 @@ def _guess_field_values(fields: dict[str, str], username: str, password: str,
             data[name] = "Test"
         elif low in _lname_names:
             data[name] = "User"
+        elif low in _phone_names or (ftype == "tel"):
+            data[name] = "5551234567"
+        elif low in _address_names:
+            data[name] = "123 Test Street"
+        elif low in _city_names:
+            data[name] = "Testville"
+        elif low in _zip_names:
+            data[name] = "12345"
+        elif low in _date_names or ftype == "date":
+            data[name] = "1990-01-15"
+        elif low in _company_names:
+            data[name] = "Test Corp"
         elif ftype == "checkbox":
             data[name] = "on"
         elif ftype == "select":
-            # Pick first non-empty option value from the HTML
             first_val = _first_select_option(html, name)
             data[name] = first_val if first_val else "1"
-        elif ftype in ("text", "tel"):
+        elif ftype in ("text",):
             data[name] = username
         elif ftype == "number":
             data[name] = "1"
@@ -519,7 +678,27 @@ def _try_register_at_url(sess, reg_url: str, base: str,
             return None
 
         action, fields = form_result
+
+        # CAPTCHA detection: if the form has a real CAPTCHA, skip it.
+        # If it uses a test site key, we can submit without solving it.
+        captcha_type = detect_captcha(current_html)
+        if captcha_type and not _has_test_sitekey(current_html):
+            global _last_captcha_block
+            _last_captcha_block = captcha_type
+            _lg.info("_try_register step=%d CAPTCHA detected (%s) at %s — skipping",
+                     step, captcha_type, current_url)
+            return None
+
         data = _guess_field_values(fields, username, password, html=current_html)
+
+        # If the CAPTCHA uses a test key, include the bypass response token
+        if captcha_type and _has_test_sitekey(current_html):
+            if captcha_type == "recaptcha":
+                data["g-recaptcha-response"] = "test"
+            elif captcha_type == "hcaptcha":
+                data["h-captcha-response"] = "test"
+            _lg.debug("_try_register step=%d CAPTCHA test-key bypass (%s)",
+                      step, captcha_type)
 
         # LLM fallback: when heuristics mapped fewer than half the visible fields
         visible_count = sum(1 for v in fields.values() if v != "hidden")
@@ -601,6 +780,12 @@ def _try_login_after_register(base: str, username: str, password: str,
 
 
 _last_registration_urls: list[str] = []
+_last_captcha_block: str | None = None
+
+
+def get_last_captcha_block() -> str | None:
+    """Return the CAPTCHA type that blocked the last registration attempt, or None."""
+    return _last_captcha_block
 
 
 def get_last_registration_urls() -> list[str]:
@@ -623,8 +808,9 @@ def try_self_register(base_url: str, *, timeout_s: int = 15,
 
     Returns (login_url, username, password) on success, None on failure.
     """
-    global _last_registration_urls
+    global _last_registration_urls, _last_captcha_block
     _last_registration_urls = []
+    _last_captcha_block = None
     import secrets
     try:
         import requests  # type: ignore
