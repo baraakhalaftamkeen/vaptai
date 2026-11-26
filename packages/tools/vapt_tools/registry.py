@@ -288,6 +288,7 @@ def _build_nuclei(args: dict) -> list[str]:
             raise ValueError(f"invalid port: {port!r}")
         url = f"{scheme}://{target}:{p}"
     argv = ["nuclei", "-silent", "-no-color", "-follow-host-redirects",
+            "-pt", "http,javascript",
             "-severity", sev]
     rps = int(args.get("rate_limit_rps", 0))
     if rps > 0:

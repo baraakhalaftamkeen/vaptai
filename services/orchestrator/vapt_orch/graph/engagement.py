@@ -1006,6 +1006,60 @@ def build_engagement_graph(
             {"tool_id": t, "args": dict(a)} for t, a in phases.scan_plan_for(scope)
         ]
 
+        # Guarantee nuclei_intrusive is in the plan when P2 is allowed.
+        # The LLM planner often includes only nuclei_safe; without this
+        # guard, critical-severity CVEs reachable only via intrusive
+        # templates are missed.
+        if PolicyClass.P2_INTRUSIVE in scope.allowed_action_classes:
+            has_intrusive = any(
+                p.get("tool_id") == "nuclei_intrusive" for p in plan_items
+            )
+            if not has_intrusive:
+                plan_items.append({
+                    "tool_id": "nuclei_intrusive",
+                    "args": {"severity": "high,critical"},
+                    "rationale": "auto-injected: P2 allowed but planner omitted intrusive scan",
+                    "source": "injection",
+                })
+
+            # Also inject nuclei_intrusive for non-web service ports that
+            # nmap/naabu discovered.  JavaScript/TCP nuclei templates
+            # (e.g. ActiveMQ CVE-2023-46604 on port 61616) only fire when
+            # nuclei targets the service's own port, not the web port.
+            try:
+                all_ports = set(phases.open_ports_from_findings(db, scope.run_id))
+                # Filter to in-scope ports so we never scan outside the
+                # engagement's allowed range, and so naabu-discovered system
+                # ports don't crowd out the target service ports.
+                scope_ports_csv = phases.ports_for(scope)
+                scope_set = {p.strip() for p in scope_ports_csv.split(",") if p.strip()}
+                if scope_set:
+                    all_ports &= scope_set
+                web_ports = {p for p, _ in phases.web_ports_from_findings(
+                    db, scope.run_id)}
+                web_ports |= {"80", "443"}
+                svc_only = sorted(all_ports - web_ports, key=int)
+                planned_ports = {
+                    str(p.get("args", {}).get("port", ""))
+                    for p in plan_items
+                    if p.get("tool_id") == "nuclei_intrusive"
+                }
+                for port in svc_only[:10]:
+                    if port not in planned_ports:
+                        plan_items.append({
+                            "tool_id": "nuclei_intrusive",
+                            "args": {
+                                "severity": "high,critical",
+                                "port": port,
+                                "scheme": "http",
+                            },
+                            "rationale": f"auto-injected: service port {port} "
+                                         f"needs JS/TCP nuclei templates",
+                            "source": "injection",
+                        })
+            except Exception:
+                pass  # best-effort; don't block the scan
+
         # Wildcard: expand plan to cover all discovered hosts. Each plan item is
         # replicated per host with a target override so the scan covers every live
         # subdomain. Done once on the first visit (iters==0 means not yet expanded).

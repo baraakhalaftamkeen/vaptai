@@ -30,9 +30,10 @@ from .runscope import RunScope
 # own "Allowed ports" field overrides this (including a full-range sweep like 1-65535).
 DEFAULT_PORTS = (
     "21,22,23,25,53,80,88,110,135,139,143,389,443,445,464,465,587,636,993,995,"
-    "1433,1521,2049,3000,3001,3268,3269,3306,3389,4200,5000,5001,5432,5601,5900,"
-    "5985,5986,6379,7001,7070,8000,8001,8002,8008,8080,8081,8088,8090,8443,8888,"
-    "9000,9001,9200,9389,27017"
+    "1433,1521,1883,2049,2181,3000,3001,3268,3269,3306,3389,4200,4848,5000,5001,"
+    "5432,5601,5672,5900,5985,5986,6379,7001,7070,8000,8001,8002,8008,8009,8080,"
+    "8081,8088,8090,8161,8443,8888,9000,9001,9090,9092,9200,9389,11211,27017,"
+    "50000,61616"
 )
 
 # Default bounded black/gray-box web+network adapter set, used when no plan is given.
@@ -62,6 +63,10 @@ def scan_plan_for(scope: "RunScope") -> list[tuple[str, dict]]:
     target = scope.target.lower()
     is_web = any(
         p in target for p in ("http", "www", ".com", ".org", ".net", ".io"))
+    from vapt_domain.enums import PolicyClass as _PC
+    allows_p2 = _PC.P2_INTRUSIVE in getattr(scope, "allowed_action_classes", [])
+    if allows_p2:
+        plan.append(("nuclei_intrusive", {"severity": "high,critical"}))
     if is_web:
         plan.extend([
             ("shcheck", {}),
@@ -70,13 +75,8 @@ def scan_plan_for(scope: "RunScope") -> list[tuple[str, dict]]:
             ("katana", {}),
             ("feroxbuster", {}),
         ])
-        from vapt_domain.enums import PolicyClass as _PC
-        allows_p2 = _PC.P2_INTRUSIVE in getattr(scope, "allowed_action_classes", [])
         if allows_p2:
-            plan.extend([
-                ("wapiti", {}),
-                ("nuclei_intrusive", {}),
-            ])
+            plan.append(("wapiti", {}))
     if scope.testing_mode != "black_box":
         plan.append(("arjun", {}))
     return plan
@@ -233,7 +233,7 @@ def service_ports_from_findings(db: Session, run_id: str) -> list[str]:
 
 
 def open_ports_from_findings(db: Session, run_id: str) -> list[str]:
-    """Every distinct open port nmap discovered — for a service→CVE (vulners) pass."""
+    """Every distinct open port discovered by nmap or naabu."""
     out: list[str] = []
     seen: set[str] = set()
     for fid in db.execute(select(Finding.id).where(Finding.run_id == run_id)).scalars().all():
@@ -241,12 +241,20 @@ def open_ports_from_findings(db: Session, run_id: str) -> list[str]:
             select(FindingObservation).where(FindingObservation.finding_id == fid)
         ).scalars().all()
         for o in obs:
-            if o.source_tool != "nmap_service_scan":
-                continue
-            port = str((o.detail or {}).get("port", "")).strip()
-            if port.isdigit() and port not in seen:
-                seen.add(port)
-                out.append(port)
+            if o.source_tool == "nmap_service_scan":
+                port = str((o.detail or {}).get("port", "")).strip()
+                if port.isdigit() and port not in seen:
+                    seen.add(port)
+                    out.append(port)
+            elif o.source_tool == "naabu":
+                excerpt = str((o.detail or {}).get("excerpt", ""))
+                for line in excerpt.splitlines():
+                    line = line.strip()
+                    if ":" in line:
+                        maybe_port = line.rsplit(":", 1)[-1].strip()
+                        if maybe_port.isdigit() and maybe_port not in seen:
+                            seen.add(maybe_port)
+                            out.append(maybe_port)
     return out
 
 
