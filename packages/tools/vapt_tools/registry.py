@@ -290,6 +290,9 @@ def _build_nuclei(args: dict) -> list[str]:
     argv = ["nuclei", "-silent", "-no-color", "-follow-host-redirects",
             "-pt", "http,javascript",
             "-severity", sev]
+    tid = str(args.get("template_id", "")).strip()
+    if tid and re.fullmatch(r"[\w:/-]+(?:,[\w:/-]+)*", tid):
+        argv += ["-id", tid]
     rps = int(args.get("rate_limit_rps", 0))
     if rps > 0:
         argv += ["-rl", str(rps)]

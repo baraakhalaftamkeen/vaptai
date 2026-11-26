@@ -1977,6 +1977,19 @@ def _scanner_finding_source(db: Session, finding_id: str) -> str | None:
     return None
 
 
+def _nuclei_template_id(db: Session, finding_id: str) -> str | None:
+    """Extract the nuclei template ID from a finding's observation detail."""
+    obs = db.execute(
+        select(FindingObservation).where(FindingObservation.finding_id == finding_id)
+    ).scalars().all()
+    for o in obs:
+        if o.source_tool and "nuclei" in o.source_tool:
+            tpl = str((o.detail or {}).get("template", "")).strip()
+            if tpl:
+                return tpl.split(":")[0]
+    return None
+
+
 def _scanner_finding_url(db: Session, finding_id: str) -> str | None:
     obs = db.execute(
         select(FindingObservation).where(FindingObservation.finding_id == finding_id)
@@ -2011,7 +2024,8 @@ def validate_scanner_candidate(
     # The normalizer outputs bare "nuclei" for all nuclei variants, but only
     # specific variants (nuclei_safe, etc.) are registered tools. For findings
     # whose title contains a CVE ID, use nuclei_cve for a fast targeted check;
-    # otherwise fall back to nuclei_safe (broadest template coverage).
+    # for non-CVE findings, extract the template ID from the observation detail
+    # so we run a targeted re-scan instead of a full nuclei_safe sweep.
     if tool == "nuclei":
         cve_m = re.search(r"(CVE-\d{4}-\d{4,})", finding.title or "", re.I)
         if cve_m:
@@ -2019,8 +2033,15 @@ def validate_scanner_candidate(
             scheme = "http" if url and url.startswith("http://") else "https"
             args: dict = {"target": scope.target, "cve": cve_m.group(1), "scheme": scheme}
         else:
+            # Info-severity nuclei findings (missing headers, WAF detect, tech detect)
+            # are informational — skip the expensive full re-scan.
+            if (finding.severity or "info") == "info":
+                return False
             tool = "nuclei_safe"
             args = {"target": scope.target}
+            tpl_id = _nuclei_template_id(db, finding_id)
+            if tpl_id:
+                args["template_id"] = tpl_id
     else:
         args = {"target": url or scope.target}
     if port:
