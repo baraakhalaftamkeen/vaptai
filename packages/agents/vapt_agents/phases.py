@@ -1276,6 +1276,57 @@ def probe_live_hosts(
 
 
 # --------------------------------------------------------------------------- #
+# WAF-aware rate limiting — applied to every tool dispatched through scan_action.
+# --------------------------------------------------------------------------- #
+_WAF_DETECTED_CACHE: dict[str, bool] = {}
+_WAF_DEFAULT_RPS = 20
+_WAF_DEFAULT_BURST = 5
+
+
+def _waf_detected(db: Session, run_id: str) -> bool:
+    """Check if a WAF/CDN was detected for this run (wafw00f or nuclei waf-detect)."""
+    if run_id in _WAF_DETECTED_CACHE:
+        return _WAF_DETECTED_CACHE[run_id]
+    hit = False
+    for fid in db.execute(select(Finding.id).where(Finding.run_id == run_id)).scalars().all():
+        for o in db.execute(
+            select(FindingObservation).where(FindingObservation.finding_id == fid)
+        ).scalars().all():
+            if o.source_tool == "wafw00f" and (o.detail or {}).get("waf"):
+                hit = True
+                break
+            if o.source_tool == "nuclei":
+                tpl = str((o.detail or {}).get("template", ""))
+                if "waf-detect" in tpl:
+                    hit = True
+                    break
+        if hit:
+            break
+    _WAF_DETECTED_CACHE[run_id] = hit
+    return hit
+
+
+def inject_rate_limit(args: dict, scope: "RunScope", db: Session | None = None) -> dict:
+    """Merge scope-level rate-limit settings into a tool's args dict.
+    When a WAF is detected and the user left all rate-limit fields at 0,
+    apply conservative defaults to avoid being blocked."""
+    if scope.rate_limit_rps:
+        args.setdefault("rate_limit_rps", scope.rate_limit_rps)
+    if scope.rate_limit_delay_ms:
+        args.setdefault("rate_limit_delay_ms", scope.rate_limit_delay_ms)
+    if scope.rate_limit_burst:
+        args.setdefault("rate_limit_burst", scope.rate_limit_burst)
+    if db and not scope.rate_limit_rps and not scope.rate_limit_delay_ms:
+        try:
+            if _waf_detected(db, scope.run_id):
+                args.setdefault("rate_limit_rps", _WAF_DEFAULT_RPS)
+                args.setdefault("rate_limit_burst", _WAF_DEFAULT_BURST)
+        except Exception:
+            pass
+    return args
+
+
+# --------------------------------------------------------------------------- #
 # Scan (one action) — the unit both callers share. The caller decides what to do
 # when the outcome asks for approval (sequential: record+skip; graph: interrupt).
 # --------------------------------------------------------------------------- #
@@ -1294,6 +1345,7 @@ def scan_action(
     exception propagated up through scan_action → scan node → Celery task. The ledger
     stopped at event 60 (the harness's own action.executed row for the failure) and the
     remaining scan steps never ran."""
+    inject_rate_limit(args, scope, db=db)
     try:
         outcome = harness.run_action(
             db, ctx_for(scope, task_id=task_id, agent=AgentRole.SCAN,

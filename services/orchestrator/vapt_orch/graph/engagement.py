@@ -70,55 +70,11 @@ from vapt_tools.catalog import _PURPOSE as TOOL_PURPOSE
 from .state import EngagementState
 
 
-_WAF_DETECTED_CACHE: dict[str, bool] = {}
-
-_WAF_DEFAULT_RPS = 20
-_WAF_DEFAULT_BURST = 5
 
 
-def _waf_detected(db, run_id: str) -> bool:
-    """Check if a WAF/CDN was detected for this run (wafw00f or nuclei waf-detect)."""
-    if run_id in _WAF_DETECTED_CACHE:
-        return _WAF_DETECTED_CACHE[run_id]
-    from vapt_domain.models import Finding, FindingObservation
-    hit = False
-    for fid in db.execute(select(Finding.id).where(Finding.run_id == run_id)).scalars().all():
-        for o in db.execute(
-            select(FindingObservation).where(FindingObservation.finding_id == fid)
-        ).scalars().all():
-            if o.source_tool == "wafw00f" and (o.detail or {}).get("waf"):
-                hit = True
-                break
-            if o.source_tool == "nuclei":
-                tpl = str((o.detail or {}).get("template", ""))
-                if "waf-detect" in tpl:
-                    hit = True
-                    break
-        if hit:
-            break
-    _WAF_DETECTED_CACHE[run_id] = hit
-    return hit
-
-
-def _inject_rate_limit(args: dict, scope: RunScope, db=None) -> dict:
-    """Merge scope-level rate-limit settings into a tool's args dict.
-    When a WAF is detected and the user left all rate-limit fields at 0,
-    apply conservative defaults to avoid being blocked."""
-    if scope.rate_limit_rps:
-        args.setdefault("rate_limit_rps", scope.rate_limit_rps)
-    if scope.rate_limit_delay_ms:
-        args.setdefault("rate_limit_delay_ms", scope.rate_limit_delay_ms)
-    if scope.rate_limit_burst:
-        args.setdefault("rate_limit_burst", scope.rate_limit_burst)
-    # Auto-throttle when WAF detected and user set no limits
-    if db and not scope.rate_limit_rps and not scope.rate_limit_delay_ms:
-        try:
-            if _waf_detected(db, scope.run_id):
-                args.setdefault("rate_limit_rps", _WAF_DEFAULT_RPS)
-                args.setdefault("rate_limit_burst", _WAF_DEFAULT_BURST)
-        except Exception:
-            pass
-    return args
+# WAF-aware rate limiting moved to phases.inject_rate_limit() — applied
+# automatically inside scan_action() so ALL tool dispatches (intake, scan,
+# webvuln) get throttled when a WAF is detected.
 
 
 _NUCLEI_TOOLS = {"nuclei_safe", "nuclei_intrusive"}
@@ -1143,7 +1099,6 @@ def build_engagement_graph(
         item = plan_items[idx]
         tool_id = item["tool_id"]
         args = dict(item.get("args") or {})
-        _inject_rate_limit(args, scope, db=db)
         if tool_id in _NUCLEI_TOOLS:
             _inject_nuclei_web_target(args, scope, db, scope.run_id)
         task_id = f"scan-{idx}"
@@ -1441,7 +1396,6 @@ def build_engagement_graph(
             except ManifestError:
                 break
             args = {"target": scope.target, **r_args}
-            _inject_rate_limit(args, scope, db=db)
             if phases.already_executed(db, scope, task_id=r_task, tool_id=tool_id, args=args):
                 continue
             step = phases.scan_action(db, scope, harness, tool_id=tool_id, args=args, task_id=r_task)
