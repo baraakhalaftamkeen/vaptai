@@ -1417,6 +1417,7 @@ def analysis_action(
 ) -> ScanStep:
     """Dispatch a follow-up tool through the harness under the ANALYSIS agent role.
     Same broker-raise protection as scan_action."""
+    inject_rate_limit(args, scope, db)
     try:
         outcome = harness.run_action(
             db, ctx_for(scope, task_id=task_id, agent=AgentRole.ANALYSIS,
@@ -1728,9 +1729,11 @@ def validate_cve_candidate(
     #    exits 1 with no match and only produces a noisy "did not complete" coverage gap.
     #    Those leads are confirmed (if at all) by the safe NSE check above and KEV below.
     if not _is_os_cpe_lead(db, finding_id):
+        nc_args = dict(base)
+        inject_rate_limit(nc_args, scope, db)
         nc = harness.run_action(
             db, ctx_for(scope, task_id=f"cvv-{finding_id[:8]}", agent=AgentRole.VALIDATE,
-                        tool_id="nuclei_cve", args=dict(base))
+                        tool_id="nuclei_cve", args=nc_args)
         )
     else:
         nc = None
@@ -2099,6 +2102,7 @@ def validate_scanner_candidate(
         args = {"target": url or scope.target}
     if port:
         args["port"] = port
+    inject_rate_limit(args, scope, db)
     recheck = harness.run_action(
         db, ctx_for(scope, task_id=f"rescan-{finding_id[:8]}", agent=AgentRole.VALIDATE,
                     tool_id=tool, args=args)
@@ -2322,6 +2326,7 @@ def validate_candidate(
     port = _finding_port(db, finding_id)
     if port:
         args["port"] = port
+    inject_rate_limit(args, scope, db)
     recheck = harness.run_action(
         db, ctx_for(scope, task_id=f"validate-{finding_id[:8]}", agent=AgentRole.VALIDATE,
                     tool_id="http_probe", args=args)
