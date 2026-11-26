@@ -1302,7 +1302,8 @@ def _waf_detected(db: Session, run_id: str) -> bool:
                     break
         if hit:
             break
-    _WAF_DETECTED_CACHE[run_id] = hit
+    if hit:
+        _WAF_DETECTED_CACHE[run_id] = True
     return hit
 
 
